@@ -140,6 +140,14 @@ Every region ends with a deterministic provenance line written by the renderer, 
 
 **D16. PR title unchanged.** `mrTitle` keeps the issue title and the `[partial] ` prefix.
 
+## Continuing after the first run (2026-09-27)
+
+The first run delivered M1 and the api half of M4 (PR #1813, now on `main`), then failed on a full worker data volume. The next run starts from `main` and:
+
+- Does **not** redo M1 or the api half of M4. Build on what is on `main`: the size line (`agent/src/pr-size.ts`), the artifact store, sanitizer and fenced stage / bind / publish-ack / lookup routes (`api/internal/workersvc/pr_descriptions.go`, `pr_description_sanitize.go`, migration `00259`). Remaining: M2, M3, the worker transport half of M4, M5, M6, M7, and M8's docs, spec and ADR (M8's live acceptance stays with the maintainer).
+- Keeps the Go build cache bounded until the worker-side fix lands (PRDs #1809 / #1810): run `go clean -cache` at every milestone boundary and before each full `task gate:api` / `task gate:controller`, and check `df -h /data` before each gate (clean again when it is above 70%). Do **not** move `GOCACHE` elsewhere: the run workdir has no size limit and a large cache there causes node disk pressure and pod eviction. Leave `GOMODCACHE` alone.
+- Greptile noted on #1813 that an adopting `mr_rework` / `ci_fix` run does not refresh the size line. That is D12, delivered in M6.
+
 ## Milestones
 
 | Phase | Milestone | Depends on | Main files |
