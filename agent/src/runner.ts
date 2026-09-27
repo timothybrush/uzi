@@ -674,18 +674,42 @@ export function composePushSecretBlockedReason(
  * Names the default branch once and points at docs/github-bot-setup.md. The branch name is
  * the only variable part and is clamped against a computed budget (MAX_FAILURE_REASON_LEN
  * minus the fixed prefix + suffix lengths), so the fixed suffix — the doc link and the
- * "Your diff is preserved below." pointer — always fits MAX_FAILURE_REASON_LEN and is never
- * truncated. Exported for a direct length-cap unit test.
+ * "Your diff is preserved below." pointer, or, when the diff was withheld, the "recoverable
+ * (export it with `uzi run export`)" tail — always fits MAX_FAILURE_REASON_LEN and is never
+ * truncated. The withheld align variant omits the token-scope parenthetical (the doc link
+ * covers it) to make that tail fit; its branch-name budget is then 13 characters, so a longer
+ * name is clamped with "…" rather than cutting the tail. Exported for a direct length-cap
+ * unit test.
+ *
+ * `stage` (issue #1769) names where the realign stopped. `"align"` (the default; byte-identical
+ * to the pre-#1769 text when the patch is preserved) is the merge/rebase path above. `"import"` means uzi could not even
+ * import the default branch's new objects into the runner clone (a self-contained Codex clone, or
+ * the probe that runs for every executor), so no merge or rebase was attempted and the reason
+ * must not claim one was. Its wording is executor-neutral for that reason.
  */
-export function composeBaseAlignConflictReason(defaultBranch: string, patchPreserved = true): string {
+export function composeBaseAlignConflictReason(
+  defaultBranch: string,
+  patchPreserved = true,
+  stage: "align" | "import" = "align",
+): string {
   const db = defaultBranch || "the default branch";
   const prefix = "This run's branch is behind the default branch (";
+  // The import wording drops the token-scope parenthetical (the doc link carries it) so that
+  // even the longer withheld tail fits the cap with room for the branch name.
+  const why = stage === "import"
+    ? ") on .github/workflows files, which uzi's GitHub bot token cannot push while they " +
+      "differ from the default. uzi could not import the default branch's new objects into " +
+      "the runner clone, so the run failed without pushing. "
+    : ") on .github/workflows files, which uzi's GitHub bot token cannot push while they " +
+      // The withheld align variant drops the same parenthetical, for the same reason: with it,
+      // `why` plus the withheld tail alone exceed the cap, so the branch name collapsed to "…"
+      // and the final slice cut the recovery instruction off the end.
+      (patchPreserved ? "differ from the default (its scope is `repo`, without `workflow`, by design). " : "differ from the default. ") +
+      "uzi tried to merge then rebase the current default into the branch to realign those files, " +
+      "but could not realign and safely push it, so the run failed without pushing. ";
   const suffix =
-    ") on .github/workflows files, which uzi's GitHub bot token cannot push while they " +
-    "differ from the default (its scope is `repo`, without `workflow`, by design). uzi tried " +
-    "to merge then rebase the current default into the branch to realign those files, but could " +
-    "not realign and safely push it, so the run failed without pushing. The work is valid; a " +
-    "human can rebase and land it. See docs/github-bot-setup.md." +
+    why +
+    "The work is valid; a human can rebase and land it. See docs/github-bot-setup.md." +
     (patchPreserved ? PATCH_PRESERVED_TAIL : PATCH_WITHHELD_TAIL);
   // Clamp the branch name (the only variable part) against the budget left after the fixed
   // prefix + suffix, so the doc link + preserved-diff pointer in `suffix` always survive.
@@ -4252,23 +4276,34 @@ export class RunRunner {
             // trackingRef, so those are unchanged; in the clobber-safety path (a branch that
             // edited a workflow) originalAgentTip carries that edit, so it is still preserved.
             const defTip = defaultTip;
-            const failBaseAlignConflict = async () => {
+            // issue #1769: `stage` "import" is the runner clone's object import
+            // (ensureRunnerCloneObjects, run for every executor) failing BEFORE any merge/rebase,
+            // so its status and reason never claim one ran;
+            // "align" (the default) keeps the merge/rebase status texts, and the patch-preserved
+            // reason, byte-identical.
+            const failBaseAlignConflict = async (stage: "align" | "import" = "align") => {
               const patch = await scanGatedPatch(
                 await this.git.workflowScopeDiff(alignBarePath, originalAgentTip),
                 "finalize_base_align_conflict",
               );
+              const what = stage === "import"
+                ? "could not import the default branch's new objects into the runner clone, so the branch was not realigned"
+                : "could not realign the branch with the updated default branch and safely push it (merge and rebase conflicted, or the aligned branch could not be fast-forwarded)";
               batcher.emit({
                 kind: "status",
                 agent: "worker",
                 payload: {
                   text: patch !== undefined
-                    ? "could not realign the branch with the updated default branch and safely push it (merge and rebase conflicted, or the aligned branch could not be fast-forwarded); failing and preserving the diff for a human to land"
-                    : "could not realign the branch with the updated default branch and safely push it (merge and rebase conflicted, or the aligned branch could not be fast-forwarded); failing (the diff is withheld: it could not be preserved or did not scan clean)",
+                    ? `${what}; failing and preserving the diff for a human to land`
+                    : `${what}; failing (the diff is withheld: it could not be preserved or did not scan clean)`,
                 },
               });
-              runLog.info("run failed: finalize base-align conflict; preserving diff", {
-                run_id: runId,
-              });
+              runLog.info(
+                stage === "import"
+                  ? "run failed: finalize base-align could not import the default tip into the runner clone; preserving diff"
+                  : "run failed: finalize base-align conflict; preserving diff",
+                { run_id: runId },
+              );
               await closeBatcher();
               // PRD #1391 Run B M3 (N1): journal write-ahead so the typed base-align-conflict failure
               // — its fail_origin AND its preserved_patch (the canonicaliser handles the diff size) —
@@ -4276,7 +4311,7 @@ export class RunRunner {
               // diff a human needs to land.
               await journalTerminalReport({
                 status: "failed",
-                failure_reason: composeBaseAlignConflictReason(alignDefaultBranch, patch !== undefined),
+                failure_reason: composeBaseAlignConflictReason(alignDefaultBranch, patch !== undefined, stage),
                 fail_origin: "finalize_base_align_conflict",
                 preserved_patch: patch,
               });
@@ -4415,6 +4450,27 @@ export class RunRunner {
                 text: "branch is behind the default branch on .github/workflows; aligning before pushing",
               },
             });
+
+            // issue #1769: a self-contained (Codex) clone has no alternate into the bare, so the
+            // fresh default tip `fetchDefaultTip` brought into the bare is not yet readable there.
+            // Import its objects once, before any strategy (overlay included) anchors it. A
+            // `--shared` (Claude) clone already resolves it and this is a probe only. A failure
+            // happens before any merge/rebase, so it fails typed with the import-stage reason.
+            try {
+              await this.git.ensureRunnerCloneObjects(
+                alignBarePath,
+                runnerClone.path,
+                defTip,
+                [runnerClone.baseCommit, runnerClone.defaultBranchCommit ?? ""],
+              );
+            } catch (e) {
+              runLog.warn(
+                "finalize base-align: could not import the default tip into the runner clone; preserving diff and failing typed",
+                { run_id: runId, error: errMessage(e) },
+              );
+              await failBaseAlignConflict("import");
+              return;
+            }
 
             // PRIMARY (issue #627): overlay ONLY the default tip's .github/workflows/ subtree
             // onto the agent tip. It cannot conflict and is a fast-forward (original agent SHAs
@@ -5512,7 +5568,7 @@ export class RunRunner {
     }
     let retained = false;
     try {
-      const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim));
+      const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, flight.executor));
       flight.worktreePath = runnerClone.path;
       flight.branch = runnerClone.branch;
     } catch (err) {
@@ -5532,7 +5588,7 @@ export class RunRunner {
         // else fail closed. Replaces the old worker-scoped getRunOwnership probe, which
         // 404'd on a worker move (Gap 2).
         await this.reclaimTerminalOrphan(barePath, claim, err.clonePath, err.branch, err.ownerRunId, err);
-        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim));
+        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, flight.executor));
         flight.worktreePath = runnerClone.path;
         flight.branch = runnerClone.branch;
       } else if (err instanceof CapturePathMismatchError) {
@@ -5540,7 +5596,7 @@ export class RunRunner {
         // divergence, e.g. an issue owner's `issue-N` vs this mr_rework's `agent-issue-N`).
         // The SAME owner-derived validation decides; any unmet predicate fails closed.
         await this.reclaimTerminalOrphan(barePath, claim, err.journaledPath, err.branch, err.ownerRunId, err);
-        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim));
+        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, flight.executor));
         flight.worktreePath = runnerClone.path;
         flight.branch = runnerClone.branch;
       } else {
@@ -10043,7 +10099,7 @@ export class RunRunner {
    * vs the repo's default branch. The working tree lives ONLY in this clone; the
    * worker fetches the agent branch back from it before pushing (fetchAgentBranch).
    */
-  private async runnerCloneForClaim(barePath: string, claim: ClaimResponse) {
+  private async runnerCloneForClaim(barePath: string, claim: ClaimResponse, executor: Executor) {
     // PRD #218 M2: thread the run id as the tracking-ref OWNERSHIP anchor. The git layer
     // stays claim-agnostic — it consults the tracking ref only when its stamp matches
     // this run id, so neither a fresh run nor a different run on the same issue can
@@ -10066,6 +10122,11 @@ export class RunRunner {
     // cannot seed off a PRIOR (possibly plan-rejected) run's work. `?? undefined` maps the
     // wire's null (a never-published run) to the "do not adopt" sentinel the git layer reads.
     const expectedCheckpointTip = claim.checkpoint_tip ?? undefined;
+    // issue #1769: a Codex (sandboxed) run's command sandbox does not grant the worker bare,
+    // so its clone is dissociated from the bare at seed. Keyed on
+    // `executor.sandboxesCommands`, which the executor sets at construction: `executor.safety`
+    // is populated only inside run(), so it is still unset here. Claude/stub pass false.
+    const cloneOpts = { selfContained: executor.sandboxesCommands === true };
     // PRD #983 M4b: the per-kind branch derivations (ci_fix's default-branch vs run-branch
     // choice, self_improve/prompt's fresh-per-cycle run-id branch, task/mr_rework's
     // pre-seeded branch with its loud missing-branch guard) live in RUN_KIND_PROFILES. A
@@ -10083,10 +10144,11 @@ export class RunRunner {
         runId,
         resume,
         expectedCheckpointTip,
+        cloneOpts,
       );
     if (claim.issue_iid == null)
       throw new Error("issue run claim is missing issue_iid");
-    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId, resume, expectedCheckpointTip);
+    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId, resume, expectedCheckpointTip, cloneOpts);
   }
 
   /**
