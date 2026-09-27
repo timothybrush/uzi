@@ -775,6 +775,17 @@ func (m tuiModel) renderDetail() string {
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 120)), m.width) + "\n")
 	}
 
+	// The vault park line (issue #1766), in the same slot and wait ink as the Codex hold line
+	// above: a vault_locked park is a recovery_wait run whose cause differs from the Codex hold's,
+	// so the two never both draw. fitVaultParkLine sheds the explanation to m.width so the
+	// retry HH:MM (at the sentence's end) survives instead of being clamped away; the 240-rune
+	// cap matches the board's second line (the full sentence is longer than 120), and
+	// clampVisual is the narrow-terminal backstop keeping it one physical row, which
+	// transcriptViewport charges (the #379 invariant).
+	if line := fitVaultParkLine(d.run, m.width); line != "" {
+		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 240)), m.width) + "\n")
+	}
+
 	// The near-timeout countdown (PRD #1170), the run detail's OTHER conditional second
 	// row. Drawn only while the run is flagged `slow` and carries a deadline_at, in the
 	// stall colour that matches the ▲ token above. fitNearTimeoutLine sheds clauses to

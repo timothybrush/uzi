@@ -123,6 +123,10 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	if line := codexAccountActionLine(r); line != "" {
 		rows = append(rows, []string{"CODEX_ACCOUNT", line})
 	}
+	// VAULT (issue #1766): a vault_locked park, emit-only-when-parked, with its next retry.
+	if line := vaultParkLine(r); line != "" {
+		rows = append(rows, []string{"VAULT", line})
+	}
 	if r.HealthReason != nil && *r.HealthReason != "" {
 		rows = append(rows, []string{"HEALTH_REASON", sanitizeTTY(*r.HealthReason)})
 	}
@@ -1485,7 +1489,8 @@ func steerKindLabel(kind string) string {
 // PRD #1392 M5: recoveryCause is the optional RecoveryWaitCause of a recovery_wait run — a
 // variadic tail so the ~two dozen existing call sites that do not have it stay valid. When
 // it is "forge_unreachable" the recovery suffix names the forge instead of the transient
-// empty turn; "codex_account_unavailable" (PRD #1590) names the Codex account.
+// empty turn; "codex_account_unavailable" (PRD #1590) names the Codex account, and
+// "vault_locked" (issue #1766) names the vault unlock the run is waiting for.
 func steerState(kind string, consumedAt *time.Time, disposition *string, runStatus string, recoveryCause ...string) string {
 	// PRD #634: a scope directive's state IS its disposition — it is never consumed, so
 	// consumed_at/runStatus carry no delivery signal for it. A nil disposition means the
@@ -1526,6 +1531,12 @@ func steerState(kind string, consumedAt *time.Time, disposition *string, runStat
 	// interruption; the action detail lives on the run-get row and the TUI detail line.
 	if len(recoveryCause) > 0 && recoveryCause[0] == codexAccountUnavailableCause {
 		recoveringSuffix = " (run held on its Codex account)"
+	}
+	// Issue #1766: a run parked because a Codex credential refresh or release found its
+	// owner's vault locked waits for the vault unlock (the words vaultParkLine and the web
+	// run page's "Waiting for vault unlock" heading use).
+	if len(recoveryCause) > 0 && recoveryCause[0] == vaultLockedCause {
+		recoveringSuffix = " (run waiting for vault unlock)"
 	}
 	if consumedAt == nil {
 		if terminalRunStatuses[runStatus] {
@@ -1579,6 +1590,67 @@ const forgeUnreachableCause = "forge_unreachable"
 // unreachable (PRD #1392 M5) — the one cause that swaps in forge-specific surface wording.
 func isForgePark(r apitypes.RunDTO) bool {
 	return r.Status == statusRecoveryWait && strOr(r.RecoveryWaitCause, "") == forgeUnreachableCause
+}
+
+// vaultLockedCause is the RecoveryWaitCause of a run parked because a Codex credential
+// refresh or release found its owner's vault locked (issue #1766). It resumes at its next
+// timer-based retry (RecoveryRetryNotBefore) once the vault is unlocked (while it stays
+// locked, a promoted run waits queued), so no surface promises an instant resume on unlock.
+const vaultLockedCause = "vault_locked"
+
+// isVaultLockedPark reports whether a recovery_wait run is parked on a locked vault (issue #1766).
+func isVaultLockedPark(r apitypes.RunDTO) bool {
+	return r.Status == statusRecoveryWait && strOr(r.RecoveryWaitCause, "") == vaultLockedCause
+}
+
+// vaultParkLine is the vault_locked park sentence (issue #1766) `uzi run get`'s VAULT row and
+// the `run logs --follow` notice share, "" for any other run. It is OWNER-NEUTRAL ("the run
+// owner's vault"), like codexAccountActionLine's "the run's": an admin reading another owner's
+// run sees the same words, and the CLI does not tell the reader to unlock anything. The retry
+// clause is HH:MM on the viewer's local wall clock, like forgeParkLine, and is dropped when
+// the server sent no retry stamp.
+func vaultParkLine(r apitypes.RunDTO) string {
+	if !isVaultLockedPark(r) {
+		return ""
+	}
+	return vaultParkLead + ": the run owner's vault was locked when this Codex run needed its credential; once the vault is unlocked it resumes at " + vaultRetryClause(r)
+}
+
+// vaultParkLead is the load-bearing opening every vault park rendering starts with.
+const vaultParkLead = "waiting for vault unlock"
+
+// vaultRetryClause is "its next retry (HH:MM)", or "its next retry" with no retry stamp.
+func vaultRetryClause(r apitypes.RunDTO) string {
+	if r.RecoveryRetryNotBefore == nil {
+		return "its next retry"
+	}
+	return "its next retry (" + r.RecoveryRetryNotBefore.Local().Format("15:04") + ")"
+}
+
+// fitVaultParkLine is vaultParkLine shed to fit a physical width, for the TUI's one-row slots
+// (the board's selected second line and the run detail line). The full sentence ends in the
+// retry time, so clamping it from the right would cut exactly the HH:MM; instead the
+// explanation sheds first: full sentence, then "waiting for vault unlock: once unlocked it
+// resumes at its next retry (HH:MM)", then the floor "waiting for vault unlock · retry HH:MM"
+// (just the lead without a retry stamp). The floor is never cut here, even when it alone
+// overflows; the caller's clampVisual handles that pathological narrow case. "" for any run
+// that is not a vault_locked park.
+func fitVaultParkLine(r apitypes.RunDTO, width int) string {
+	full := vaultParkLine(r)
+	if full == "" {
+		return ""
+	}
+	floor := vaultParkLead
+	if r.RecoveryRetryNotBefore != nil {
+		floor += " · retry " + r.RecoveryRetryNotBefore.Local().Format("15:04")
+	}
+	short := vaultParkLead + ": once unlocked it resumes at " + vaultRetryClause(r)
+	for _, cand := range []string{full, short} {
+		if visualWidth(cand) <= width {
+			return cand
+		}
+	}
+	return floor
 }
 
 // codexAccountUnavailableCause is the RecoveryWaitCause of a run held on its Codex
@@ -1660,10 +1732,13 @@ func codexAccountActionShort(r apitypes.RunDTO) string {
 // runStatusCell is the STATUS cell of the run tables (`uzi run list`, `uzi admin runs`):
 // displayRunStatus, plus the short Codex account action in parentheses for a run held on its
 // Codex account (PRD #1590), so the list says what the held run needs without a `run get`.
+// Issue #1766: a vault_locked park adds "(waiting for vault unlock)" the same way.
 func runStatusCell(r apitypes.RunListItemDTO) string {
 	s := displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState)
 	if short := codexAccountActionShort(r.RunDTO); short != "" {
 		s += " (" + short + ")"
+	} else if isVaultLockedPark(r.RunDTO) {
+		s += " (waiting for vault unlock)"
 	}
 	return s
 }
