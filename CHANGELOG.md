@@ -46,6 +46,9 @@ through `[0.52.0]`.)
 - **`uzi run pause` now works on Codex-harness runs ([#1764](https://github.com/vtmocanu/uzi/issues/1764)).**
   A milestone pause parks the run after the milestone in progress, with its checkpoint pushed first, and `uzi run pause --now` interrupts the current turn and parks instead of cancelling the run. If the checkpoint cannot be published, the run shows `pause_failed` and keeps running (a `--now` pause during planning instead leaves the run to be requeued), as on Claude runs. `uzi run resume` continues from the parked session with milestone progress kept.
 
+- **The TUI run view no longer picks up a stale live stream when you reopen the same run ([#1151](https://github.com/vtmocanu/uzi/issues/1151)).**
+  Leaving a run's detail view and quickly reopening it could let the previous session's late socket or run refresh land in the new one: the view could drop to 2s polling, run a second reader over the stream, leak a connection, or show older milestones. Late replies from an earlier session are now ignored and a stale socket is closed.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added
