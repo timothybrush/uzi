@@ -461,8 +461,8 @@ type Store interface {
 	CreateAutoMRReworkRun(ctx context.Context, arg store.CreateAutoMRReworkRunParams) (store.Run, error)
 	// On-demand mr_rework (PRD #1202): StartMRReworkForRun reads the loop-guard ledger
 	// (what is new since the last cycle) and advances the consumed high-water WITHOUT
-	// spending an automatic cycle; UserHasAnthropicToken is the door-check that the owner
-	// can pay for the run the endpoint would mint.
+	// spending an automatic cycle; UserHasEnabledAnthropicToken is the door-check that the
+	// owner can pay for the run the endpoint would mint.
 	GetMRReworkLedger(ctx context.Context, arg store.GetMRReworkLedgerParams) (store.MrReworkLedger, error)
 	// CreateManualMRReworkRunAndAdvance folds the on-demand run INSERT and the non-counting
 	// high-water advance into ONE atomic statement (PRD #1202, review-finding hardening):
@@ -470,6 +470,9 @@ type Store interface {
 	// lets the automatic watcher re-fire on the same comments.
 	CreateManualMRReworkRunAndAdvance(ctx context.Context, arg store.CreateManualMRReworkRunAndAdvanceParams) (store.Run, error)
 	UserHasAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error)
+	// UserHasEnabledAnthropicToken is the door-check's ENABLED variant (PRD #1732 D15): a
+	// Claude rework is mintable only when the owner holds an enabled token.
+	UserHasEnabledAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error)
 	// Self-improvement runs (PRD #46 Decision 10).
 	CreateSelfImproveRun(ctx context.Context, arg store.CreateSelfImproveRunParams) (store.Run, error)
 	// Scheduled prompt runs (PRD #241).
@@ -796,6 +799,22 @@ type Store interface {
 	// rows (guard fail) is the non-paused ack the worker's park order must retain the run on.
 	SetRunCompletionHold(ctx context.Context, arg store.SetRunCompletionHoldParams) (store.Run, error)
 	ResumePausedRun(ctx context.Context, arg store.ResumePausedRunParams) (store.ResumePausedRunRow, error)
+	// PRD #1732 D14: the credential_disabled park writer (exact undelivered claim), and the
+	// promoter's two keyset worklists (one owner's held runs; owners with any held run).
+	ParkCredentialDisabledRun(ctx context.Context, arg store.ParkCredentialDisabledRunParams) (int64, error)
+	ListCredentialDisabledRuns(ctx context.Context, arg store.ListCredentialDisabledRunsParams) ([]store.ListCredentialDisabledRunsRow, error)
+	ListCredentialDisabledUsers(ctx context.Context, arg store.ListCredentialDisabledUsersParams) ([]uuid.UUID, error)
+	PromoteCredentialDisabledRun(ctx context.Context, arg store.PromoteCredentialDisabledRunParams) (store.PromoteCredentialDisabledRunRow, error)
+	ReassignCredentialDisabledRun(ctx context.Context, arg store.ReassignCredentialDisabledRunParams) (store.ReassignCredentialDisabledRunRow, error)
+	// The held-run reassignment's locked re-read and the two settles it shares with the promoter
+	// (a pending pause, a spent budget); see reassignCredentialDisabledRun.
+	LockCredentialDisabledRunForPromotion(ctx context.Context, arg store.LockCredentialDisabledRunForPromotionParams) (store.LockCredentialDisabledRunForPromotionRow, error)
+	SettleCredentialDisabledPause(ctx context.Context, arg store.SettleCredentialDisabledPauseParams) (store.SettleCredentialDisabledPauseRow, error)
+	SettleCredentialDisabledSpentBudget(ctx context.Context, arg store.SettleCredentialDisabledSpentBudgetParams) (store.SettleCredentialDisabledSpentBudgetRow, error)
+	// LockSecretForPromotion share-locks one of the owner's credentials and reports whether it
+	// is enabled: the promoter's requirement check, and the in-transaction D5 re-check of a new
+	// per-run pin (lockPinnedOverrideEnabled). pgx.ErrNoRows: missing or another owner's.
+	LockSecretForPromotion(ctx context.Context, arg store.LockSecretForPromotionParams) (bool, error)
 	// ReleaseCredentialSwitch is the held-state credential-switch RELEASE transition (PRD
 	// #1247 M5, D3/D4/D14): a worker's {status:"credential_switch", claim_generation} report
 	// requeues the held run in ONE fenced statement — generation- and release-gated, banking
@@ -1081,6 +1100,8 @@ type Store interface {
 	ListChatRunsForUser(ctx context.Context, userID uuid.UUID) ([]store.ListChatRunsForUserRow, error)
 	GetLiveChatForUser(ctx context.Context, userID uuid.UUID) (store.Run, error)
 	ClaimChatRun(ctx context.Context, arg store.ClaimChatRunParams) (store.Run, error)
+	// ParkCredentialDisabledChatRun holds a claimed chat on credential_disabled (PRD #1732 D2).
+	ParkCredentialDisabledChatRun(ctx context.Context, arg store.ParkCredentialDisabledChatRunParams) (int64, error)
 	GetChatRunClaimContext(ctx context.Context, runID uuid.UUID) (pgtype.Text, error)
 	CountChatFollowUps(ctx context.Context, runID uuid.UUID) (int64, error)
 	SweepIdleChatRuns(ctx context.Context, cutoff pgtype.Timestamptz) ([]store.SweepIdleChatRunsRow, error)
@@ -1151,8 +1172,8 @@ type Store interface {
 	// Worker → token binding (PRD #104 M3): label resolution for the mint-time and
 	// CLI-facing forms, and the id-keyed rebind itself.
 	GetUserSecretIDByLabel(ctx context.Context, arg store.GetUserSecretIDByLabelParams) (uuid.UUID, error)
-	// UserHasAutoEligibleAnthropicToken reports whether the owner has ≥1 auto_eligible
-	// anthropic_token (a non-empty auto-select pool). CreateWorker reads it to derive a
+	// UserHasAutoEligibleAnthropicToken reports whether the owner has ≥1 enabled,
+	// auto_eligible anthropic_token (a non-empty auto-select pool). CreateWorker reads it to derive a
 	// new worker's bind mode the #804 way (PRD #1140 M1): no label + non-empty pool → auto.
 	UserHasAutoEligibleAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error)
 	SetWorkerAnthropicSecret(ctx context.Context, arg store.SetWorkerAnthropicSecretParams) (store.Worker, error)
@@ -1160,6 +1181,9 @@ type Store interface {
 	// at judge-claim time, written by PUT /api/me/judge in one statement (D6).
 	GetUserJudgeAnthropicBinding(ctx context.Context, id uuid.UUID) (store.GetUserJudgeAnthropicBindingRow, error)
 	SetUserJudgeAnthropicBinding(ctx context.Context, arg store.SetUserJudgeAnthropicBindingParams) (store.User, error)
+	// The Judge opt-in, written in the same secret-mutation transaction as the binding
+	// (SetUserJudgeBinding) so a PUT that names a token is all-or-nothing.
+	SetUserJudgeEnabled(ctx context.Context, arg store.SetUserJudgeEnabledParams) (store.User, error)
 	// Per-harness worker-model lanes (PRD #1551 M4, D4): read at issue- and chat-run
 	// claim assembly, keyed on the run owner. The lane matching the already-frozen run
 	// harness replaces the legacy shared default_model; each lane NULL ⇒ inherit.
@@ -1691,6 +1715,12 @@ type Service struct {
 	codexPromote codexAccountPageCursor
 	// codexPromoteHooks are the promotion pass's LiveDB race seams (nil in production).
 	codexPromoteHooks *codexPromoteTestHooks
+	// credPromote coalesces requested credential_disabled promoter passes per owner (PRD
+	// #1732 D14). Zero value ready; see RequestCredentialDisabledPromotion.
+	credPromote credentialPromoteQueue
+	// credPromoteHooks are the credential_disabled promoter's LiveDB race seams (nil in
+	// production, so inert unless a test sets it; the codexPromoteHooks idiom above).
+	credPromoteHooks *credentialPromoteTestHooks
 	// readyAt is the moment the worker-facing listener(s) became ready (PRD #1390 M1, D1),
 	// stored as Unix nanoseconds (0 = not yet ready). main.go writes it via SetReadyAt after
 	// binding every enabled listener; the sweeper goroutine reads it each tick to anchor the
@@ -5179,33 +5209,48 @@ func (s *Service) SetWorkerAnthropicToken(ctx context.Context, userID, workerID 
 	if mode != BindModePinned {
 		secretID = nil
 	}
-	var bind pgtype.UUID
-	if secretID != nil {
-		// Confirm the secret is this user's before writing, so the caller gets a 404
-		// naming what was wrong instead of a 500 from the FK.
-		if _, err := s.q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
-			ID:     *secretID,
-			UserID: userID,
-		}); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return store.Worker{}, ErrSecretNotOwned
+	// PRD #1732 D14: the rebind runs under the user's secret mutation lock, the lock order the
+	// credential_disabled promoter shares, and requests a promoter pass after commit (a worker
+	// rebound onto an enabled credential resumes the runs it parked).
+	var wkr store.Worker
+	err := s.withSecretMutation(ctx, userID, func(q secretMutationQueries) error {
+		var bind pgtype.UUID
+		if secretID != nil {
+			// Confirm the secret is this user's before writing, so the caller gets a 404
+			// naming what was wrong instead of a 500 from the FK.
+			row, err := q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
+				ID:     *secretID,
+				UserID: userID,
+			})
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return ErrSecretNotOwned
+				}
+				return err
 			}
-			return store.Worker{}, err
+			// PRD #1732 D5: a new binding onto a disabled credential is refused, not stored.
+			// Read under the secret mutation lock, so a concurrent disable is serialized.
+			if row.Disabled {
+				return ErrCredentialDisabled
+			}
+			bind = pgconv.UUID(*secretID)
 		}
-		bind = pgconv.UUID(*secretID)
-	}
-	wkr, err := s.q.SetWorkerAnthropicSecret(ctx, store.SetWorkerAnthropicSecretParams{
-		ID:                workerID,
-		UserID:            userID,
-		AnthropicSecretID: bind,
-		AnthropicBindMode: mode,
+		var err error
+		wkr, err = q.SetWorkerAnthropicSecret(ctx, store.SetWorkerAnthropicSecretParams{
+			ID:                workerID,
+			UserID:            userID,
+			AnthropicSecretID: bind,
+			AnthropicBindMode: mode,
+		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrWorkerNotFound
+		}
+		return err
 	})
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return store.Worker{}, ErrWorkerNotFound
-		}
 		return store.Worker{}, err
 	}
+	s.RequestCredentialDisabledPromotion(userID)
 	return wkr, nil
 }
 
@@ -5220,7 +5265,13 @@ func (s *Service) SetWorkerAnthropicToken(ctx context.Context, userID, workerID 
 // Ownership is checked here so the caller gets a 404 rather than a constraint
 // violation; 00079's composite FK refuses the same binding independently, and is
 // the layer that holds if this check is ever bypassed (D11).
-func (s *Service) SetUserJudgeBinding(ctx context.Context, userID uuid.UUID, mode string, secretID *uuid.UUID) (store.User, error) {
+//
+// optIn, when non-nil, is the Judge opt-in (users.judge_enabled) the same PUT carries. It is
+// written in the SAME transaction, under the user's secret mutation lock and after the
+// ownership and D5 enablement checks, so a request naming a disabled (or foreign) token writes
+// neither half: a disable that commits first is seen by the locked check and refuses the whole
+// request, and one that commits later waits for this transaction (PRD #1732 D5).
+func (s *Service) SetUserJudgeBinding(ctx context.Context, userID uuid.UUID, mode string, secretID *uuid.UUID, optIn *bool) (store.User, error) {
 	if !ValidBindMode(mode) {
 		return store.User{}, ErrInvalidBindMode
 	}
@@ -5230,24 +5281,46 @@ func (s *Service) SetUserJudgeBinding(ctx context.Context, userID uuid.UUID, mod
 	if mode != BindModePinned {
 		secretID = nil
 	}
-	var bind pgtype.UUID
-	if secretID != nil {
-		if _, err := s.q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
-			ID:     *secretID,
-			UserID: userID,
-		}); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return store.User{}, ErrSecretNotOwned
+	// PRD #1732 D14: same lock order and post-commit promoter request as the worker rebind.
+	var user store.User
+	err := s.withSecretMutation(ctx, userID, func(q secretMutationQueries) error {
+		var bind pgtype.UUID
+		if secretID != nil {
+			row, err := q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
+				ID:     *secretID,
+				UserID: userID,
+			})
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return ErrSecretNotOwned
+				}
+				return err
 			}
-			return store.User{}, err
+			// PRD #1732 D5: a new binding onto a disabled credential is refused, not stored.
+			// Read under the secret mutation lock, so a concurrent disable is serialized.
+			if row.Disabled {
+				return ErrCredentialDisabled
+			}
+			bind = pgconv.UUID(*secretID)
 		}
-		bind = pgconv.UUID(*secretID)
-	}
-	return s.q.SetUserJudgeAnthropicBinding(ctx, store.SetUserJudgeAnthropicBindingParams{
-		ID:                     userID,
-		JudgeAnthropicBindMode: mode,
-		JudgeAnthropicSecretID: bind,
+		if optIn != nil {
+			if _, err := q.SetUserJudgeEnabled(ctx, store.SetUserJudgeEnabledParams{ID: userID, JudgeEnabled: *optIn}); err != nil {
+				return err
+			}
+		}
+		var err error
+		user, err = q.SetUserJudgeAnthropicBinding(ctx, store.SetUserJudgeAnthropicBindingParams{
+			ID:                     userID,
+			JudgeAnthropicBindMode: mode,
+			JudgeAnthropicSecretID: bind,
+		})
+		return err
 	})
+	if err != nil {
+		return store.User{}, err
+	}
+	s.RequestCredentialDisabledPromotion(userID)
+	return user, nil
 }
 
 // ResolveTokenLabel exposes label → secret id for the handler's PATCH body, which
@@ -5696,6 +5769,21 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 				return store.Run{}, verr
 			}
 			effOverride = ov
+		} else if err := checkStoredOverrideEnabled(ctx, q, userID, credOverride); err != nil {
+			// PRD #1732 D2: a schedule's stored pin that has since been disabled starts no
+			// run on it; the scheduler records the credential_disabled skip.
+			return store.Run{}, err
+		}
+		// PRD #1732 D5/D2: both reads above are plain, so the pin is share-locked and re-read in
+		// this transaction; a disable committed since is refused (the same sentinel), and one
+		// committing later waits for this create and meets a stored pin. A requested pin that
+		// vanished is the validator's 404; a stored one inherits, as checkStoredOverrideEnabled.
+		pinMissing := error(nil)
+		if rawOverride != nil {
+			pinMissing = ErrCredentialOverrideSecretNotFound
+		}
+		if err := lockPinnedOverrideEnabled(ctx, q, userID, effOverride, pinMissing); err != nil {
+			return store.Run{}, err
 		}
 		// Stamp unseeded issue runs for either resolved harness when the switch is on.
 		var completionContractVersion pgtype.Int4
@@ -6240,6 +6328,10 @@ type SweepResult struct {
 	// ONE per distinct held-run owner per tick (the anti-stampede stagger), so on a
 	// busy resume it climbs one owner at a time across ticks. Normally 0.
 	PoolResumed int64
+	// CredentialPromoted is the number of runs this pass's credential_disabled promoter
+	// returned to queued because their exact credential requirement is enabled again (PRD
+	// #1732 D14, the restart-safe fallback to the post-commit pass). Normally 0.
+	CredentialPromoted int64
 	// LimitReevaluated is the number of still-parked limit_wait runs this pass LOWERED to
 	// retry_not_before = now() because their `auto` next claim now has a pooled
 	// alternative that is spendable sooner than their park (PRD #1247 M3, D8 — Decision

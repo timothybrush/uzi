@@ -1559,7 +1559,7 @@ point individual workers at them. The CLI can **read** that set and **move a
 worker between its members** — it cannot change the set itself:
 
 ```sh
-uzi token list                                 # labels, default flag, pool opt-in, live eligibility
+uzi token list                                 # labels, default flag, pool opt-in, live eligibility, enabled state
 uzi token pool console-key --on                # add it to the auto-selection pool
 uzi token pool console-key --off               # take it back out
 uzi worker set-token <worker-id> console-key   # bind a worker to a named token
@@ -1592,6 +1592,17 @@ Under `--json` the same answer is the `auto_status` field. It is always
 present and is **`null` when it is not known** — which is not the same as
 "not eligible", so branch on null before you branch on the value. An
 un-pooled token reports `not_pooled` there rather than the table's `-`.
+
+The last column, `STATE`, is `enabled` or `disabled since <date>` for a
+credential you have [disabled](./anthropic-token.md#disabling-a-token) in
+Settings; `--json` carries it as `enabled` (true/false) and `disabled_at`
+(null while enabled). A disabled token keeps its `POOL` opt-in but reads `-`
+under `ELIGIBLE`, since nothing picks it while it is disabled; under `--json`
+its `auto_status` is `null`, because uzi reads no usage for it, so a script
+checks `enabled` first and treats a `null` `auto_status` as "unknown" only for
+an enabled token. `uzi token pool <name> --on` refuses a disabled token.
+Disabling and enabling are
+web-only; the CLI has no command for them.
 
 `uzi worker list` carries a `TOKEN` column showing how each worker chooses:
 the token's **name** when it is pinned, or `default` / `auto`. An `auto`
@@ -1830,7 +1841,15 @@ A run's `status` (on `run get` and `run list`) is one of exactly **thirteen** va
   pause carries none of them. Before it parks that way, an interlocked run
   also passes through two running-state `COMPLETION` labels of its own —
   **Checking completion** and **Reworking unmet milestones** — still `status:
-  running` underneath, not a distinct CLI status value.
+  running` underneath, not a distinct CLI status value. A `paused` run can
+  also be **waiting on a disabled credential** (`hold_reason:
+  credential_disabled`): a token or Codex login it needs was [disabled in
+  Settings](anthropic-token.md#work-that-needs-a-disabled-token-waits). It
+  resumes on its own once that credential is enabled again. `run get` prints
+  a `HOLD` row reading `credential disabled` with the next step (enable it in
+  Settings, or `uzi run set-token` where the run accepts a token switch),
+  `run list` shows `paused (credential disabled)`, and the TUI draws it as
+  `⊘ cred disabled` in NEEDS YOU.
 
 `limit_wait` and `recovery_wait` auto-resume on their own on a timer — nothing
 to do but wait or cancel; `pool_wait` instead clears only when a token is

@@ -74,6 +74,7 @@ type AnthropicRateLimit struct {
 	SevenDayResetsAt pgtype.Timestamptz `json:"seven_day_resets_at"`
 	Source           pgtype.Text        `json:"source"`
 	SyncedAt         pgtype.Timestamptz `json:"synced_at"`
+	EnablementRev    int64              `json:"enablement_rev"`
 }
 
 type AppSetting struct {
@@ -163,6 +164,7 @@ type CodexAccountRateLimit struct {
 	AttemptError               pgtype.Text        `json:"attempt_error"`
 	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt                  pgtype.Timestamptz `json:"updated_at"`
+	EnablementSig              pgtype.Text        `json:"enablement_sig"`
 }
 
 type CodexCredentialState struct {
@@ -901,16 +903,18 @@ type User struct {
 }
 
 type UserSecret struct {
-	ID           uuid.UUID          `json:"id"`
-	UserID       uuid.UUID          `json:"user_id"`
-	Kind         string             `json:"kind"`
-	Ciphertext   []byte             `json:"ciphertext"`
-	CreatedAt    pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
-	SealedWith   string             `json:"sealed_with"`
-	Label        string             `json:"label"`
-	IsDefault    bool               `json:"is_default"`
-	AutoEligible bool               `json:"auto_eligible"`
+	ID            uuid.UUID          `json:"id"`
+	UserID        uuid.UUID          `json:"user_id"`
+	Kind          string             `json:"kind"`
+	Ciphertext    []byte             `json:"ciphertext"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	SealedWith    string             `json:"sealed_with"`
+	Label         string             `json:"label"`
+	IsDefault     bool               `json:"is_default"`
+	AutoEligible  bool               `json:"auto_eligible"`
+	DisabledAt    pgtype.Timestamptz `json:"disabled_at"`
+	EnablementRev int64              `json:"enablement_rev"`
 }
 
 type UserVault struct {

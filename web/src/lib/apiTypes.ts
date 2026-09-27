@@ -59,6 +59,27 @@ export interface User {
   last_login: string | null;
 }
 
+// SecretDependentPage is one paged list in the dependents read (PRD #1732 D11): the first
+// page of items, the TOTAL count (which can exceed the page), and a cursor for the next page.
+export interface SecretDependentPage<T> {
+  items: T[];
+  total: number;
+  next_cursor?: string;
+}
+
+// SecretDependents is GET /api/me/secrets/{kind}/{id}/dependents (PRD #1732 D11): what relies
+// on one credential right now, read by the Disable dialog. `default` says whether it is its
+// slot's default; `judge` whether the run judge is pinned to it; `enabled_siblings` are the
+// other ENABLED Codex aliases on the same provider account (always empty for Anthropic).
+export interface SecretDependents {
+  default: boolean;
+  judge: boolean;
+  workers: SecretDependentPage<{ id: string; name: string }>;
+  schedules: SecretDependentPage<{ id: string; target: string }>;
+  runs: SecretDependentPage<{ id: string; status: string }>;
+  enabled_siblings: SecretDependentPage<{ id: string; label: string }>;
+}
+
 // SecretMeta is the metadata-only view of ONE stored per-user secret. The secret
 // value is never returned by the API, so it never appears here.
 //
@@ -84,6 +105,14 @@ export interface SecretMeta {
    *  moves a codex_auth row to "linked" or "failed". Optional, matching the omitempty,
    *  and stateless UI (a badge read straight off this — never a second fetch). */
   codex_status?: string;
+  /** PRD #1732 D10: whether the credential is available. A disabled credential keeps its
+   *  value, label, pool opt-in and sidebar preference; it is only suspended. It never keeps
+   *  the default flag (D4: a disabled credential is never the default).
+   *  `enabled` is derived server-side from `disabled_at IS NULL`. */
+  enabled: boolean;
+  /** When the credential was disabled (ISO-8601), null while enabled. A repeated disable
+   *  keeps the original timestamp, so this is the "Disabled since" date. */
+  disabled_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -695,6 +724,12 @@ export interface LatestRun {
   // null for a non-running/chat/judge/interactive run. Optional for the same api/web
   // rollout skew as is_planning: a pre-feature api pod omits the key.
   deadline_at?: string | null;
+  // hold_reason (PRD #1226/#1497/#1732): why a `paused` run is server-held, null for an owner
+  // pause or a non-paused run. Non-sensitive, so the board projection sends it on every card
+  // (api/internal/handler/board.go latestRunDTO.HoldReason). effectiveRunStatus overlays
+  // 'credential_disabled' so the card reads "waiting: credential disabled", not "paused".
+  // Optional for api/web rollout skew: an absent key reads as no hold.
+  hold_reason?: string | null;
   owner_name: string;
   worker_name: string | null;
   is_mine: boolean;
@@ -1490,7 +1525,8 @@ export type ScheduleSkipReason =
   | "open_mr_exists"
   | "codex_override_conflict"
   | "schedules_paused"
-  | "no_usable_credential";
+  | "no_usable_credential"
+  | "credential_disabled";
 
 // One run a persisted fire actually created; issue_iid is null for a prompt schedule.
 export interface LastFireStarted {
@@ -2663,7 +2699,10 @@ export interface Run {
    *  server-validated milestone keys (not free text), but still sanitize before writing to a
    *  terminal (same rule as milestones).
    *
-   *  `hold_reason` is 'completion_blocked' when the run parked in a completion hold, else null.
+   *  `hold_reason` names why a `paused` run is server-held, else null: 'completion_blocked' for
+   *  a completion hold, 'credential_disabled' for a run waiting on a disabled credential
+   *  (PRD #1732 D14; resumes on Enable, never on a plain Resume), 'budget_exhausted' for a
+   *  wall-clock park (PRD #1497). Render an unrecognised value honestly.
    *  `hold_context` is the constant "unavailable(same_worker_only)" ONLY while held, else null:
    *  the UI/CLI state the hold's durability HONESTLY from it — the hold is same-worker-only and
    *  must NOT be shown as cross-worker durable.

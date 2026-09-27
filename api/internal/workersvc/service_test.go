@@ -184,6 +184,13 @@ type fakeStore struct {
 	// SQLSTATE errors to drive finishRunClaim's bounded 55P03 retry.
 	claimFinishLockErrs []error
 	claimFinishBegins   int
+	// PRD #1732 D14: claimSecretDisabled is what the finisher's enablement re-check reads for
+	// the resolved credential; claimSecretLockErrs is consumed one per re-check (55P03
+	// staging); claimCredParked records the COMMITTED credential_disabled park.
+	claimSecretDisabled bool
+	claimSecretLockErrs []error
+	claimSecretChecks   int
+	claimCredParked     *store.ParkCredentialDisabledRunParams
 	// hasActiveRunForIssue is what the CreateRun dedup pre-check returns (PRD #754 M4);
 	// hasActiveRunForIssueErr forces its error path.
 	hasActiveRunForIssue    bool
@@ -758,6 +765,9 @@ func (f *fakeStore) ClaimChatRun(_ context.Context, arg store.ClaimChatRunParams
 	f.callOrder = append(f.callOrder, "claim_chat")
 	return f.chatClaimRun, f.chatClaimErr
 }
+func (f *fakeStore) ParkCredentialDisabledChatRun(context.Context, store.ParkCredentialDisabledChatRunParams) (int64, error) {
+	return 1, nil
+}
 func (f *fakeStore) GetChatRunClaimContext(context.Context, uuid.UUID) (pgtype.Text, error) {
 	return f.resumeSession, nil
 }
@@ -928,6 +938,17 @@ func (f *fakeStore) GetUserSecretMetaByIDOfKind(_ context.Context, arg store.Get
 		label = "token-" + arg.ID.String()[:8]
 	}
 	return store.GetUserSecretMetaByIDOfKindRow{ID: arg.ID, Label: label, Kind: arg.Kind}, nil
+}
+
+// LockSecretForPromotion mirrors the owner-scoped share-locked enablement read (PRD #1732)
+// over the same byIDSecrets fixtures: a missing or foreign id is pgx.ErrNoRows, and a staged
+// token reads enabled (the fake stages no disabled state; the live-DB tests own that).
+func (f *fakeStore) LockSecretForPromotion(_ context.Context, arg store.LockSecretForPromotionParams) (bool, error) {
+	row, ok := f.byIDSecrets[arg.ID]
+	if !ok || (row.UserID != uuid.Nil && row.UserID != arg.UserID) {
+		return false, pgx.ErrNoRows
+	}
+	return true, nil
 }
 
 // RecordRunCredentialEpoch records the per-claim attribution-journal write (PRD #1247
@@ -1578,6 +1599,9 @@ func (f *fakeStore) CreateManualMRReworkRunAndAdvance(_ context.Context, arg sto
 	return f.mrReworkRunResult, f.mrReworkRunErr
 }
 func (f *fakeStore) UserHasAnthropicToken(context.Context, uuid.UUID) (bool, error) {
+	return f.hasAnthropicToken, f.hasAnthropicTokenErr
+}
+func (f *fakeStore) UserHasEnabledAnthropicToken(context.Context, uuid.UUID) (bool, error) {
 	return f.hasAnthropicToken, f.hasAnthropicTokenErr
 }
 func (f *fakeStore) CreatePromptRun(_ context.Context, arg store.CreatePromptRunParams) (store.Run, error) {
