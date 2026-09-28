@@ -22,7 +22,12 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.85.0] - 2026-09-26
+
 ### Added
+
+- **The Helm chart can run on OpenShift and OKD ([#1755](https://github.com/vtmocanu/uzi/issues/1755)).**
+  New opt-in knobs, all off by default: `web.httpRoute` exposes the web frontend through a Gateway API HTTPRoute instead of the nginx Ingress; pod ids can be nulled so OpenShift assigns them; `workers.networkPolicy.dns.ports` sets the worker DNS port (OpenShift DNS pods use 5353); `workers.fqdnEgress.provider: ovn` renders named worker egress as an OVN EgressFirewall plus an external-only NetworkPolicy; and `openshift.enabled` adds SCC grants for the hosted workers and keeps their PodSecurity labels. See the OpenShift and OKD operator page.
 
 - **A plan-gate approve, reject or request-changes now binds to the exact plan it was sent against ([#1795](https://github.com/vtmocanu/uzi/issues/1795)).**
   Each time a plan is shown at the approval gate, the run's `gate_revision` counts up by one, and every verdict the worker takes is matched to that exact revision rather than to a per-claim epoch that could bump after the verdict had already been sent — closing a race where an approve issued right as a new plan was published could be misjudged as stale even though it landed against the plan the owner actually saw. Web, the CLI (`--expected-gate-revision`, readable via `uzi run get --field gate_revision`; a mismatch exits 5) and Slack now send back the revision they displayed, so a decision made against an outdated plan is refused (409 `gate_revision_mismatch`) instead of silently applying to a newer or older one. An approve sent while no gate is visible is ignored with a feed notice; a reject or request-changes sent the same way still applies at the run's next gate, unchanged from before. A worker that cannot re-present a gate it previously showed parks at `recovery_wait` and retries on a fresh claim; past `RUN_GATE_REFUSAL_MAX` (default 3) such refusals the run fails instead, with reason `gate_presentation_refused`. See [ADR-1795](adr/1795-gate-revision-bound-verdicts.md).
@@ -44,6 +49,15 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **The default sweeps no longer all start at 02:00 UTC, and bug triage picks up 4 issues ([#1738](https://github.com/vtmocanu/uzi/pull/1738)).**
+  Bug triage now starts at 00:00, the Planned sweep stays at 02:00, and the assigned-to-uzi sweep moves to 06:00, giving bug runs a two-hour head start before Planned work is queued. Sweeps you already enabled keep their schedule: Reset on the row adopts the new defaults (it also restores UTC and clears other customizations), or set the cron and max issues explicitly with `uzi schedule edit`.
+
+- **Codex runs show their account in the TUI, CLI and web, the way Claude runs show their token ([#1730](https://github.com/vtmocanu/uzi/issues/1730)).**
+  A Codex run names the account alias it was started with: in the web run credential, the TUI board column and rail, and a new `CODEX_ALIAS` row in `uzi run get` (`(deleted)` when the alias is gone). Run reads gain `codex_secret_id`, and the TUI's credential column now counts credentials per harness instead of every secret kind.
+
+- **Hosted workers: larger `l` data volume and a higher docker-tier ephemeral-storage request ([#1757](https://github.com/vtmocanu/uzi/issues/1757)).**
+  The `l` preset's `/data` PVC grows from 20Gi to 25Gi, and a docker-tier worker now requests 5Gi of ephemeral storage instead of 4Gi (`workers.docker.ephemeralRequest`): provisional headroom for the Codex command cache that also ranks a busy worker later under node disk pressure. The chart raises the matching ceilings: `limitRange.maxPVCStorage` 20Gi to 25Gi on both tiers, and `quota.requestsStorage` to 900Gi (restricted) and 650Gi (docker). A cluster that overrides `maxPVCStorage` below 25Gi must raise it: the controller validates the ceilings at startup and refuses to start, which stops reconciliation of every hosted worker. A smaller storage quota or ephemeral request override stays valid; it only limits how many workers fit. Existing workers keep their current PVCs (grow them in place where the StorageClass allows volume expansion). Docker workers roll once for the new request. A request never stops an eviction on a node whose root disk is too small; size worker nodes' root disks for the fleet.
+
 - **The builtin agent roles now match uzi's upstream role library exactly ([#1849](https://github.com/vtmocanu/uzi/issues/1849)).**
   The eleven builtin subagents (every builtin but `lead`) are unchanged copies of the library's published roles, so a synced agent source and the shipped roles no longer disagree. uzi's own rules (the run's scratch directory, the review-snapshot recipe, "no detached checkout", "never run Git inside an export") reach every agent through the worker's prompt instead of the role text, and the fact-checker keeps its forge tools after an agent-source sync. Untouched builtin rows pick up the new text on the next boot. `task nudge:builtins` reports any drift. See [ADR-1849](adr/1849-builtin-agents-mirror-upstream.md).
 - **An ephemeral (run-bound) hosted worker's `/data` volume is now 20Gi by default, whatever its size ([#1815](https://github.com/vtmocanu/uzi/issues/1815)).**
@@ -55,6 +69,21 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Worker restarts log enough to diagnose a run lost across a restart ([#1742](https://github.com/vtmocanu/uzi/issues/1742)).**
+  The worker and api now log the restart window a run crosses (whether a terminal journal was reloaded and what register snapshot was sent), so a run that fails `worker_lost` after an eviction can be traced. Logging only: no behaviour change.
+
+- **Five run and schedule states now display correctly in the web UI and CLI ([#1727](https://github.com/vtmocanu/uzi/issues/1727)).**
+  A failed run start on the issue page keeps its error instead of clearing it on reload. A paused run's "Paused by you at" time and elapsed time, and the CLI's parked ages, come from when the run entered its status (the run now exposes `status_since`), so an extend no longer shifts them. Runs parked on a usage limit or an empty token pool show as waiting in the activity feed, not idle. Judge rationale loads again after collapsing a row mid-fetch. A sweep whose matches were all ineligible shows as starved instead of "matched 0".
+
+- **A run whose subagent is busy is no longer flagged stalled while its parent `Agent` call is still open ([#1394](https://github.com/vtmocanu/uzi/issues/1394)).**
+  The stalled check's "a tool call is in flight" suppression now reads the lead's own tool calls instead of the newest call across every lane, so a subagent's completed calls no longer hide the lead's open dispatch; an unmatched lead call from an earlier claim or query leg no longer counts once a newer init or result marks that leg's boundary.
+
+- **A run that finishes while the api is briefly unreachable no longer fails.**
+  A run with the completion check on asks the api for its completion permit at the very end, and a single network error there failed the whole run, even though its work was already pushed; after the api came back the run still showed as failed. The worker now retries that request until the api answers, for up to 10 minutes, and then completes normally. A real refusal is still handled as before.
+
+- **Hosted workers no longer crash on OpenShift and OKD ([#1761](https://github.com/vtmocanu/uzi/issues/1761)).**
+  CRI-O on OpenShift mounts its own `/run/secrets` into every container, which hid the worker's join-token Secret, so every hosted worker exited at startup. The new `workers.secretMountPath` moves the Secret (for example `/run/uzi-secrets`), and the render refuses `openshift.enabled` without it. The value must be one lower-case directory directly under `/run`, and the controller refuses to start on one that overlaps another worker mount. The worker follows the new path through `UZI_WORKER_TOKEN_FILE`: its entrypoint checks the token's ownership and mode there, and its guardrails deny agent commands that name the Secret directory for Claude, chat and Codex runs. The worker image is pinned separately from the chart, so the chart and the controller both refuse a relocated path unless `workers.image.tag` is `0.85.0-rc.2` or newer: an older image would start but not guard the new directory. A non-semver tag needs `workers.secretMountPathAllowUnversionedImage: true`. The default mount and every existing install are unchanged. The OpenShift DNS example now includes `k8s-app: null`: without it the chart's default DNS label survived Helm's map merge and worker DNS matched no pod.
+
 - **A superseded judge or task-review flight can no longer overwrite the current review ([#1423](https://github.com/vtmocanu/uzi/issues/1423)).**
   When a judge or review run was requeued and reclaimed at a newer claim generation, the old flight could still post its verdict or findings over the new one. The review write is now fenced on the advice run's claim in the same statement: a post from a released or superseded claim, from a judge or review run that has already finished (completed, failed or cancelled), or from a worker that no longer holds the run, persists nothing and is answered with a 409 `stale_claim`, and the worker abandons that flight without failing the run. The worker also sends the advice run's id (`advice_run_id`) with the generation, so a late post from an earlier judge or review run can no longer land under a re-run whose generation happens to match. A worker advertising the new `advice_claim_fence_v1` capability must stamp both `claim_generation` and `advice_run_id` on these posts (omitting either is refused with a 409). Workers without it, including current `credential_switch_v1` workers, keep posting unstamped during an upgrade and are still accepted on a live claim they hold.
 
@@ -65,7 +94,7 @@ through `[0.52.0]`.)
   The issue reference line in a merge request body read `Implements issue #N.`, and GitLab's default closing pattern treats "Implements" as a closing keyword, so merging a held merge request (created without `Closes #N` until its head is verified) still closed the issue on GitLab. The line now reads `Related to #N.`, and the empty-title fallback changes from `Resolve issue #N` to `Work on issue #N`, since GitLab's default merge and squash commit messages carry the title. GitHub and Forgejo were not affected. A verified completion still closes its issue with `Closes #N`.
 
 - **The Fleet upgrade panel no longer counts a hosted worker on an older release as up to date ([#1415](https://github.com/vtmocanu/uzi/issues/1415)).**
-  A hosted worker that the controller reports as settled but that reports a version behind its target (for example a cordoned, draining worker still on its previous release) now reads `outdated` instead of `up_to_date` with a "re-tagged image" note, so it counts toward the attention badge and the "N up to date" summary stays honest. The settled softener from ADR-738 is removed, since agent images are no longer re-tagged (#1720). A fleet deliberately pinned to a pre-#1729 re-tagged tag now reads `outdated`.
+  A hosted worker that the controller reports as settled but that reports a version behind its target (for example a cordoned, draining worker still on its previous release) now reads `outdated` instead of `up_to_date` with a "re-tagged image" note, so it counts toward the attention badge and the "N up to date" summary stays honest. The settled softener from ADR-738 is removed, since agent images are no longer re-tagged ([#1720](https://github.com/vtmocanu/uzi/pull/1720)). A fleet deliberately pinned to a pre-#1729 re-tagged tag now reads `outdated`.
 
 - **A follow-up sent to a Claude issue run now reaches the agent after a milestone checkpoint ([#1152](https://github.com/vtmocanu/uzi/issues/1152)).**
   When the agent checkpointed a finished milestone, queued follow-ups stayed buffered even though the steer queue showed them as Delivered, and the agent could be shown the previous follow-up again. The worker now hands the agent the next queued follow-up (one per turn, in order) after each checkpoint too. The docs now list more cases where a follow-up shows Delivered but is never acted on.
@@ -90,41 +119,6 @@ through `[0.52.0]`.)
   A provider error without a terminal reason but with an HTTP status is now judged transient or permanent from the status, as the rest of the worker already does, so a 400, 401 or 403 fails the run instead of parking it for recovery, while a retryable status still parks it.
 - **The bundled uzi-cli skill no longer calls a `uza_` token read-only ([#1767](https://github.com/vtmocanu/uzi/pull/1767)).**
   A `uza_` token acts as its owner exactly like a `uzc_` token (runs, handoff, schedules) and additionally opens the read-only admin views; only admin writes need the web session. The old wording led agents to think they needed a second login before starting a run.
-
-## [0.85.0] - 2026-09-26
-
-### Added
-
-- **The Helm chart can run on OpenShift and OKD ([#1755](https://github.com/vtmocanu/uzi/issues/1755)).**
-  New opt-in knobs, all off by default: `web.httpRoute` exposes the web frontend through a Gateway API HTTPRoute instead of the nginx Ingress; pod ids can be nulled so OpenShift assigns them; `workers.networkPolicy.dns.ports` sets the worker DNS port (OpenShift DNS pods use 5353); `workers.fqdnEgress.provider: ovn` renders named worker egress as an OVN EgressFirewall plus an external-only NetworkPolicy; and `openshift.enabled` adds SCC grants for the hosted workers and keeps their PodSecurity labels. See the OpenShift and OKD operator page.
-
-### Changed
-
-- **The default sweeps no longer all start at 02:00 UTC, and bug triage picks up 4 issues ([#1738](https://github.com/vtmocanu/uzi/pull/1738)).**
-  Bug triage now starts at 00:00, the Planned sweep stays at 02:00, and the assigned-to-uzi sweep moves to 06:00, giving bug runs a two-hour head start before Planned work is queued. Sweeps you already enabled keep their schedule: Reset on the row adopts the new defaults (it also restores UTC and clears other customizations), or set the cron and max issues explicitly with `uzi schedule edit`.
-
-- **Codex runs show their account in the TUI, CLI and web, the way Claude runs show their token ([#1730](https://github.com/vtmocanu/uzi/issues/1730)).**
-  A Codex run names the account alias it was started with: in the web run credential, the TUI board column and rail, and a new `CODEX_ALIAS` row in `uzi run get` (`(deleted)` when the alias is gone). Run reads gain `codex_secret_id`, and the TUI's credential column now counts credentials per harness instead of every secret kind.
-
-- **Hosted workers: larger `l` data volume and a higher docker-tier ephemeral-storage request ([#1757](https://github.com/vtmocanu/uzi/issues/1757)).**
-  The `l` preset's `/data` PVC grows from 20Gi to 25Gi, and a docker-tier worker now requests 5Gi of ephemeral storage instead of 4Gi (`workers.docker.ephemeralRequest`): provisional headroom for the Codex command cache that also ranks a busy worker later under node disk pressure. The chart raises the matching ceilings: `limitRange.maxPVCStorage` 20Gi to 25Gi on both tiers, and `quota.requestsStorage` to 900Gi (restricted) and 650Gi (docker). A cluster that overrides `maxPVCStorage` below 25Gi must raise it: the controller validates the ceilings at startup and refuses to start, which stops reconciliation of every hosted worker. A smaller storage quota or ephemeral request override stays valid; it only limits how many workers fit. Existing workers keep their current PVCs (grow them in place where the StorageClass allows volume expansion). Docker workers roll once for the new request. A request never stops an eviction on a node whose root disk is too small; size worker nodes' root disks for the fleet.
-
-### Fixed
-
-- **Worker restarts log enough to diagnose a run lost across a restart ([#1742](https://github.com/vtmocanu/uzi/issues/1742)).**
-  The worker and api now log the restart window a run crosses (whether a terminal journal was reloaded and what register snapshot was sent), so a run that fails `worker_lost` after an eviction can be traced. Logging only: no behaviour change.
-
-- **Five run and schedule states now display correctly in the web UI and CLI ([#1727](https://github.com/vtmocanu/uzi/issues/1727)).**
-  A failed run start on the issue page keeps its error instead of clearing it on reload. A paused run's "Paused by you at" time and elapsed time, and the CLI's parked ages, come from when the run entered its status (the run now exposes `status_since`), so an extend no longer shifts them. Runs parked on a usage limit or an empty token pool show as waiting in the activity feed, not idle. Judge rationale loads again after collapsing a row mid-fetch. A sweep whose matches were all ineligible shows as starved instead of "matched 0".
-
-- **A run whose subagent is busy is no longer flagged stalled while its parent `Agent` call is still open ([#1394](https://github.com/vtmocanu/uzi/issues/1394)).**
-  The stalled check's "a tool call is in flight" suppression now reads the lead's own tool calls instead of the newest call across every lane, so a subagent's completed calls no longer hide the lead's open dispatch; an unmatched lead call from an earlier claim or query leg no longer counts once a newer init or result marks that leg's boundary.
-
-- **A run that finishes while the api is briefly unreachable no longer fails.**
-  A run with the completion check on asks the api for its completion permit at the very end, and a single network error there failed the whole run, even though its work was already pushed; after the api came back the run still showed as failed. The worker now retries that request until the api answers, for up to 10 minutes, and then completes normally. A real refusal is still handled as before.
-
-- **Hosted workers no longer crash on OpenShift and OKD ([#1761](https://github.com/vtmocanu/uzi/issues/1761)).**
-  CRI-O on OpenShift mounts its own `/run/secrets` into every container, which hid the worker's join-token Secret, so every hosted worker exited at startup. The new `workers.secretMountPath` moves the Secret (for example `/run/uzi-secrets`), and the render refuses `openshift.enabled` without it. The value must be one lower-case directory directly under `/run`, and the controller refuses to start on one that overlaps another worker mount. The worker follows the new path through `UZI_WORKER_TOKEN_FILE`: its entrypoint checks the token's ownership and mode there, and its guardrails deny agent commands that name the Secret directory for Claude, chat and Codex runs. The worker image is pinned separately from the chart, so the chart and the controller both refuse a relocated path unless `workers.image.tag` is `0.85.0-rc.2` or newer: an older image would start but not guard the new directory. A non-semver tag needs `workers.secretMountPathAllowUnversionedImage: true`. The default mount and every existing install are unchanged. The OpenShift DNS example now includes `k8s-app: null`: without it the chart's default DNS label survived Helm's map merge and worker DNS matched no pod.
 
 ## [0.84.0] - 2026-09-26
 
