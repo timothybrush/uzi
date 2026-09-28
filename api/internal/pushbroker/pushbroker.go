@@ -16,11 +16,19 @@
 // remote's compare-and-swap on that fetched Old refuses any update that would move the
 // ref off it. A non-fast-forward / CAS-mismatch rejection is mapped to ErrNotDescendant
 // — a legitimate "origin moved" outcome the caller turns into a 200 skip, never a 5xx.
+//
+// The other two ref writes keep the same invariant. Delete removes a checkpoint or
+// recovery ref (a CAS on the expected tip when one is known), and CreateRef (PRD #1810
+// D2) creates a refs/uzi-recovery/* ref with a single command whose Old is the zero
+// hash, so the remote's compare-and-swap refuses it whenever the ref already exists.
+// No path in this package sends a forced update.
 package pushbroker
 
 import (
 	"bytes"
 	"context"
+	"crypto/sha1" //nolint:gosec // G505: SHA-1 is the git packfile trailer format, not a security primitive.
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -34,6 +42,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/format/packfile"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/protocol/packp"
+	"github.com/go-git/go-git/v5/plumbing/protocol/packp/capability"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	"github.com/go-git/go-git/v5/plumbing/transport/client"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
@@ -67,6 +76,10 @@ type Options struct {
 // Result reports the ref that was (or would have been) advanced.
 type Result struct {
 	Ref string
+	// AlreadyCurrent: origin's checkpoint ref already pointed at the declared tip, so nothing
+	// was written. The success proves only that origin holds the tip, not who wrote it; the
+	// caller decides whether the tip is the run's own (PRD #1810).
+	AlreadyCurrent bool
 }
 
 var (
@@ -103,6 +116,26 @@ var (
 	// cleanly (checkpoints are best-effort — PRD #456 M4) and never fails the run. The
 	// finalize base-align (PRD #456 M1) is the real safety net for such a run's work.
 	ErrWorkflowScopeRejected = errors.New("pushbroker: checkpoint push rejected for missing workflow scope")
+	// ErrInvalidRef means a ref name or tip handed to CreateRef or Delete is outside
+	// the namespaces this package may write (refs/uzi-checkpoints/*, refs/uzi-recovery/*),
+	// is not a well-formed git ref name, or (CreateRef) the tip is not a 40-hex non-zero
+	// object id. It is a caller bug, refused before any network I/O.
+	ErrInvalidRef = errors.New("pushbroker: invalid ref")
+	// ErrRefExists means CreateRef found the target ref present on origin at a tip
+	// other than the one requested: in the list before the create, or in the read-back
+	// list after a refused or failed create. It is decided ONLY from an advertisement
+	// that shows the ref at another tip, never from a receive-pack error's wording, so a
+	// refusal for any other reason (a missing object, a pack error) is a wrapped error
+	// and never this sentinel. The ref is left untouched.
+	ErrRefExists = errors.New("pushbroker: ref already exists")
+	// ErrRefExistsAtTip means CreateRef found the target ref already present on origin
+	// at exactly the requested tip: a retry after an earlier create landed. Callers
+	// treat it as success.
+	ErrRefExistsAtTip = errors.New("pushbroker: ref already exists at the requested tip")
+	// ErrSourceMissing means CreateRef's source ref is not advertised by origin at
+	// exactly the requested tip (or origin is empty), so the tip object's presence on
+	// origin is not proven and nothing was sent.
+	ErrSourceMissing = errors.New("pushbroker: source ref not at the requested tip")
 )
 
 // Pack inflation budget (PRD #122 M8 hardening). The handler caps the COMPRESSED
@@ -147,6 +180,10 @@ const (
 // which swallows the outcome regardless. Deliberately shorter than maxPublishDuration.
 const maxDeleteDuration = 30 * time.Second
 
+// maxCreateRefDuration is the wall-clock ceiling on ONE CreateRef: a list plus a
+// receive-pack session carrying a single command and a 32-byte empty pack.
+const maxCreateRefDuration = 30 * time.Second
+
 // maxPublishDuration is a hard wall-clock ceiling on ONE brokered publish — the
 // untrusted-pack budget scan (single-core zlib inflation), the origin fetch, and the
 // non-forced push combined. /publish carries no request timeout of its own, and a
@@ -156,9 +193,28 @@ const maxDeleteDuration = 30 * time.Second
 // request can never run unbounded.
 const maxPublishDuration = 60 * time.Second
 
+// MaxPublishDuration exports maxPublishDuration for the retention timing relations in workersvc
+// (PRD #1810 D2: the supersession cooling period is sized above a live publish's pre-push budget
+// plus this client-side ceiling).
+const MaxPublishDuration = maxPublishDuration
+
+// MaxDeleteDuration and MaxCreateRefDuration export the per-call ceilings of Delete, ListRefTips
+// (which shares maxDeleteDuration) and CreateRef for the retention timing relations in workersvc
+// (PRD #1810: one hung forge call ends at its own ceiling, inside the sweeper's per-record
+// timeout, so the record's failure is recorded before the operation's deadline).
+const (
+	MaxDeleteDuration    = maxDeleteDuration
+	MaxCreateRefDuration = maxCreateRefDuration
+)
+
 // checkpointRefPrefix is the uzi-owned ref namespace no CI watches (Rule 3). The
 // end-of-run push targets refs/heads/<branch>; checkpoints never do.
 const checkpointRefPrefix = "refs/uzi-checkpoints/"
+
+// RecoveryRefPrefix is the uzi-owned namespace a superseded run's checkpoint tip is
+// preserved under (PRD #1810 D2): refs/uzi-recovery/<run-id>. Like the checkpoint
+// namespace it is outside refs/heads, so no CI watches it.
+const RecoveryRefPrefix = "refs/uzi-recovery/"
 
 // Publish fetches origin's base objects, applies the worker's delta pack, verifies
 // the declared tip strictly descends origin's current tip, and pushes it —
@@ -254,6 +310,7 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 	// checkpoint ref, so its presence is proven and there is nothing to advance. tipHash
 	// is non-zero (guarded above), so this fires only for a real, matching checkpoint ref.
 	if checkpointTip == tipHash {
+		result.AlreadyCurrent = true
 		return result, nil
 	}
 
@@ -360,24 +417,36 @@ type DeleteOptions struct {
 	Branch   string
 	Username string
 	PAT      string
+	// Ref, when set, is the FULL name of the ref to delete and replaces
+	// refs/uzi-checkpoints/<Branch>. It must lie under refs/uzi-checkpoints/ or
+	// refs/uzi-recovery/ and be a well-formed ref name, else Delete returns
+	// ErrInvalidRef before any network I/O. Empty keeps the branch-derived name. A
+	// recovery ref is only ever CAS-deleted: Ref under refs/uzi-recovery/ with an empty
+	// ExpectedOldTip is ErrInvalidRef.
+	Ref string
 	// ExpectedOldTip is the tip this run last published to its checkpoint ref (the
 	// persisted runs.checkpoint_tip). When set, Delete takes a compare-and-swap path:
 	// it removes the ref ONLY if origin still points at exactly this tip, and treats a
 	// CAS refusal (the ref advanced since our last publish, or is already absent) as
 	// benign success — so a terminal cleanup can never clobber a SIBLING run's fresh
 	// checkpoint on the same branch. When empty, Delete preserves its legacy
-	// UNCONDITIONAL list-then-delete behaviour (backward-compatible; see Delete).
+	// UNCONDITIONAL list-then-delete behaviour (backward-compatible; see Delete). When
+	// set it must be a lowercase 40-hex non-zero object id, else ErrInvalidRef.
 	ExpectedOldTip string
 }
 
-// Delete removes refs/uzi-checkpoints/<branch> from the remote, BEST-EFFORT (PRD
-// #1030 M4). A run's checkpoint ref is uzi-owned scratch state; once the run reaches
+// Delete removes refs/uzi-checkpoints/<branch> (or o.Ref, a checkpoint or recovery
+// ref named in full) from the remote, BEST-EFFORT (PRD #1030 M4). A run's checkpoint ref is uzi-owned scratch state; once the run reaches
 // a terminal state it is stale, and a stale ref left behind later blocks a NEW run on
 // the same branch with a not_descendant skip (the new run's tip does not descend the
-// dead run's checkpoint). The caller invokes this on every terminal transition and
-// SWALLOWS the returned error — it must never block or fail the worker's terminal
-// report — so this carries its OWN short wall-clock timeout rather than inheriting an
-// unbounded ctx.
+// dead run's checkpoint). PRD #1810 routes terminal cleanup through checkpoint
+// retention (workersvc), not a delete on every terminal transition: the branch ref is
+// deleted once the run's last open custody hold settles, or immediately at the
+// terminal transition when the run has no hold; a supersession (another run needing
+// the slot) and the sweep reconciler also call this, each a CAS on the run's recorded
+// tip. Every caller SWALLOWS or records the returned error — it must never block or
+// fail the worker's terminal report — so this carries its OWN short wall-clock
+// timeout rather than inheriting an unbounded ctx.
 //
 // The delete goes out as a go-git delete refspec (":<ref>" — empty source, the ref as
 // destination), the pure-Go equivalent of `git push origin :refs/uzi-checkpoints/…`.
@@ -412,18 +481,25 @@ func Delete(ctx context.Context, o DeleteOptions) error {
 	defer cancel()
 
 	ref := checkpointRefPrefix + o.Branch
+	if o.Ref != "" {
+		if !validRefUnder(o.Ref, checkpointRefPrefix) && !validRefUnder(o.Ref, RecoveryRefPrefix) {
+			return ErrInvalidRef
+		}
+		// A recovery ref preserves a superseded run's only off-worker copy: it is only
+		// ever removed compare-and-swap on its recorded tip, never unconditionally.
+		if o.ExpectedOldTip == "" && strings.HasPrefix(o.Ref, RecoveryRefPrefix) {
+			return ErrInvalidRef
+		}
+		ref = o.Ref
+	}
+	if o.ExpectedOldTip != "" && (!isObjectID(o.ExpectedOldTip) || plumbing.NewHash(o.ExpectedOldTip).IsZero()) {
+		return ErrInvalidRef
+	}
 	refName := plumbing.ReferenceName(ref)
 
-	repo, err := git.Init(memory.NewStorage(), nil)
+	remote, err := newOriginRemote(o.CloneURL)
 	if err != nil {
-		return fmt.Errorf("pushbroker: init: %w", err)
-	}
-	remote, err := repo.CreateRemote(&config.RemoteConfig{
-		Name: "origin",
-		URLs: []string{o.CloneURL},
-	})
-	if err != nil {
-		return fmt.Errorf("pushbroker: create remote: %w", err)
+		return err
 	}
 	auth := authFor(Options{Username: o.Username, PAT: o.PAT})
 
@@ -463,7 +539,7 @@ func Delete(ctx context.Context, o DeleteOptions) error {
 	if err == nil || errors.Is(err, git.NoErrAlreadyUpToDate) {
 		return nil
 	}
-	return fmt.Errorf("pushbroker: delete checkpoint ref: %w", err)
+	return fmt.Errorf("pushbroker: delete ref: %w", err)
 }
 
 // casDelete removes refName from origin ONLY if origin still points it at expectedOld
@@ -551,8 +627,321 @@ func casDelete(ctx context.Context, remote *git.Remote, auth transport.AuthMetho
 	case isCASDeleteRefusal(err):
 		return nil // ref moved out from under our Old in the list→delete window — benign
 	default:
-		return fmt.Errorf("pushbroker: cas delete checkpoint ref: %w", err)
+		return fmt.Errorf("pushbroker: cas delete ref: %w", err)
 	}
+}
+
+// CreateRefOptions carries a recovery-ref create (PRD #1810 D2). Like DeleteOptions
+// every field is server-derived by the caller: the forge connection, the recovery ref
+// to create (Ref, under RecoveryRefPrefix), the tip it must point at, and the
+// checkpoint ref (SourceRef, under refs/uzi-checkpoints/) origin must currently
+// advertise at exactly that tip.
+type CreateRefOptions struct {
+	CloneURL  string
+	Username  string
+	PAT       string
+	Ref       string
+	Tip       string
+	SourceRef string
+}
+
+// CreateRef creates o.Ref on origin pointing at o.Tip, an object origin already holds
+// (it is the tip of o.SourceRef), so no objects are shipped. It never moves an
+// existing ref:
+//
+//   - It LISTS origin's refs first. o.Ref already at o.Tip returns ErrRefExistsAtTip
+//     (a retry after an earlier create; callers treat it as success); at any other tip
+//     it returns ErrRefExists. o.SourceRef not advertised at exactly o.Tip (or an empty
+//     origin) returns ErrSourceMissing: without it the tip's presence on origin is
+//     unproven.
+//   - It then sends ONE receive-pack command, Old = zero hash, New = o.Tip, with a
+//     zero-object pack. Old = zero is a compare-and-swap: the remote refuses the
+//     create if the ref appeared after the list. The remote's own connectivity check
+//     is the second guard on the tip's presence.
+//   - Whatever the receive-pack outcome, it LISTS origin again and decides from what
+//     origin now advertises (createOutcome): o.Ref at o.Tip is success (nil after an
+//     accepted create, ErrRefExistsAtTip after a refused or failed one, e.g. a racer
+//     created the same tip or the response was lost); at another tip ErrRefExists;
+//     absent a wrapped error. An accepted create is therefore nil only when the
+//     read-back proves it, and a receive-pack refusal is never mapped to
+//     ErrRefExists from its message text alone.
+//
+// The pack is required, not decorative: git receive-pack reads a pack for every
+// non-delete command, and a create with none is refused ("eof before pack header",
+// as Publish records). Invalid inputs return ErrInvalidRef before any network I/O.
+// Any other failure is a wrapped error the caller must scrub like Delete's.
+func CreateRef(ctx context.Context, o CreateRefOptions) error {
+	return createRefWithPack(ctx, o, emptyPack())
+}
+
+// createRefWithPack is CreateRef with the pack as a parameter, so a test can prove
+// against a real git receive-pack that the empty pack is what makes the create land.
+func createRefWithPack(ctx context.Context, o CreateRefOptions, pack []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, maxCreateRefDuration)
+	defer cancel()
+
+	if err := validateCreateRef(o); err != nil {
+		return err
+	}
+	refName := plumbing.ReferenceName(o.Ref)
+	sourceName := plumbing.ReferenceName(o.SourceRef)
+	tip := plumbing.NewHash(o.Tip)
+
+	remote, err := newOriginRemote(o.CloneURL)
+	if err != nil {
+		return err
+	}
+	auth := authFor(Options{Username: o.Username, PAT: o.PAT})
+
+	advertised, err := remote.ListContext(ctx, &git.ListOptions{Auth: auth})
+	if err != nil {
+		if errors.Is(err, transport.ErrEmptyRemoteRepository) {
+			return ErrSourceMissing // an empty origin holds no source ref
+		}
+		return fmt.Errorf("pushbroker: list: %w", err)
+	}
+	var target, source plumbing.Hash
+	var targetPresent bool
+	for _, r := range advertised {
+		switch r.Name() {
+		case refName:
+			target, targetPresent = r.Hash(), true
+		case sourceName:
+			source = r.Hash()
+		}
+	}
+	if targetPresent {
+		if target == tip {
+			return ErrRefExistsAtTip
+		}
+		return ErrRefExists
+	}
+	if source != tip {
+		return ErrSourceMissing
+	}
+	return pushCreateVerified(ctx, remote, auth, refName, tip, pack)
+}
+
+// pushCreateVerified sends the create command, then re-lists origin and classifies the
+// outcome from the read-back (createOutcome).
+func pushCreateVerified(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, ref plumbing.ReferenceName, tip plumbing.Hash, pack []byte) error {
+	pushErr := pushCreate(ctx, remote, auth, ref, tip, pack)
+	current, present, listErr := listRefTip(ctx, remote, auth, ref)
+	return createOutcome(pushErr, current, present, listErr, tip)
+}
+
+// pushCreate sends the create command through a manual receive-pack session and returns
+// the raw outcome, wrapped: nil when the remote reported success. It does not classify;
+// createOutcome does, from the read-back.
+func pushCreate(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, ref plumbing.ReferenceName, tip plumbing.Hash, pack []byte) error {
+	sess, ar, err := openReceivePack(ctx, remote, auth)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = sess.Close() }()
+
+	if _, err := sess.ReceivePack(ctx, createRefRequest(ar.Capabilities, ref, tip, pack)); err != nil {
+		return fmt.Errorf("pushbroker: create ref: %w", err)
+	}
+	return nil
+}
+
+// listRefTip lists origin and returns where it advertises ref (present false when it does
+// not, including an empty origin).
+func listRefTip(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, ref plumbing.ReferenceName) (plumbing.Hash, bool, error) {
+	advertised, err := remote.ListContext(ctx, &git.ListOptions{Auth: auth})
+	if err != nil {
+		if errors.Is(err, transport.ErrEmptyRemoteRepository) {
+			return plumbing.ZeroHash, false, nil
+		}
+		return plumbing.ZeroHash, false, fmt.Errorf("pushbroker: list: %w", err)
+	}
+	for _, r := range advertised {
+		if r.Name() == ref {
+			return r.Hash(), true, nil
+		}
+	}
+	return plumbing.ZeroHash, false, nil
+}
+
+// createOutcome classifies a create from its receive-pack result (pushErr) and the
+// read-back list that followed it (current/present, or listErr):
+//
+//   - read-back failed: the outcome is unknown, so a wrapped error (never a sentinel);
+//   - ref at tip: nil when the create was accepted, ErrRefExistsAtTip when it was
+//     refused or failed (someone, or a lost response of ours, put exactly our tip
+//     there). Both are success to callers;
+//   - ref at another tip: ErrRefExists;
+//   - ref absent: a wrapped error. An accepted create the read-back cannot see is an
+//     error too, never a silent success.
+func createOutcome(pushErr error, current plumbing.Hash, present bool, listErr error, tip plumbing.Hash) error {
+	switch {
+	case listErr != nil:
+		if pushErr != nil {
+			return fmt.Errorf("%w (read-back failed: %v)", pushErr, listErr)
+		}
+		return fmt.Errorf("pushbroker: create ref read-back: %w", listErr)
+	case present && current == tip:
+		if pushErr != nil {
+			return ErrRefExistsAtTip
+		}
+		return nil
+	case present:
+		return ErrRefExists
+	case pushErr != nil:
+		return pushErr
+	default:
+		return errors.New("pushbroker: create ref reported success but origin does not advertise the ref")
+	}
+}
+
+// ListRefsOptions names the forge connection ListRefTips lists. Server-derived by the
+// caller, like DeleteOptions.
+type ListRefsOptions struct {
+	CloneURL string
+	Username string
+	PAT      string
+}
+
+// ListRefTips lists origin once and returns the tips of those of refs it advertises
+// (an absent ref has no key; an empty origin yields an empty map). Every ref must lie
+// under refs/uzi-checkpoints/ or refs/uzi-recovery/, else ErrInvalidRef before any
+// network I/O. A read, never a write: a caller uses it to tell the reasons CreateRef
+// reported ErrSourceMissing apart.
+func ListRefTips(ctx context.Context, o ListRefsOptions, refs ...string) (map[string]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, maxDeleteDuration)
+	defer cancel()
+	want := make(map[plumbing.ReferenceName]bool, len(refs))
+	for _, r := range refs {
+		if !validRefUnder(r, checkpointRefPrefix) && !validRefUnder(r, RecoveryRefPrefix) {
+			return nil, ErrInvalidRef
+		}
+		want[plumbing.ReferenceName(r)] = true
+	}
+	remote, err := newOriginRemote(o.CloneURL)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(refs))
+	advertised, err := remote.ListContext(ctx, &git.ListOptions{Auth: authFor(Options{Username: o.Username, PAT: o.PAT})})
+	if err != nil {
+		if errors.Is(err, transport.ErrEmptyRemoteRepository) {
+			return out, nil
+		}
+		return nil, fmt.Errorf("pushbroker: list: %w", err)
+	}
+	for _, r := range advertised {
+		if want[r.Name()] {
+			out[r.Name().String()] = r.Hash().String()
+		}
+	}
+	return out, nil
+}
+
+// createRefRequest builds the single-command create: Old is ALWAYS the zero hash (the
+// wire compare-and-swap that refuses an existing ref), New is the tip, and the pack
+// is attached when non-nil. There is no force form.
+func createRefRequest(caps *capability.List, ref plumbing.ReferenceName, tip plumbing.Hash, pack []byte) *packp.ReferenceUpdateRequest {
+	req := packp.NewReferenceUpdateRequestFromCapabilities(caps)
+	req.Commands = []*packp.Command{{
+		Name: ref,
+		Old:  plumbing.ZeroHash,
+		New:  tip,
+	}}
+	if pack != nil {
+		req.Packfile = io.NopCloser(bytes.NewReader(pack))
+	}
+	return req
+}
+
+// emptyPack returns a valid zero-object packfile: "PACK", version 2, object count 0
+// (both big-endian uint32), then the SHA-1 of those 12 bytes. 32 bytes in all.
+func emptyPack() []byte {
+	hdr := make([]byte, 12, 32)
+	copy(hdr, "PACK")
+	binary.BigEndian.PutUint32(hdr[4:8], 2)
+	binary.BigEndian.PutUint32(hdr[8:12], 0)
+	sum := sha1.Sum(hdr) //nolint:gosec // G401: the packfile trailer is defined as SHA-1 by the git pack format, not used for security.
+	return append(hdr, sum[:]...)
+}
+
+// validateCreateRef checks CreateRef's inputs without touching the network.
+func validateCreateRef(o CreateRefOptions) error {
+	if !validRefUnder(o.Ref, RecoveryRefPrefix) || !validRefUnder(o.SourceRef, checkpointRefPrefix) {
+		return ErrInvalidRef
+	}
+	if !isObjectID(o.Tip) || plumbing.NewHash(o.Tip).IsZero() {
+		return ErrInvalidRef
+	}
+	return nil
+}
+
+// validRefUnder reports whether ref is a well-formed git ref name (git
+// check-ref-format rules, via go-git) strictly under prefix.
+func validRefUnder(ref, prefix string) bool {
+	if !strings.HasPrefix(ref, prefix) || len(ref) == len(prefix) {
+		return false
+	}
+	return plumbing.ReferenceName(ref).Validate() == nil
+}
+
+// isObjectID reports whether s is a lowercase 40-hex SHA-1 object id.
+func isObjectID(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// newOriginRemote builds the throwaway in-memory repo and its "origin" remote every
+// list/receive-pack operation here dials.
+func newOriginRemote(cloneURL string) (*git.Remote, error) {
+	repo, err := git.Init(memory.NewStorage(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("pushbroker: init: %w", err)
+	}
+	remote, err := repo.CreateRemote(&config.RemoteConfig{
+		Name: "origin",
+		URLs: []string{cloneURL},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("pushbroker: create remote: %w", err)
+	}
+	return remote, nil
+}
+
+// openReceivePack opens a manual receive-pack session on remote's URL (through
+// transportFor, so http(s) keeps the same-origin redirect guard) and returns it with
+// its reference advertisement. The caller closes the session.
+func openReceivePack(ctx context.Context, remote *git.Remote, auth transport.AuthMethod) (transport.ReceivePackSession, *packp.AdvRefs, error) {
+	urls := remote.Config().URLs
+	if len(urls) == 0 {
+		return nil, nil, fmt.Errorf("pushbroker: remote has no URL")
+	}
+	ep, err := transport.NewEndpoint(urls[0])
+	if err != nil {
+		return nil, nil, fmt.Errorf("pushbroker: endpoint: %w", err)
+	}
+	c, err := transportFor(ep)
+	if err != nil {
+		return nil, nil, fmt.Errorf("pushbroker: transport client: %w", err)
+	}
+	sess, err := c.NewReceivePackSession(ep, auth)
+	if err != nil {
+		return nil, nil, fmt.Errorf("pushbroker: receive-pack session: %w", err)
+	}
+	ar, err := sess.AdvertisedReferencesContext(ctx)
+	if err != nil {
+		_ = sess.Close()
+		return nil, nil, fmt.Errorf("pushbroker: advertise: %w", err)
+	}
+	return sess, ar, nil
 }
 
 // forwardPack ships the worker's (non-thin) packfile to origin through a MANUAL
