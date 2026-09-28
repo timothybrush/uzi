@@ -3,7 +3,7 @@
 **Status**: Accepted (issue #1849)
 **Date**: 2026-09-28
 **Deciders**: the maintainer, with a Codex peer review of the PRD and of the upstream change.
-**Related**: PRD #1849 (`prds/1849-builtin-agents-mirror-upstream.md`, decision log D1-D7); [ADR-1719](1719-run-scratch-dir.md) (the run scratch directory whose rules move to the append); [ADR-0602](0602-agent-source-repo-sync.md) (agent-source sync, unchanged in design).
+**Related**: PRD #1849 (`prds/done/1849-builtin-agents-mirror-upstream.md`, decision log D1-D7); [ADR-1719](1719-run-scratch-dir.md) (the run scratch directory whose rules move to the append); [ADR-0602](0602-agent-source-repo-sync.md) (agent-source sync, unchanged in design).
 
 ## Decision (summary)
 
