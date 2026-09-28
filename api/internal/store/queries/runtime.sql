@@ -322,6 +322,10 @@ UPDATE workers SET
     stats_disk_dind_total_bytes  = sqlc.narg('stats_disk_dind_total_bytes'),
     stats_disk_dind_inodes       = sqlc.narg('stats_disk_dind_inodes'),
     stats_disk_dind_total_inodes = sqlc.narg('stats_disk_dind_total_inodes'),
+    -- data-volume inode sample (PRD #1809 M6, D8): used + total inodes beside the byte pair,
+    -- same write-every-tick-incl-NULL discipline; display-only, never a disk_pressure input.
+    stats_disk_data_inodes       = sqlc.narg('stats_disk_data_inodes'),
+    stats_disk_data_total_inodes = sqlc.narg('stats_disk_data_total_inodes'),
     -- Disk-pressure debounce streak (PRD #837 M4). Increment (bounded to 100 so a
     -- perpetually-full worker can't overflow the counter) when THIS tick's sample is
     -- over threshold, else reset to 0 — so a single under-threshold (or absent) sample
@@ -1229,6 +1233,12 @@ UPDATE runs SET
     -- stale_requeue_generation = claim_generation, so leaving a stale value here could refund a
     -- requeue_count charged against a generation this claim has already replaced.
     stale_requeue_generation = NULL,
+    -- PRD #1809 M6 (D8): a claim starts a new flight, so the previous park's checkpoint-durability
+    -- report no longer describes this run. Cleared here AND on every running report
+    -- (SetRunRunning) so a later park the worker does not report on (a server-side
+    -- credential_disabled park of this claimed run, a sweeper wall park, a completion hold) shows
+    -- "not reported" instead of an older park's value. Display-only.
+    checkpoint_contains_latest = NULL,
     -- Exit contract (PRD #47 Decision 3): leaving 'queued' clears any health flag
     -- the detector raised (e.g. "no worker online"). health_notified_at is NOT reset.
     health = 'ok', health_reason = NULL, health_since = NULL
@@ -1551,6 +1561,14 @@ UPDATE runs SET
     -- survive to reach the worker's ACK.
     hold_reason                    = NULL,
     hold_captured_head             = NULL,
+    -- PRD #1809 M6 (D8): the run is executing again, so the last park's checkpoint-durability
+    -- report is over: it describes only the park that reported it. Every resume reaches running
+    -- here (paused/limit_wait/recovery_wait -> queued -> claimed -> running, and the in-place
+    -- awaiting_* windows), and the source guards above refuse a stale running report onto a
+    -- parked run, so the clear never lands on the park it would erase. ClaimRun clears it too
+    -- (a claimed run a server-side park catches before its first running report). A running ->
+    -- running heartbeat re-clears an already-NULL column (a no-op). Display-only.
+    checkpoint_contains_latest     = NULL,
     started_at       = COALESCE(started_at, now()),
     iteration_count  = GREATEST(iteration_count, @iteration_count),
     session_id       = COALESCE(sqlc.narg('session_id'), session_id),
@@ -2486,6 +2504,47 @@ UPDATE runs SET
 WHERE id = @id AND worker_id = @worker_id
   AND status = 'running'
   AND kind <> 'judge'
+RETURNING *;
+
+-- name: ParkRunDataVolumeFull :one
+-- PRD #1809 M5 (D6): the DATA-VOLUME-FULL park writer, the typed sibling of
+-- ParkRunForgeUnreachable — same 'recovery_wait' transition, same backoff-shaping
+-- recovery_wait_count bump, same health-trio reset and session_id COALESCE, same positive
+-- source guard (status = 'running') — with its own cause and counter:
+--
+--   - recovery_wait_cause = 'data_volume_full' — the TYPED cause the surfaces render the
+--     disk-full wording off of.
+--   - disk_park_count = disk_park_count + 1 when @counted — the DISK-ONLY lifetime counter the
+--     cap (UZI_RUN_DISK_PARK_MAX) decides on, bumped in the SAME statement as the transition so
+--     a counted park cannot land without its counter advancing. A PREVENTIVE park (the worker
+--     stopped the run before the volume filled; @counted = false) leaves it untouched, so
+--     repeated preventive parks can never walk a run into the cap. forge_park_count is never
+--     touched here: it belongs to the forge park alone.
+--
+-- RETURNING * so the service reads back the counter and the stamped recovery_retry_not_before
+-- for the ack. Run INSIDE the disk-park transaction after the run row is FOR UPDATE locked and
+-- its status/generation/release verified in Go, so the guards below are the belt-and-braces
+-- backstop rather than the race barrier (the row lock is). The generation and released-claim
+-- conjuncts are SetRunRecoveryWait's (sqlc.narg, never @name, for the same parser reason).
+-- It does NOT touch recovery_custody_holds: unlike the pre-clone forge park, a disk park can
+-- land mid-run with work only this worker holds, so the generation's hold stays open (D6: the
+-- park still holds custody).
+UPDATE runs SET
+    status                    = 'recovery_wait',
+    status_since              = now(),
+    recovery_wait_count       = recovery_wait_count + 1,
+    recovery_wait_cause       = 'data_volume_full',
+    disk_park_count           = disk_park_count + CASE WHEN sqlc.arg('counted')::boolean THEN 1 ELSE 0 END,
+    recovery_retry_not_before = @retry_not_before,
+    session_id                = COALESCE(sqlc.narg('session_id'), session_id),
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at                = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND status = 'running'
+  AND kind <> 'judge'
+  AND claim_released_at IS NULL
+  AND (sqlc.narg('claim_generation')::bigint IS NULL
+       OR claim_generation = sqlc.narg('claim_generation')::bigint)
 RETURNING *;
 
 -- name: LockOpenCustodyHoldsForRunWorkerGeneration :many
