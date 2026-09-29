@@ -35,6 +35,9 @@ through `[0.52.0]`.)
 - **Built-in agents synced to skills v0.42.0.**
   The built-in coder, reviewer, tester, auditor, documenter, fact-checker and architect gain rules drawn from judge recommendations and CodeRabbit/Greptile findings: bound every loop, retry and cleanup; never read an ambiguous 404, empty or timeout reply as success; check every surface a new state reaches and both rollout orders; wait for a backgrounded gate; prove a probe's tool exists; back every/never/only claims with the enforcing code. The built-in coder now runs on the `sonnet` tier (upstream v0.41.0). Unmodified built-in roles refresh on the next boot.
 
+- **uzi's self-improvement runs gate through the Taskfile and re-check old recommendations.**
+  On a repo opted into uzi dogfooding, the self-improvement run now passes `task gate:repo` plus the touched components' gates and, for web changes, the production build (reporting a missing `task` as a gate failure) instead of a stale hand-written test list, confirms a judge recommendation still holds on current code (and is not already fixed by an open merge request) before acting on it, prefers a fix several recommendations share, and never edits the built-in agent templates copied verbatim from upstream.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added
