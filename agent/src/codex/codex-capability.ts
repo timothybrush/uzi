@@ -3,13 +3,15 @@
 // A worker may advertise Codex ONLY when all three preconditions hold:
 //   1. the installer receipt is intact (probeCodexRuntime — kept UNCHANGED, no-exec);
 //   2. the worker→runner→runner-cmd uid split is active (uidSplitActive());
-//   3. Landlock is available, OR the command sandbox is in `best-effort` mode on a
-//      kernel that reports Landlock UNAVAILABLE (ENOSYS/EOPNOTSUPP) — in which case
-//      commands run without filesystem confinement and the worker is "degraded".
+//   3. the command sandbox is `off` (Landlock never applied), OR Landlock is available,
+//      OR the sandbox is in `best-effort` mode on a kernel that reports Landlock
+//      UNAVAILABLE (ENOSYS/EOPNOTSUPP). In `off` and that best-effort case commands
+//      run without filesystem confinement and the worker is "degraded".
 //
-// A Landlock ERROR (any other errno / ABI < 1) or a failed probe is FATAL even in
-// best-effort (D8), so it must NOT advertise — advertising it would produce a
-// claimed-then-failed run, the exact dishonesty this milestone removes.
+// A Landlock ERROR (any other errno / ABI < 1) or a failed probe is FATAL in
+// `required` and `best-effort` (D8), so it must NOT advertise — advertising it would
+// produce a claimed-then-failed run, the exact dishonesty this milestone removes.
+// `off` never calls Landlock at all: startup skips the probe (outcome `skipped`).
 //
 // This wrapper spawns `uzi-codex-command-sandbox --probe`, so it lives in its OWN
 // module: it must never be imported into codex-runtime-probe.ts, whose no-exec /
@@ -37,12 +39,13 @@ const PROBE_EXIT_ERROR = 11;
 
 /** The Landlock probe outcome. `probe-failed` is distinct from the sandbox's own
  *  `error` classification: it means the `--probe` process could not be run at all
- *  (binary missing, spawn error, timeout, or an unexpected exit code). */
-export type LandlockProbeOutcome = "available" | "unavailable" | "error" | "probe-failed";
+ *  (binary missing, spawn error, timeout, or an unexpected exit code). `skipped`
+ *  means the mode is `off`, so no probe ran. */
+export type LandlockProbeOutcome = "available" | "unavailable" | "error" | "probe-failed" | "skipped";
 
 /** The resolved advertisement decision. `advertise` gates `codex_harness_v1`;
- *  `degraded` is true only when advertising in best-effort on a Landlock-unavailable
- *  kernel (commands run unconfined); `reason` is a bounded, credential-free
+ *  `degraded` is true when advertising with commands unconfined: mode `off`, or
+ *  best-effort on a Landlock-unavailable kernel; `reason` is a bounded, credential-free
  *  diagnostic set only when NOT advertising (safe to log). */
 export interface CodexHarnessAvailability {
   advertise: boolean;
@@ -79,6 +82,16 @@ export function probeLandlockAvailability(
   }
 }
 
+/** The startup Landlock probe for a configured mode: `off` never applies Landlock,
+ *  so it skips the `--probe` spawn (up to a 10 s synchronous wait) and reports
+ *  `skipped`; every other mode runs the probe. */
+export function landlockProbeForMode(
+  mode: CommandSandboxMode,
+  probe: () => LandlockProbeOutcome = probeLandlockAvailability,
+): LandlockProbeOutcome {
+  return mode === "off" ? "skipped" : probe();
+}
+
 /** Inputs to {@link resolveCodexHarnessAvailability} — the three combined signals
  *  plus the worker's configured sandbox mode. */
 export interface ResolveCodexHarnessInput {
@@ -111,6 +124,9 @@ export function resolveCodexHarnessAvailability(input: ResolveCodexHarnessInput)
       landlock,
       reason: "uid split not active (UZI_UID_SPLIT unset); Codex requires the worker/runner/runner-cmd split",
     };
+  }
+  if (mode === "off") {
+    return { advertise: true, degraded: true, landlock };
   }
   if (landlock === "available") {
     return { advertise: true, degraded: false, landlock };
