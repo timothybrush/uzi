@@ -59,6 +59,11 @@ type FakeClient struct {
 	GuardrailV      apitypes.GuardrailImpactDTO
 	BlockedReposV   apitypes.AdminBlockedReposDTO
 	AgentSourceV    apitypes.AgentSourceDTO
+	// EgressProfiles drives AdminListEgressProfiles and AdminGetEgressProfile (PRD #1906
+	// M1); a name not in the list is an ExitNotFound error, like the server's 404.
+	// LastEgressProfileName records the name AdminGetEgressProfile was asked for.
+	EgressProfiles        []apitypes.EgressProfileDTO
+	LastEgressProfileName string
 
 	// ListRunsCalls / AdminListRunsCalls count real ListRuns / AdminListRuns
 	// invocations (PRD #1130 M1). Purely additive, no mutex like the rest of this
@@ -603,6 +608,14 @@ type FakeClient struct {
 	// capture id IN ORDER, so a test proves NO download was attempted when selection should
 	// have failed first (the >1-available-without-selection case). The *Err fields win over
 	// the blanket Err so a test can model a summary that reads fine and a download that fails.
+	// RunFetchesResult backs RunFetches, keyed by run id for the first page and by
+	// "<run id>?after=<cursor>" for a later one (an absent key is an empty page);
+	// RunFetchesCalls records each requested key in order. RunFetchesErr wins over the
+	// blanket Err.
+	RunFetchesResult map[string]apitypes.RunFetchesDTO
+	RunFetchesCalls  []string
+	RunFetchesErr    error
+
 	RecoverySummaries     map[string]apitypes.RecoveryArchiveSummaryDTO
 	RecoveryArchivesErr   error
 	RecoveryBytes         map[string][]byte

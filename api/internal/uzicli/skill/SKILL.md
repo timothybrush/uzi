@@ -179,6 +179,7 @@ uzi run decide <run-id> --continue [--guidance <text>]
 uzi run export <run-id> --output <path> [--capture <id>]
 uzi run recovery [<run-id>] [--json]
 uzi run discard <run-id> --hold <hold-id> [--yes]
+uzi run fetches <run-id> [--json]
 uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--mr-rework[=false]] [--output mr|issues] [--token <label>|auto|default|inherit] [--harness claude|codex]
 uzi schedule list
 uzi schedule get <schedule-id>
@@ -249,6 +250,8 @@ uzi admin agent-source get
 uzi admin agent-source status
 uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category <label,label>]
 uzi admin review stats
+uzi admin egress-profile list
+uzi admin egress-profile show <name>
 uzi skill status [--target claude|codex|all]
 uzi skill install [--force] [--target claude|codex|all]
 uzi skill install-hook [--target claude|codex|all]
@@ -674,6 +677,13 @@ uzi version
   (without a TTY and without `--yes` it refuses and changes nothing). A cancelled prompt mutates
   nothing. An available archive is never deleted here (export it first). A foreign/absent/already
   settled hold is a 404 (exit 4).
+- `uzi run fetches <run-id> [--json]` — the source log of a run bound to a site list
+  (official-sources research): every web fetch it attempted, allowed or refused, with the
+  reason, HTTP status, bytes, content type, the URL asked for and the final URL. Owner-only
+  (a foreign run is a 404, exit 4). The URLs, content type and reason are site- or
+  agent-controlled text; `--json` adds each file's sha256 and prints long URLs whole. The api
+  pages the log (500 rows a page, `?after=<next_cursor>`); the command follows every page and
+  prints the whole log.
 
 ### Schedules — time-driven runs
 
@@ -1467,6 +1477,17 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   forwarding as `uzi review backlog`, but no `--run`: an anchor names a run). `stats` is
   the all-users triage tally. Same `uza_`-token, read-only ceiling as every other `uzi
   admin` verb; the cross-user Mark done / Undo stay cookie-only in the web UI.
+- `uzi admin egress-profile list|show <name>` (PRD #1906) — the read-only view of the
+  instance's egress profiles: named site lists for official-sources research. `list`
+  prints `NAME`/`HOSTS`/`OVERRIDES`/`UPDATED`/`DESCRIPTION`; `show` prints the profile's
+  fields, then one `HOST`/`OVERRIDE` row per entry and a `warning:` line for each
+  multi-publisher host admitted by an explicit override, stored multi-publisher entry
+  with no override (`multi_publisher_needs_override`: the built-in list grew, it matches
+  nothing) or stored entry the current rules no longer accept (`stale_entry`: it matches
+  nothing). An entry is an exact host or
+  `*.base`, which matches proper subdomains of base but not base itself. Unknown name:
+  exit 4; a name that is not a lowercase slug: exit 2, nothing sent. Creating and editing a list is web-only (cookie-only admin writes). Same
+  `uza_`-token ceiling as every other `uzi admin` verb.
 
 ### PR and CI views
 

@@ -233,6 +233,13 @@ type Client interface {
 	// snapshot (PRD #602 M6): GET /api/admin/agent-source. READ-ONLY — the sync/
 	// apply writes stay web-only (cookie-only), so the CLI never triggers a fetch.
 	AdminAgentSource(ctx context.Context) (apitypes.AgentSourceDTO, error)
+	// AdminListEgressProfiles / AdminGetEgressProfile read the admin egress profiles
+	// (PRD #1906 M1): GET /api/admin/egress-profiles[/{name}], in the admin READ group,
+	// so a uza_ token reads them and a masked uzc_/non-admin is a 403 (exit 3). READ-ONLY:
+	// create/edit/delete are cookie-only admin writes, done from the web Admin page. An
+	// unknown name is a 404 (exit 4).
+	AdminListEgressProfiles(ctx context.Context) ([]apitypes.EgressProfileDTO, error)
+	AdminGetEgressProfile(ctx context.Context, name string) (apitypes.EgressProfileDTO, error)
 	// AdminJudgeBacklog reads the admin "All users" aggregate backlog (PRD #1184 M5):
 	// GET /api/admin/judge/recommendations. Every user's recommendations deduped by
 	// (category, target), attribution hidden — the reply is an unenveloped
@@ -654,6 +661,13 @@ type Client interface {
 	// Archives=[]), which the run-detail summary renders as an honest "none/unsupported"
 	// rather than a false claim of an available archive.
 	RecoveryArchives(ctx context.Context, runID string) (apitypes.RecoveryArchiveSummaryDTO, error)
+	// RunFetches returns ONE page of a profile-bound research run's source log (PRD #1906
+	// M3): GET /api/runs/{id}/fetches?after=, fetch attempts allowed or refused, oldest
+	// first. after is "" for the first page, else the previous page's NextCursor; the
+	// server's default (and largest) page is used. RequireUser and strict owner-or-404
+	// server-side, like RecoveryArchives. The URL, final URL, content type and reason are
+	// site- or agent-controlled text.
+	RunFetches(ctx context.Context, runID, after string) (apitypes.RunFetchesDTO, error)
 	// DownloadRecoveryArchive streams ONE owner-owned capture's decrypted bundle bytes to
 	// w and returns the number of bytes written (PRD #1296 D4/D7): GET
 	// /api/runs/{id}/archives/{captureID}/download. It is deliberately NOT built on the

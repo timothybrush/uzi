@@ -67,7 +67,12 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 215 as of this commit. PRD #1907 M5 added the user's product-token routes, all
+// 220 as of this commit. PRD #1906 M1 added the egress-profile admin routes: GET
+// /api/admin/egress-profiles and GET /api/admin/egress-profiles/{name} in the admin READ
+// group, and POST /api/admin/egress-profiles, PUT and DELETE
+// /api/admin/egress-profiles/{name} in the cookie-only admin WRITE group. All five are
+// local DB reads or writes with no forge call and no token spend → noLimiter, like the
+// settings GET/PUT they sit beside. It was 215 until then. PRD #1907 M5 added the user's product-token routes, all
 // cookie-only (RequireAuth): GET /api/me/product-tokens/, GET
 // /api/me/product-tokens/products and DELETE /api/me/product-tokens/{id} (noLimiter), and
 // the mint, POST /api/me/product-tokens/, on authLimiter.PerUserMiddleware.
@@ -266,6 +271,13 @@ type routeMount struct {
 // across `c309e8a0`, every SHA-BOUND claim here survived (the `ad6c63d9` figures at :27
 // and below) and every UNBOUND one rotted (three of three, each way).
 var wantRouteMounts = []routeMount{
+	// PRD #1906 M1: egress profiles (named site lists). Reads in the admin read group,
+	// writes cookie-only; every one a local DB statement with no forge call → noLimiter.
+	{"GET", "/api/admin/egress-profiles", noLimiter},
+	{"GET", "/api/admin/egress-profiles/{name}", noLimiter},
+	{"POST", "/api/admin/egress-profiles", noLimiter},
+	{"PUT", "/api/admin/egress-profiles/{name}", noLimiter},
+	{"DELETE", "/api/admin/egress-profiles/{name}", noLimiter},
 	// PRD #685 M1: admin clear of a branding logo — cookie-only admin DB delete, no
 	// forge call → noLimiter, like the settings PUT and guardrail-override it sits
 	// beside.
@@ -375,6 +387,11 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/branding/logo/{slot}", noLimiter},
 	{"GET", "/api/chats/", noLimiter},
 	{"GET", "/api/controller/poll", noLimiter},
+	// PRD #1906 M3: the fetcher control routes. Authenticated by the fetcher's single
+	// service credential (no user to key a per-user bucket on); the per-run caps are the
+	// admission itself (Begin's reservation), so no limiter → noLimiter.
+	{"POST", "/api/fetcher/v1/begin", noLimiter},
+	{"POST", "/api/fetcher/v1/complete", noLimiter},
 	// PRD #333 M4: the Findings backlog read + the issue-draft read. Both are RequireUser
 	// reads with no per-user limiter — owner-scoped, no forge call, no spend → noLimiter.
 	{"GET", "/api/findings/", noLimiter},
@@ -456,6 +473,9 @@ var wantRouteMounts = []routeMount{
 	// with no forge call and no token spend (the streaming download is bounded by the
 	// recovery service's own per-process concurrency cap, not a per-user limiter).
 	{"GET", "/api/runs/{id}/archives", noLimiter},
+	// PRD #1906 M3: the owner read of a research run's source log. Owner-scoped, no forge
+	// call, no spend → noLimiter, like the archives list.
+	{"GET", "/api/runs/{id}/fetches", noLimiter},
 	{"GET", "/api/runs/{id}/archives/{captureID}/download", noLimiter},
 	{"DELETE", "/api/runs/{id}/archives/{captureID}", noLimiter},
 	// PRD #1349 M5: the exact owner custody-hold DISCARD, in the same RequireUser /runs group
@@ -1079,8 +1099,9 @@ func TestChatCreateRoutePatternMatchesMount(t *testing.T) {
 
 func TestEveryRouteCarriesItsExpectedPerUserLimiter(t *testing.T) {
 	limiters := newProbeLimiters()
-	// Hosting on, so the controller routes exist and the table is unconditional.
-	h := &Handler{cfg: config.Config{WorkerHostingEnabled: true}}
+	// Hosting on and a fetcher token configured, so the controller and fetcher control
+	// routes exist and the table is unconditional.
+	h := &Handler{cfg: config.Config{WorkerHostingEnabled: true, FetcherTokenSHA256: make([]byte, 32)}}
 	router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
 		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8])
 

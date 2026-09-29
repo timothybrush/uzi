@@ -159,6 +159,12 @@ func contractCases() []contractCase {
 		// present-as-null deleted_at) and the user mint picker entry (all strings, no null).
 		newContractCase[AdminDeleteProductResponse]("admin_delete_product"),
 		newContractCase[MintableProductDTO]("mintable_product"),
+		// PRD #1906 M1w: the admin egress profile ("site list"). created_by/updated_by are
+		// present-as-null pointers on the zero value; hosts, multi_publisher_override and
+		// warnings are non-omitempty slices (nil-slice nulls the handler normalizes to [],
+		// nonNilStrings and make(..., 0, n) in egressProfileToDTO). The nested
+		// EgressProfileWarningDTO rides inside the full fixture's warnings[0].
+		newContractCase[EgressProfileDTO]("egress_profile"),
 	}
 }
 

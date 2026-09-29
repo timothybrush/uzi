@@ -1009,6 +1009,15 @@ Tracked as GitHub issue vtmocanu/uzi#1864.
 
 - Before a non-interactive run's done checkpoint, the worker scans the branch's unpublished commits locally. A trusted finding entirely above the checkpoint floor returns to the lead for a history rewrite, at most 2 times; a finding at or below the floor, an exhausted cap, or an untrusted rescan after a finding fails the run `push_secret_blocked` with no push and no preserved patch (a durable-recovery archive stays exportable). A commit the mid-turn checkpoint scan flagged fails the run the same way while it is still in the pushed history. While a finding is live, no checkpoint publish goes out from the checkpoint body; the park, shutdown, pause, capture and completion-hold sinks stay unscanned (#1597). The local-scan failure reason never claims GH013 or GitHub Push Protection. Limits: a secret already published by an earlier GitHub milestone checkpoint is at or below the floor and is not remediated; a token-shaped fixture on a merged public non-default branch counts as a finding. (AI-synced 2026-09-29)
 
+## PRD #1906 — Official-sources web research
+
+Tracked as GitHub issue vtmocanu/uzi#1906; design in `prds/1906-official-sources-web-research.md`.
+
+- A run bound to a site list may read web content only from hosts on that list, fetched through a uzi fetch service; it runs in a worker lane with no internet, and nothing (kill-switch, cleared requirements, self-reported capability, old agent) can place it outside that lane. (AI-synced 2026-09-29)
+- Site lists are named, admin-managed, and never supplied by a request; admins create and edit them in the web UI (cookie-only writes), the CLI can list and show them. (AI-synced 2026-09-29)
+- Every fetch attempt, allowed or refused, is in the run's source log, readable by the run owner (`uzi run fetches <run>`); a fetch that cannot be logged does not happen. (AI-synced 2026-09-29)
+- The lane is off by default; existing worker tiers are unchanged, and no new image or workflow change is needed. (AI-synced 2026-09-29)
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
