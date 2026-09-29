@@ -22,37 +22,6 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
-### Added
-
-- **RC channel update prompts and correct Homebrew upgrade commands ([#1890](https://github.com/vtmocanu/uzi/issues/1890)).**
-  The TUI offers newer release candidates to `uzi-cli-rc` installs while stable installs stay on stable releases. The CLI version-skew warning now names the matching formula, and an RC install is never offered a stable-formula upgrade action.
-
-- **`uzi run recovery` with no run id lists all your held work ([#1889](https://github.com/vtmocanu/uzi/issues/1889)).**
-  It shows every open custody hold across your runs, with the full run and hold ids ready to paste into `uzi run discard`, plus the open, limit and decision-needed counts. `--json` returns every hold, settled ones included. `uzi run recovery <run-id>` is unchanged.
-
-- **A run whose skills plugin fails to load now stops instead of working without its skills ([#1888](https://github.com/vtmocanu/uzi/issues/1888)).**
-  When the Claude SDK reports skills-plugin load errors at session start, a run with selected skills fails with the new `fail_origin` `skills_plugin_load_failed` (never judged), and its failure reason names the plugin, error type, path and a trimmed message, redacted and bounded. An error report the worker cannot parse still counts as a failure. A run without selected skills posts a warning and continues. Claude runs only.
-
-### Fixed
-
-- **Codex finalize no longer fails finished runs on the 30-second checkpoint deadline ([#1900](https://github.com/vtmocanu/uzi/issues/1900), [#1904](https://github.com/vtmocanu/uzi/pull/1904)).**
-  Finalize (fetch, align, push, completion permit, PR description, MR creation) now runs under its own boundary deadline derived from its per-step timeouts. The worker logs each finalize step's duration, and a deadline failure names the step that was running.
-
-- **Codex checkpoint timeouts are diagnosable and recoverable ([#1914](https://github.com/vtmocanu/uzi/issues/1914), [#1917](https://github.com/vtmocanu/uzi/pull/1917), [#1919](https://github.com/vtmocanu/uzi/pull/1919)).**
-  A held-permit abort is no longer mistaken for a scratch-publication refusal, and a hard-deadline failure names the checkpoint phase that stalled. Milestone and done checkpoint publication get a 10-second cooperative budget inside the 30-second hard boundary: a clean timeout keeps the committed work in the worker and retries on the next checkpoint instead of failing the run, while hard aborts and unclean reaps still fail closed.
-
-- **A Codex finalize deadline now also stops the completion permit retry ([#1925](https://github.com/vtmocanu/uzi/pull/1925)).**
-  Previously an API outage could keep the worker slot and boundary permit occupied for up to the permit's 10-minute retry budget after the deadline fired.
-
-- **Worker shutdown no longer hangs on a run parked at the plan gate ([#1894](https://github.com/vtmocanu/uzi/issues/1894), [#1920](https://github.com/vtmocanu/uzi/pull/1920)).**
-  The gate wait now honours the shutdown signal, so the worker exits promptly and the run is released.
-
-- **The Codex command sandbox can execute the pinned Codex binary ([#1886](https://github.com/vtmocanu/uzi/issues/1886), [#1898](https://github.com/vtmocanu/uzi/pull/1898)).**
-  The Landlock allowlist now grants read and execute (never write) on `/opt/uzi-codex`, which previously failed with `EACCES` inside the sandbox. The Codex provisioning check also reports spawn errors and signals, not just the exit status.
-
-- **Faster API test suite: fake-forge 5xx tests no longer wait out the GitLab client's retry backoff ([#1893](https://github.com/vtmocanu/uzi/issues/1893), [#1905](https://github.com/vtmocanu/uzi/pull/1905)).**
-  Production retry behavior, including `Retry-After` handling, is unchanged.
-
 ## [0.85.0] - 2026-09-26
 
 ### Added
@@ -83,6 +52,15 @@ through `[0.52.0]`.)
 
 - **Leads now learn their environment's limits at run start ([#1866](https://github.com/vtmocanu/uzi/issues/1866)).**
   Before the plan turn (or the first implement turn on a plan-less resume), the worker runs a fixed probe measuring whether `/proc` can be enumerated and whether `$HOME`/`$TMPDIR` are writable, and folds the limits it found, plus whether Docker is wired on this worker, into a short prompt block with a rule: a gate blocked by a verified limit is recorded as blocked or not run rather than retried unchanged. The probe fails closed, so an unconfirmed cleanup fails the run rather than reporting a fact it can't stand behind. No egress tier is reported, since the worker receives none to pass through. A new uzi-watcher plan-trap check reads the worker's `environment facts` status line to catch a plan that ignores an affected gate.
+
+- **RC channel update prompts and correct Homebrew upgrade commands ([#1890](https://github.com/vtmocanu/uzi/issues/1890)).**
+  The TUI offers newer release candidates to `uzi-cli-rc` installs while stable installs stay on stable releases. The CLI version-skew warning now names the matching formula, and an RC install is never offered a stable-formula upgrade action.
+
+- **`uzi run recovery` with no run id lists all your held work ([#1889](https://github.com/vtmocanu/uzi/issues/1889)).**
+  It shows every open custody hold across your runs, with the full run and hold ids ready to paste into `uzi run discard`, plus the open, limit and decision-needed counts. `--json` returns every hold, settled ones included. `uzi run recovery <run-id>` is unchanged.
+
+- **A run whose skills plugin fails to load now stops instead of working without its skills ([#1888](https://github.com/vtmocanu/uzi/issues/1888)).**
+  When the Claude SDK reports skills-plugin load errors at session start, a run with selected skills fails with the new `fail_origin` `skills_plugin_load_failed` (never judged), and its failure reason names the plugin, error type, path and a trimmed message, redacted and bounded. An error report the worker cannot parse still counts as a failure. A run without selected skills posts a warning and continues. Claude runs only.
 
 ### Changed
 
@@ -188,6 +166,24 @@ through `[0.52.0]`.)
 
 - **Codex runs no longer fail at the next checkpoint when the lead's turn ends with a delegation still open ([#1864](https://github.com/vtmocanu/uzi/issues/1864)).**
   The open delegation is now cancelled and its work settled before the checkpoint. A boundary that still cannot settle fails closed, and the failure reason and worker log now name the stage, the checkpoint and the unsettled work instead of only `codex boundary failed at quiesce`.
+
+- **Codex finalize no longer fails finished runs on the 30-second checkpoint deadline ([#1900](https://github.com/vtmocanu/uzi/issues/1900), [#1904](https://github.com/vtmocanu/uzi/pull/1904)).**
+  Finalize (fetch, align, push, completion permit, PR description, MR creation) now runs under its own boundary deadline derived from its per-step timeouts. The worker logs each finalize step's duration, and a deadline failure names the step that was running.
+
+- **Codex checkpoint timeouts are diagnosable and recoverable ([#1914](https://github.com/vtmocanu/uzi/issues/1914), [#1917](https://github.com/vtmocanu/uzi/pull/1917), [#1919](https://github.com/vtmocanu/uzi/pull/1919)).**
+  A held-permit abort is no longer mistaken for a scratch-publication refusal, and a hard-deadline failure names the checkpoint phase that stalled. Milestone and done checkpoint publication get a 10-second cooperative budget inside the 30-second hard boundary: a clean timeout keeps the committed work in the worker and retries on the next checkpoint instead of failing the run, while hard aborts and unclean reaps still fail closed.
+
+- **A Codex finalize deadline now also stops the completion permit retry ([#1925](https://github.com/vtmocanu/uzi/pull/1925)).**
+  Previously an API outage could keep the worker slot and boundary permit occupied for up to the permit's 10-minute retry budget after the deadline fired.
+
+- **Worker shutdown no longer hangs on a run parked at the plan gate ([#1894](https://github.com/vtmocanu/uzi/issues/1894), [#1920](https://github.com/vtmocanu/uzi/pull/1920)).**
+  The gate wait now honours the shutdown signal, so the worker exits promptly and the run is released.
+
+- **The Codex command sandbox can execute the pinned Codex binary ([#1886](https://github.com/vtmocanu/uzi/issues/1886), [#1898](https://github.com/vtmocanu/uzi/pull/1898)).**
+  The Landlock allowlist now grants read and execute (never write) on `/opt/uzi-codex`, which previously failed with `EACCES` inside the sandbox. The Codex provisioning check also reports spawn errors and signals, not just the exit status.
+
+- **Faster API test suite: fake-forge 5xx tests no longer wait out the GitLab client's retry backoff ([#1893](https://github.com/vtmocanu/uzi/issues/1893), [#1905](https://github.com/vtmocanu/uzi/pull/1905)).**
+  Production retry behavior, including `Retry-After` handling, is unchanged.
 
 ## [0.84.0] - 2026-09-26
 
