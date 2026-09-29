@@ -24,6 +24,7 @@ import {
 } from "../src/run-quiescence.js";
 import { defaultCheckRunner } from "../src/self-improve.js";
 import { makeFakeProcRoot, scopedRealView, withQuiescenceView } from "./fake-proc.js";
+import { realProcfsSkip } from "./real-procfs.js";
 import { RUN_ATTEMPT_ENV, registerWorkerRunnerRoot, workerSpawnNonce } from "../src/worker-spawn-mark.js";
 
 // issue #1783 review round — the hardening of the run-quiescence reaper: attribution of a
@@ -351,13 +352,26 @@ describe("A-helper-tmp: the uid-split TMPDIR setup runs mktemp/rm asynchronously
     assert.ok(Date.now() - started < 5_000, "bounded by its deadline");
     assert.ok(ticks >= 5, `the event loop kept running while mktemp hung (ticks=${ticks})`);
     const hungPid = Number(fs.readFileSync(pidFile, "utf8").trim());
+    // hungPid is this process's own spawned child, so node reaps it once it dies and
+    // process.kill(pid, 0) then reports ESRCH. A failed status read never counts as gone by itself:
+    // ENOENT (also what a host with no proc filesystem returns for every pid) and a read denied by
+    // the sandbox (EACCES) both fall back to the signal probe instead of passing vacuously.
+    const hungGone = (): boolean => {
+      try {
+        return /^State:\s*[ZX]/m.test(procfsTable.readStatus(hungPid));
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === "ESRCH") return true;
+      }
+      try {
+        process.kill(hungPid, 0);
+        return false;
+      } catch (e) {
+        return (e as NodeJS.ErrnoException).code === "ESRCH";
+      }
+    };
     const gone = await (async () => {
       for (let i = 0; i < 100; i++) {
-        try {
-          if (/^State:\s*[ZX]/m.test(procfsTable.readStatus(hungPid))) return true;
-        } catch {
-          return true;
-        }
+        if (hungGone()) return true;
         await new Promise((r) => setTimeout(r, 20));
       }
       return false;
@@ -572,7 +586,11 @@ describe("A-docker-hardening", () => {
 
 // ─── item 4: a self-improve check's leak is reaped ─────────────────────────────────────────
 
-describe("A-check-leak: a process leaked by a self-improve check is reaped", { skip: !HAS_PROCFS }, () => {
+// The leak is found and reaped on the REAL process table: a sandbox that denies enumerating the
+// proc root skips through the shared detector (issue #1863).
+describe("A-check-leak: a process leaked by a self-improve check is reaped", {
+  skip: !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip("run-quiescence-hardening A-check-leak"),
+}, () => {
   it("the check is NOT worker-marked, so its detached leak (cwd in the clone) is killed by the run's own reap", async () => {
     const repoDir = path.join(tmp, "check-leak", "runner", "github.com+o+check");
     const clone = path.join(repoDir, "issue-17");

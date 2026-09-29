@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { type RunProcsOptions, reapRunProcesses, scanRunProcesses } from "../src/run-procs.js";
 import type { CommandWrapper } from "../src/rmtree.js";
+import { realProcfsSkip } from "./real-procfs.js";
 
 // PRD #1809 D4: process ATTRIBUTION by environment. The Claude CLI spawns every Bash command
 // detached (a new session and process group), so the run's processes are found by `HOME=<runHome>`
@@ -17,6 +18,10 @@ import type { CommandWrapper } from "../src/rmtree.js";
 const UID = process.getuid?.() ?? 0;
 const PROC = `/${"proc"}`;
 const HAS_PROC = fs.existsSync(`${PROC}/self/status`);
+/** The skip for a test of this host's REAL proc tree: none, "no proc filesystem", or (a sandbox
+ *  that denies enumerating the proc root, issue #1863) the shared detector's recorded reason. */
+const realTreeSkip = (label: string): string | false =>
+  !HAS_PROC ? "no proc filesystem here" : realProcfsSkip(`run process attribution: ${label}`);
 
 let root: string;
 let procRoot: string;
@@ -311,8 +316,7 @@ fs.openSync = function (p, ...rest) {
     assert.strictEqual(c.exitCode, null);
   });
 
-  it("this host's real proc tree: a detached child with the run's HOME is found and reaped; another HOME is not", async (t) => {
-    if (!HAS_PROC) return t.skip("no proc filesystem here");
+  it("this host's real proc tree: a detached child with the run's HOME is found and reaped; another HOME is not", { skip: realTreeSkip("real proc tree: detached child with the run's HOME") }, async () => {
     const mine = spawn("sleep", ["30"], { detached: true, stdio: "ignore", env: { PATH: process.env.PATH, HOME: runHome } });
     const other = spawn("sleep", ["30"], { detached: true, stdio: "ignore", env: { PATH: process.env.PATH, HOME: path.join(root, "x") } });
     children.push(mine, other);
@@ -320,6 +324,7 @@ fs.openSync = function (p, ...rest) {
     const found = await scanRunProcesses(runHome, undefined);
     assert.ok(found.pids.includes(mine.pid!), `the run's detached child is attributed (${JSON.stringify(found)})`);
     assert.ok(!found.pids.includes(other.pid!), "another HOME is not");
+    assert.strictEqual(found.complete, true, `the real scan completed, so the negative above is proven (${JSON.stringify(found)})`);
     // The test process is the "worker" here and both children are its direct children, so name
     // another worker pid for the reap.
     const exited = new Promise<NodeJS.Signals | null>((resolve) => mine.once("exit", (_c, sig) => resolve(sig)));
@@ -329,8 +334,7 @@ fs.openSync = function (p, ...rest) {
     assert.strictEqual(await exited, "SIGKILL");
   });
 
-  it("this host's real proc tree: an unrelated NON-DUMPABLE process does not make the run busy", async (t) => {
-    if (!HAS_PROC) return t.skip("no proc filesystem here");
+  it("this host's real proc tree: an unrelated NON-DUMPABLE process does not make the run busy", { skip: realTreeSkip("real proc tree: unrelated NON-DUMPABLE process") }, async (t) => {
     const py = python();
     if (!py) return t.skip("no python3 with ctypes here to call prctl(PR_SET_DUMPABLE, 0)");
     const pidFile = path.join(root, "nd.pid");
@@ -346,10 +350,10 @@ fs.openSync = function (p, ...rest) {
     const found = await scanRunProcesses(runHome, worktree);
     assert.ok(!found.pids.includes(nd.pid!), `the unrelated non-dumpable process is not the run's (${JSON.stringify(found)})`);
     assert.deepStrictEqual(found.pids, [], "nothing of this run is alive");
+    assert.strictEqual(found.complete, true, `the real scan completed: a scan that failed outright is not a quiet point (${JSON.stringify(found)})`);
   });
 
-  it("this host's real proc tree: a NON-DUMPABLE child of an attributed process IS the run's", async (t) => {
-    if (!HAS_PROC) return t.skip("no proc filesystem here");
+  it("this host's real proc tree: a NON-DUMPABLE child of an attributed process IS the run's", { skip: realTreeSkip("real proc tree: NON-DUMPABLE child of an attributed process") }, async (t) => {
     const py = python();
     if (!py) return t.skip("no python3 with ctypes here to call prctl(PR_SET_DUMPABLE, 0)");
     const pidFile = path.join(root, "child.pid");

@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { pipeline } from "node:stream/promises";
-import { PassThrough, type Readable, type Writable } from "node:stream";
+import { PassThrough, Writable, type Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import type { Logger } from "./log.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js";
@@ -108,6 +108,56 @@ function exitGatedStream(
       settle();
     },
   };
+}
+
+/**
+ * issue #1863 — the finalize import's writable view of its `index-pack` consumer's stdin.
+ * index-pack stops reading at the pack trailer and exits, and Node destroys a child's stdin on
+ * its exit, so that stdin can CLOSE (unfinished, with no error) while the producer's
+ * {@link exitGatedStream} still waits for pack-objects' exit status. Piping straight into it
+ * made `pipeline` report a premature close and fail an import whose both sides exited 0.
+ * Through this sink such a close is not a stream failure: later bytes are discarded and the end
+ * completes, so the verdict is left to the two exit statuses and the tip probe. An 'error' on
+ * the stdin (EPIPE) still errors the sink, and destroying the sink destroys the stdin.
+ */
+function consumerInputSink(target: Writable): Writable {
+  let pending: ((err?: Error | null) => void) | undefined;
+  const release = (): void => {
+    const cb = pending;
+    pending = undefined;
+    cb?.();
+  };
+  const sink = new Writable({
+    write(chunk: Buffer, _enc, cb) {
+      if (target.destroyed) {
+        cb();
+        return;
+      }
+      if (target.write(chunk)) cb();
+      else {
+        pending = cb;
+        target.once("drain", release);
+      }
+    },
+    final(cb) {
+      if (target.destroyed || target.writableFinished) {
+        cb();
+        return;
+      }
+      pending = cb;
+      target.once("finish", release);
+      target.end();
+    },
+    destroy(err, cb) {
+      target.destroy();
+      cb(err);
+    },
+  });
+  target.on("error", (err) => sink.destroy(err));
+  target.on("close", () => {
+    if (!target.errored) release();
+  });
+  return sink;
 }
 
 export class ScratchPublicationError extends Error {
@@ -5495,12 +5545,13 @@ export class GitCache {
       if (res.code !== 0 && !consumerStopped) stopProducer();
       return res;
     });
-    const piped = pipeline(producer.stdout, consumer.stdin).then(
+    const piped = pipeline(producer.stdout, consumerInputSink(consumer.stdin)).then(
       () => undefined,
       (err: unknown) => {
         // Attribute the break unless an exit handler already did: the producer when its stream
-        // errored first, otherwise the consumer (an EPIPE on its stdin, or a premature close with
-        // no error at all). Then tear both sides down.
+        // errored first, otherwise the consumer (an EPIPE on its stdin). A consumer stdin that
+        // closes with no error is not a break here (consumerInputSink): the consumer's exit
+        // status judges it. Then tear both sides down.
         if (!producerStopped && !consumerStopped) {
           if (firstBroken === "producer") stopConsumer();
           else stopProducer();
@@ -5524,7 +5575,14 @@ export class GitCache {
     if (producerFailure && producerStopped) failures.push(`${producerFailure} (stopped after its peer failed)`);
     if (consumerFailure && consumerStopped) failures.push(`${consumerFailure} (stopped after its peer failed)`);
     if (failures.length > 0) throw fail(failures.join("; "));
-    if (pipeError !== undefined) throw fail(`pack stream failed: ${gitErrorMessage(pipeError)}`);
+    if (pipeError !== undefined) {
+      // Both sides exited 0 here, yet the stream between them broke: name the side whose stream
+      // errored first and both (settled) exit statuses, so the log says where to look.
+      const side = firstBroken ? `${firstBroken} side` : "side unknown";
+      throw fail(
+        `pack stream failed (${side}; pack-objects exited ${producerCode}, index-pack exited ${consumerResult.code}): ${gitErrorMessage(pipeError)}`,
+      );
+    }
     if (!(await cloneHasTip())) throw fail("the imported pack did not make the tip resolvable in the clone");
     this.log.info("runner clone: imported default-tip objects", {
       path: clonePath,
