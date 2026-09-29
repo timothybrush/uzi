@@ -12613,7 +12613,7 @@ export class RunRunner {
     };
 
     if (this.planApprovalTimeoutMs <= 0)
-      return settle(await steering.awaitGateEvent(epoch));
+      return settle(await steering.awaitGateEvent(epoch, this.shutdownSignal.signal));
 
     // One absolute deadline across all revision rounds: set it on the first entry and
     // reuse it, so the per-round timer counts down the REMAINING budget (not a fresh 24h).
@@ -12624,6 +12624,10 @@ export class RunRunner {
     }
     const remaining = Math.max(0, deadlineAt - Date.now());
     let timer: NodeJS.Timeout | undefined;
+    // The timeout can win Promise.race while the gate waiter is still parked.
+    // End that losing wait as well, without aborting the runner's shutdown signal.
+    const gateWaitAbort = new AbortController();
+    const gateWaitSignal = AbortSignal.any([this.shutdownSignal.signal, gateWaitAbort.signal]);
     const timeout = new Promise<PlanVerdict>((resolve) => {
       timer = setTimeout(
         () => resolve({ kind: "reject", reason: PLAN_APPROVAL_TIMEOUT_REASON }),
@@ -12633,10 +12637,11 @@ export class RunRunner {
     });
     try {
       return settle(
-        await Promise.race([steering.awaitGateEvent(epoch), timeout]),
+        await Promise.race([steering.awaitGateEvent(epoch, gateWaitSignal), timeout]),
       );
     } finally {
       if (timer) clearTimeout(timer);
+      gateWaitAbort.abort(new Error("gate wait settled"));
     }
   }
 
