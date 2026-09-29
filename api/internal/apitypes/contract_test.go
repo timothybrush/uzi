@@ -144,6 +144,21 @@ func contractCases() []contractCase {
 		// nested all-int struct (no null). The nested HealthCheckDTO / HealthEvidenceDTO
 		// ride inside the full fixture's checks[0], no standalone row (never returned alone).
 		newContractCase[HealthDocDTO]("health_doc"),
+		// PRD #1907 M1: the product registry, product tokens and the /api/v1 whoami
+		// seam. ProductDTO's deleted_at, ProductTokenDTO's last_used_*/expires_at and
+		// V1WhoamiDTO's product are present-as-null pointers; the scopes slices are
+		// non-omitempty (null in zero.json, never null on the real wire: the column is
+		// NOT NULL and non-empty). AdminProductTokenDTO embeds ProductTokenDTO, so its
+		// fixture carries the row's keys inline; MintProductTokenResponse nests it.
+		newContractCase[ProductDTO]("product"),
+		newContractCase[ProductTokenDTO]("product_token"),
+		newContractCase[AdminProductTokenDTO]("admin_product_token"),
+		newContractCase[MintProductTokenResponse]("mint_product_token"),
+		newContractCase[V1WhoamiDTO]("v1_whoami"),
+		// PRD #1907 M4/M5: the typed admin delete response (its nested product carries the
+		// present-as-null deleted_at) and the user mint picker entry (all strings, no null).
+		newContractCase[AdminDeleteProductResponse]("admin_delete_product"),
+		newContractCase[MintableProductDTO]("mintable_product"),
 	}
 }
 

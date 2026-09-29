@@ -151,7 +151,7 @@ uzi repo list | remove <id> [--force]
 uzi project-sync status <repo> | resync <repo>
 uzi pr list [--repo <id>] | checks <iid> [--repo <id>] [--watch]
 uzi ci list [--repo <id>] [--limit <n>] | jobs <run-id> [--repo <id>] | fix <ref> [--repo <id>]
-uzi admin users | runs | workers | usage | rate-limits | cli-tokens | guardrail-impact | blocked-repos
+uzi admin users | runs | workers | usage | rate-limits | cli-tokens | products | guardrail-impact | blocked-repos
 uzi admin health [--all] [--strict]
 uzi admin agent-source get | status
 uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category label,label] | stats [--json]
@@ -696,6 +696,13 @@ A few worth knowing:
   not an oversight, but worth knowing before you mint or hand out one of
   these tokens. Read-only: there's no admin revoke here, the same write/read
   split as every other `admin` verb.
+- **`admin products` lists the external products registered for product
+  tokens** (PRD #1907), soft-deleted ones included, with `NAME`, `STATE`
+  (`enabled`, `disabled` or `deleted`), `ACTIVE_TOKENS` (tokens neither
+  revoked nor expired) and `DESCRIPTION`. A disabled or deleted product's
+  tokens are refused on `/api/v1`, and a deleted product can never be
+  re-enabled. Read-only: registering, editing, deleting a product and
+  revoking one of its tokens are browser-only admin actions.
 - **`admin guardrail-impact` is a live pre-flight count** (PRD #66) — how many
   enabled repos, factory-wide, the push/merge guardrail would refuse right now
   (the bot can push or merge to the default branch). It **persists nothing**: it
@@ -2278,8 +2285,10 @@ that counts output lines, say. It is a poor substitute for upgrading.
 
 If a laptop is lost, **Settings → Access → Revoke all** is the one-click
 answer — it stops every `uzi` CLI and CI job using one of your tokens at
-once. If you'd rather keep some, the token list gives you what you need to
-decide: `token_prefix`, `last_used_at`, and `last_used_ip`. Revoke anything
+once. Since PRD #1907 it revokes your **product tokens** too (see below), in
+the same step, so no CLI or product token of yours stays live (browser
+sessions are not ended: sign out for that). If you'd rather keep some, the
+token list gives you what you need to decide: `token_prefix`, `last_used_at`, and `last_used_ip`. Revoke anything
 you don't recognise, and treat an unfamiliar `last_used_ip` as the signal to
 revoke, not just a curiosity.
 
@@ -2288,3 +2297,13 @@ revoke, not just a curiosity.
 There is no per-request audit log for CLI tokens — `last_used_ip` (updated at
 most once a minute) is the only detection control the design has, not a full
 trail.
+
+**Product tokens (`uzp_…`) are a separate credential.** A token you mint in
+**Settings → Access → Product tokens** for an external product works only on
+`/api/v1` and is not a CLI token: `uzi` cannot use one, so `UZI_TOKEN` must
+hold a CLI token (`uzc_` or `uza_`), and the CLI refuses a `uzp_` value with an
+error saying so. Like CLI tokens, product tokens are **not** revoked by a
+password change or logout; Revoke all, revoking one token, an admin, disabling
+or deleting the product, or deactivating the account does revoke them. Minting
+and admin product management are browser-only; the CLI has just the read-only
+`uzi admin products`. See [Product tokens](./product-tokens.md).

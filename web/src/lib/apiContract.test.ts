@@ -45,6 +45,13 @@ import type {
   CodexAdminRateLimitRow,
   HealthDoc,
   BuildInfo,
+  Product,
+  ProductToken,
+  AdminProductToken,
+  ProductTokenMint,
+  V1Whoami,
+  AdminDeleteProductResponse,
+  MintableProduct,
 } from "./apiTypes";
 
 import buildInfoZero from "../../../fixtures/api-contract/build_info.zero.json";
@@ -135,6 +142,20 @@ import codexAdminRateLimitRowZero from "../../../fixtures/api-contract/codex_adm
 import codexAdminRateLimitRowFull from "../../../fixtures/api-contract/codex_admin_rate_limit_row.full.json";
 import healthDocZero from "../../../fixtures/api-contract/health_doc.zero.json";
 import healthDocFull from "../../../fixtures/api-contract/health_doc.full.json";
+import productZero from "../../../fixtures/api-contract/product.zero.json";
+import productFull from "../../../fixtures/api-contract/product.full.json";
+import productTokenZero from "../../../fixtures/api-contract/product_token.zero.json";
+import productTokenFull from "../../../fixtures/api-contract/product_token.full.json";
+import adminProductTokenZero from "../../../fixtures/api-contract/admin_product_token.zero.json";
+import adminProductTokenFull from "../../../fixtures/api-contract/admin_product_token.full.json";
+import mintProductTokenZero from "../../../fixtures/api-contract/mint_product_token.zero.json";
+import mintProductTokenFull from "../../../fixtures/api-contract/mint_product_token.full.json";
+import adminDeleteProductZero from "../../../fixtures/api-contract/admin_delete_product.zero.json";
+import adminDeleteProductFull from "../../../fixtures/api-contract/admin_delete_product.full.json";
+import mintableProductZero from "../../../fixtures/api-contract/mintable_product.zero.json";
+import mintableProductFull from "../../../fixtures/api-contract/mintable_product.full.json";
+import v1WhoamiZero from "../../../fixtures/api-contract/v1_whoami.zero.json";
+import v1WhoamiFull from "../../../fixtures/api-contract/v1_whoami.full.json";
 
 // The api ⇄ SPA JSON wire-contract (PRD #982). This is the VITEST HALF; the Go
 // half is api/internal/apitypes/contract_test.go. Neither reads the other: each
@@ -945,6 +966,85 @@ void _buildInfoFull;
   void _recoveryCustodyHoldsFull;
 }
 
+// ── Product tokens (PRD #1907 M1) ────────────────────────────────────────────
+// ZeroOf exemption: scopes — product_tokens.scopes is NOT NULL with a non-empty CHECK
+// (migration 00270), so every row the mappers build carries a non-empty array; the null
+// is only the nil-slice zero marshal. The nested product_token in the mint response
+// carries the same exemption, spelled as a nested ZeroOf. deleted_at, last_used_at,
+// last_used_ip, expires_at and the whoami product are typed `X | null`, no exemption.
+{
+  const _productMissing: never = null as unknown as Exclude<keyof Product, keyof typeof productFull>;
+  const _productExtra: never = null as unknown as Exclude<keyof typeof productFull, keyof Product>;
+  const _productZero: ZeroOf<Product> = productZero;
+  const _productFull: Widen<Product> = productFull;
+  void _productMissing;
+  void _productExtra;
+  void _productZero;
+  void _productFull;
+}
+{
+  const _productTokenMissing: never = null as unknown as Exclude<keyof ProductToken, keyof typeof productTokenFull>;
+  const _productTokenExtra: never = null as unknown as Exclude<keyof typeof productTokenFull, keyof ProductToken>;
+  const _productTokenZero: ZeroOf<ProductToken, "scopes"> = productTokenZero;
+  const _productTokenFull: Widen<ProductToken> = productTokenFull;
+  void _productTokenMissing;
+  void _productTokenExtra;
+  void _productTokenZero;
+  void _productTokenFull;
+}
+{
+  const _adminProductTokenMissing: never = null as unknown as Exclude<keyof AdminProductToken, keyof typeof adminProductTokenFull>;
+  const _adminProductTokenExtra: never = null as unknown as Exclude<keyof typeof adminProductTokenFull, keyof AdminProductToken>;
+  const _adminProductTokenZero: ZeroOf<AdminProductToken, "scopes"> = adminProductTokenZero;
+  const _adminProductTokenFull: Widen<AdminProductToken> = adminProductTokenFull;
+  void _adminProductTokenMissing;
+  void _adminProductTokenExtra;
+  void _adminProductTokenZero;
+  void _adminProductTokenFull;
+}
+{
+  const _mintProductTokenMissing: never = null as unknown as Exclude<keyof ProductTokenMint, keyof typeof mintProductTokenFull>;
+  const _mintProductTokenExtra: never = null as unknown as Exclude<keyof typeof mintProductTokenFull, keyof ProductTokenMint>;
+  const _mintProductTokenZero: { token: string; product_token: ZeroOf<ProductToken, "scopes"> } = mintProductTokenZero;
+  const _mintProductTokenFull: Widen<ProductTokenMint> = mintProductTokenFull;
+  void _mintProductTokenMissing;
+  void _mintProductTokenExtra;
+  void _mintProductTokenZero;
+  void _mintProductTokenFull;
+}
+{
+  const _v1WhoamiMissing: never = null as unknown as Exclude<keyof V1Whoami, keyof typeof v1WhoamiFull>;
+  const _v1WhoamiExtra: never = null as unknown as Exclude<keyof typeof v1WhoamiFull, keyof V1Whoami>;
+  const _v1WhoamiZero: ZeroOf<V1Whoami, "scopes"> = v1WhoamiZero;
+  const _v1WhoamiFull: Widen<V1Whoami> = v1WhoamiFull;
+  void _v1WhoamiMissing;
+  void _v1WhoamiExtra;
+  void _v1WhoamiZero;
+  void _v1WhoamiFull;
+}
+// PRD #1907 M4/M5: the typed admin delete response (its nested product's deleted_at is
+// `string | null`, no exemption) and the user mint-picker entry (all strings).
+{
+  const _adminDeleteProductMissing: never = null as unknown as Exclude<keyof AdminDeleteProductResponse, keyof typeof adminDeleteProductFull>;
+  const _adminDeleteProductExtra: never = null as unknown as Exclude<keyof typeof adminDeleteProductFull, keyof AdminDeleteProductResponse>;
+  const _adminDeleteProductZero: ZeroOf<AdminDeleteProductResponse> = adminDeleteProductZero;
+  const _adminDeleteProductFull: Widen<AdminDeleteProductResponse> = adminDeleteProductFull;
+  void _adminDeleteProductMissing;
+  void _adminDeleteProductExtra;
+  void _adminDeleteProductZero;
+  void _adminDeleteProductFull;
+}
+{
+  const _mintableProductMissing: never = null as unknown as Exclude<keyof MintableProduct, keyof typeof mintableProductFull>;
+  const _mintableProductExtra: never = null as unknown as Exclude<keyof typeof mintableProductFull, keyof MintableProduct>;
+  const _mintableProductZero: ZeroOf<MintableProduct> = mintableProductZero;
+  const _mintableProductFull: Widen<MintableProduct> = mintableProductFull;
+  void _mintableProductMissing;
+  void _mintableProductExtra;
+  void _mintableProductZero;
+  void _mintableProductFull;
+}
+
 // ── Runtime self-checks ─────────────────────────────────────────────────────
 // A contract that passes on a missing fixture, or on a zero.json with no null in
 // it, is the false-green shape this repo documents repeatedly. These fatal
@@ -1054,6 +1154,17 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // normalizes to []), so its zero.json carries nulls.
   { stem: "health_doc", nullable: true },
   { stem: "build_info", nullable: false },
+  // PRD #1907 M1: every product/product-token DTO has a present-as-null pointer or a
+  // nil-slice scopes in its zero.json, so all five are nullable:true.
+  { stem: "product", nullable: true },
+  { stem: "product_token", nullable: true },
+  { stem: "admin_product_token", nullable: true },
+  { stem: "mint_product_token", nullable: true },
+  { stem: "v1_whoami", nullable: true },
+  // PRD #1907 M4/M5: admin_delete_product nests a product whose deleted_at is null in
+  // zero.json; mintable_product is all strings, so its zero.json carries no null.
+  { stem: "admin_delete_product", nullable: true },
+  { stem: "mintable_product", nullable: false },
 ];
 
 describe("api-contract fixtures are present and discriminating", () => {

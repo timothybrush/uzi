@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Product tokens and a stable `/api/v1` ([#1907](https://github.com/vtmocanu/uzi/issues/1907)).**
+  Admins register external products under Admin > Products; users mint `uzp_` product tokens for them in Settings > Access (scopes, expiry, at most 10 active per product, shown once). A product token works only on `/api/v1` (today `GET /api/v1/whoami`, described in `api/openapi/v1.yaml`), never carries admin authority, and is refused everywhere else. Revoke all now also revokes product tokens; admins can revoke one, or disable or delete the product. The `uzi` CLI refuses a `uzp_` token with a clear error.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added
