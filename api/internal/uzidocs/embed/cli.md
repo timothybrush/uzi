@@ -881,6 +881,50 @@ uzi run discard <run-id> --hold <hold-id> --yes
 - **Terminal and owner-scoped.** A discarded hold cannot be revived, and you can discard
   only your own runs' holds.
 
+### A failed run's salvage copy: `refs/uzi-salvage/<run-id>`
+
+Salvage is **off by default**. An operator turns it on per forge with
+`UZI_SALVAGE_FORGES` (a comma list of `github`, `gitlab`, `forgejo`). When it is on,
+uzi copies a failed run's last **published** checkpoint to a run-scoped ref,
+`refs/uzi-salvage/<run-id>`, and removes that copy after `UZI_RECOVERY_READY_RETENTION`
+(if the removal keeps failing, uzi stops trying and `SALVAGE_ERROR` names the ref that may
+remain).
+The copy is only what the run had checkpointed to the forge, so it may be behind the
+run's final local work. Salvage never moves or deletes the branch's own checkpoint ref.
+
+`uzi run get` on a failed run with a salvage record prints a `SALVAGE` block: the state
+with a one-line explanation, then `SALVAGE_REF`, `SALVAGE_TIP` (short), `SALVAGE_EXPIRES`
+and `SALVAGE_ERROR` when set. A promoted copy also prints the fetch command:
+
+```
+SALVAGE          promoted: checkpointed commits saved (last published checkpoint; may be behind the run's final local work)
+SALVAGE_REF      refs/uzi-salvage/<run-id>
+SALVAGE_TIP      89abcdef0123
+SALVAGE_EXPIRES  2026-09-29T12:00:00Z
+SALVAGE_FETCH    git fetch origin refs/uzi-salvage/<run-id>
+```
+
+The other states read `pending` (the copy is being made), `unavailable` (not saved: the
+published checkpoint was no longer at its recorded tip on the forge, either gone or moved),
+`refused` (the salvage ref already pointed at a different commit), `failed` (salvage stopped after
+repeated attempts; the last error names any ref that may remain), `skipped_secret` (not saved: the run failed on a secret-scan block),
+`expired` (the copy was removed, unless removal kept failing; the last error names any ref that may remain) and `disabled` (not saved: salvage was turned off for
+that forge before a copy was made). `SALVAGE_REF` and `SALVAGE_FETCH` print only for a
+ref of the exact form `refs/uzi-salvage/<run-id>` naming this run. The same values are the run's `salvage_state`,
+`salvage_ref`, `salvage_tip`, `salvage_expires_at` and `salvage_last_error` fields
+(`--json`, or `uzi run get <run-id> --field salvage_state`); all are null without a
+salvage record.
+
+While a failed run has a live salvage copy (made, or still being made), removing its repo
+or forge connection is refused with a 409. The body names **at most 5** live rows total,
+split between `salvage_refs` (each created `refs/uzi-salvage/<run-id>`) and
+`salvage_pending_runs` (each run whose copy is still `pending`, by run id; a pending copy
+may already have its ref); a run beyond that first 5 is only counted, in `salvage_count`
+(the true total) and in the error text's trailing "and N more run(s)". The error text
+otherwise names the same refs and runs as the body. The block lifts when the
+copies expire, or when a pending copy settles (into `promoted`, which then holds until it
+expires, or into a state that saved nothing); retry the removal after that.
+
 ## uzi handoff: ephemeral branch-scoped task runs
 
 ```sh

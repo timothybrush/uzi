@@ -626,6 +626,16 @@ type Store interface {
 	// metadata row in state 'expired'. It NEVER touches custody — an expired capture whose hold
 	// is still open stays retained per D3.
 	ExpireReadyCaptures(ctx context.Context, now pgtype.Timestamptz) (int64, error)
+	// Failed-run checkpoint salvage (PRD #1867), driven by SweepSalvage (salvage.go).
+	ListSalvageCandidates(ctx context.Context, arg store.ListSalvageCandidatesParams) ([]store.ListSalvageCandidatesRow, error)
+	InsertRunSalvage(ctx context.Context, arg store.InsertRunSalvageParams) (int64, error)
+	ListSalvageDuePending(ctx context.Context, arg store.ListSalvageDuePendingParams) ([]store.RunSalvage, error)
+	ListSalvageDueExpiry(ctx context.Context, arg store.ListSalvageDueExpiryParams) ([]store.RunSalvage, error)
+	RecordSalvageCreated(ctx context.Context, arg store.RecordSalvageCreatedParams) (int64, error)
+	MarkSalvagePromoted(ctx context.Context, arg store.MarkSalvagePromotedParams) (int64, error)
+	RecordSalvageAttemptFailed(ctx context.Context, arg store.RecordSalvageAttemptFailedParams) (int64, error)
+	SettleSalvage(ctx context.Context, arg store.SettleSalvageParams) (int64, error)
+	RecordSalvageExpireFailed(ctx context.Context, arg store.RecordSalvageExpireFailedParams) (int64, error)
 	// ExpireStalledUploads is the periodic upload-retry-window sweep (PRD #1296 D3/D4): it
 	// flips a capture stuck in a non-terminal upload state (preparing/uploading) past the
 	// UZI_RECOVERY_UPLOAD_RETRY_WINDOW to needs_action WITHOUT releasing its custody hold, so
@@ -1504,6 +1514,13 @@ type Params struct {
 	// value DISABLES the sweep (the zero value is the safe off direction, so a Params literal that
 	// omits it never runs the pass); the positive default lives in config.go where the env is read.
 	RecoveryReadyRetention time.Duration
+
+	// SalvageForges (PRD #1867, UZI_SALVAGE_FORGES) lists the forge kinds ("github",
+	// "gitlab", "forgejo") whose failed runs SweepSalvage enqueues for a salvage ref. It gates
+	// the enqueue and the create: rows already recorded keep expiring when their forge leaves
+	// the list, and a pending row there settles 'disabled' after a CAS delete of any unrecorded
+	// copy. Empty (the zero value) is off.
+	SalvageForges []string
 }
 
 // Broadcaster receives run events after they are persisted, for live fan-out to
@@ -1742,6 +1759,21 @@ type Service struct {
 	// error-injected) without a real forge. Same seam discipline as publishFn:
 	// pushbroker stays the ONE place go-git lives.
 	deleteCheckpointFn func(ctx context.Context, o pushbroker.DeleteOptions) error
+	// salvageListRefTipsFn / salvageCreateRefFn / salvageDeleteRefFn are SweepSalvage's
+	// broker seams (PRD #1867). They have the types of listRefTipsFn / createRefFn /
+	// deleteCheckpointFn and default to the same #1810 primitives (pushbroker.ListRefTips,
+	// CreateRef and Delete, set in New), but are separate fields so a salvage test's fake
+	// forge never serves retention's calls, and so deleteCheckpointFn stays a tripwire
+	// salvage must never reach. salvage.go only ever passes a refs/uzi-salvage/<run-id>
+	// Ref with an ExpectedOldTip to salvageDeleteRefFn (pinned by an AST test).
+	// salvagePassBudget overrides the pass's wall-clock budget (zero = the 10s
+	// salvagePassBudgetDefault); tests shorten it. salvageLeadPending is which due list
+	// leads the next pass's round-robin (false = expiries), flipped every pass.
+	salvageListRefTipsFn func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error)
+	salvageCreateRefFn   func(ctx context.Context, o pushbroker.CreateRefOptions) error
+	salvageDeleteRefFn   func(ctx context.Context, o pushbroker.DeleteOptions) error
+	salvagePassBudget    time.Duration
+	salvageLeadPending   bool
 	// createRefFn is the go-git recovery-ref CREATOR (PRD #1810 M3, D2): supersession preserves
 	// a retained checkpoint tip under refs/uzi-recovery/<run id> before freeing the branch ref.
 	// Defaults to pushbroker.CreateRef (set in New); tests stub it with an in-memory forge.
@@ -2014,12 +2046,15 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 	}
 	return &Service{
 		q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker(), outbox: newOutboxTracker(),
-		publishFn:          pushbroker.Publish,
-		deleteCheckpointFn: pushbroker.Delete,
-		createRefFn:        pushbroker.CreateRef,
-		listRefTipsFn:      pushbroker.ListRefTips,
-		background:         func(fn func()) { go fn() },
-		retentionSem:       make(chan struct{}, retentionDefaultConc),
+		publishFn:            pushbroker.Publish,
+		deleteCheckpointFn:   pushbroker.Delete,
+		salvageListRefTipsFn: pushbroker.ListRefTips,
+		salvageCreateRefFn:   pushbroker.CreateRef,
+		salvageDeleteRefFn:   pushbroker.Delete,
+		createRefFn:          pushbroker.CreateRef,
+		listRefTipsFn:        pushbroker.ListRefTips,
+		background:           func(fn func()) { go fn() },
+		retentionSem:         make(chan struct{}, retentionDefaultConc),
 
 		terminalLockRetryBudget:   terminalPublishLockRetryBudget,
 		terminalLockRetryInterval: terminalPublishLockRetryInterval,

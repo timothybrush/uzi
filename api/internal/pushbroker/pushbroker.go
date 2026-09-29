@@ -17,10 +17,11 @@
 // ref off it. A non-fast-forward / CAS-mismatch rejection is mapped to ErrNotDescendant
 // — a legitimate "origin moved" outcome the caller turns into a 200 skip, never a 5xx.
 //
-// The other two ref writes keep the same invariant. Delete removes a checkpoint or
-// recovery ref (a CAS on the expected tip when one is known), and CreateRef (PRD #1810
-// D2) creates a refs/uzi-recovery/* ref with a single command whose Old is the zero
-// hash, so the remote's compare-and-swap refuses it whenever the ref already exists.
+// The other two ref writes keep the same invariant. Delete removes a checkpoint,
+// recovery or salvage ref (a CAS on the expected tip when one is known; always a CAS for
+// a recovery or salvage ref), and CreateRef (PRD #1810 D2, widened by PRD #1867) creates a
+// refs/uzi-recovery/* or refs/uzi-salvage/* ref with a single command whose Old is the
+// zero hash, so the remote's compare-and-swap refuses it whenever the ref already exists.
 // No path in this package sends a forced update.
 package pushbroker
 
@@ -47,6 +48,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/transport/client"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	"github.com/go-git/go-git/v5/storage/memory"
+	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/redirectguard"
 )
@@ -116,10 +118,11 @@ var (
 	// cleanly (checkpoints are best-effort — PRD #456 M4) and never fails the run. The
 	// finalize base-align (PRD #456 M1) is the real safety net for such a run's work.
 	ErrWorkflowScopeRejected = errors.New("pushbroker: checkpoint push rejected for missing workflow scope")
-	// ErrInvalidRef means a ref name or tip handed to CreateRef or Delete is outside
-	// the namespaces this package may write (refs/uzi-checkpoints/*, refs/uzi-recovery/*),
-	// is not a well-formed git ref name, or (CreateRef) the tip is not a 40-hex non-zero
-	// object id. It is a caller bug, refused before any network I/O.
+	// ErrInvalidRef means a ref name or tip handed to CreateRef, Delete or ListRefTips is
+	// outside the namespaces this package may touch (refs/uzi-checkpoints/*,
+	// refs/uzi-recovery/*, refs/uzi-salvage/*; CreateRef narrows that per target, see
+	// validateCreateRef), is not a well-formed git ref name, or (CreateRef) the tip is not
+	// a 40-hex non-zero object id. It is a caller bug, refused before any network I/O.
 	ErrInvalidRef = errors.New("pushbroker: invalid ref")
 	// ErrRefExists means CreateRef found the target ref present on origin at a tip
 	// other than the one requested: in the list before the create, or in the read-back
@@ -215,6 +218,24 @@ const checkpointRefPrefix = "refs/uzi-checkpoints/"
 // preserved under (PRD #1810 D2): refs/uzi-recovery/<run-id>. Like the checkpoint
 // namespace it is outside refs/heads, so no CI watches it.
 const RecoveryRefPrefix = "refs/uzi-recovery/"
+
+// SalvageRefPrefix is the run-scoped namespace a FAILED run's last published checkpoint
+// tip is copied into for bounded archival (PRD #1867): refs/uzi-salvage/<run-id>. Keyed
+// by run id, so it never blocks a later run on the same branch, and outside refs/heads,
+// so no CI watches it. Its refs are only ever created (CreateRef) and CAS-deleted.
+const SalvageRefPrefix = "refs/uzi-salvage/"
+
+// SalvageRef names the salvage ref for runID: refs/uzi-salvage/<run-id>.
+func SalvageRef(runID uuid.UUID) string {
+	return SalvageRefPrefix + runID.String()
+}
+
+// validManagedRef reports whether ref is a well-formed ref strictly under one of the
+// namespaces Delete and ListRefTips accept: checkpoint, recovery or salvage.
+func validManagedRef(ref string) bool {
+	return validRefUnder(ref, checkpointRefPrefix) || validRefUnder(ref, RecoveryRefPrefix) ||
+		validRefUnder(ref, SalvageRefPrefix)
+}
 
 // Publish fetches origin's base objects, applies the worker's delta pack, verifies
 // the declared tip strictly descends origin's current tip, and pushes it —
@@ -418,11 +439,11 @@ type DeleteOptions struct {
 	Username string
 	PAT      string
 	// Ref, when set, is the FULL name of the ref to delete and replaces
-	// refs/uzi-checkpoints/<Branch>. It must lie under refs/uzi-checkpoints/ or
-	// refs/uzi-recovery/ and be a well-formed ref name, else Delete returns
-	// ErrInvalidRef before any network I/O. Empty keeps the branch-derived name. A
-	// recovery ref is only ever CAS-deleted: Ref under refs/uzi-recovery/ with an empty
-	// ExpectedOldTip is ErrInvalidRef.
+	// refs/uzi-checkpoints/<Branch>. It must lie under refs/uzi-checkpoints/,
+	// refs/uzi-recovery/ or refs/uzi-salvage/ (PRD #1867) and be a well-formed ref name,
+	// else Delete returns ErrInvalidRef before any network I/O. Empty keeps the
+	// branch-derived name. A recovery or salvage ref is only ever CAS-deleted: Ref under
+	// either prefix with an empty ExpectedOldTip is ErrInvalidRef.
 	Ref string
 	// ExpectedOldTip is the tip this run last published to its checkpoint ref (the
 	// persisted runs.checkpoint_tip). When set, Delete takes a compare-and-swap path:
@@ -435,8 +456,8 @@ type DeleteOptions struct {
 	ExpectedOldTip string
 }
 
-// Delete removes refs/uzi-checkpoints/<branch> (or o.Ref, a checkpoint or recovery
-// ref named in full) from the remote, BEST-EFFORT (PRD #1030 M4). A run's checkpoint ref is uzi-owned scratch state; once the run reaches
+// Delete removes refs/uzi-checkpoints/<branch> (or o.Ref, a checkpoint, recovery or
+// salvage ref named in full) from the remote, BEST-EFFORT (PRD #1030 M4). A run's checkpoint ref is uzi-owned scratch state; once the run reaches
 // a terminal state it is stale, and a stale ref left behind later blocks a NEW run on
 // the same branch with a not_descendant skip (the new run's tip does not descend the
 // dead run's checkpoint). PRD #1810 routes terminal cleanup through checkpoint
@@ -444,7 +465,8 @@ type DeleteOptions struct {
 // deleted once the run's last open custody hold settles, or immediately at the
 // terminal transition when the run has no hold; a supersession (another run needing
 // the slot) and the sweep reconciler also call this, each a CAS on the run's recorded
-// tip. Every caller SWALLOWS or records the returned error — it must never block or
+// tip. The salvage sweep (PRD #1867) CAS-deletes only its own refs/uzi-salvage/<run-id>
+// at expiry. Every caller SWALLOWS or records the returned error — it must never block or
 // fail the worker's terminal report — so this carries its OWN short wall-clock
 // timeout rather than inheriting an unbounded ctx.
 //
@@ -482,12 +504,13 @@ func Delete(ctx context.Context, o DeleteOptions) error {
 
 	ref := checkpointRefPrefix + o.Branch
 	if o.Ref != "" {
-		if !validRefUnder(o.Ref, checkpointRefPrefix) && !validRefUnder(o.Ref, RecoveryRefPrefix) {
+		if !validManagedRef(o.Ref) {
 			return ErrInvalidRef
 		}
-		// A recovery ref preserves a superseded run's only off-worker copy: it is only
-		// ever removed compare-and-swap on its recorded tip, never unconditionally.
-		if o.ExpectedOldTip == "" && strings.HasPrefix(o.Ref, RecoveryRefPrefix) {
+		// A recovery ref preserves a superseded run's only off-worker copy, and a salvage
+		// ref a failed run's archived tip: each is only ever removed compare-and-swap on
+		// its recorded tip, never unconditionally.
+		if o.ExpectedOldTip == "" && (strings.HasPrefix(o.Ref, RecoveryRefPrefix) || strings.HasPrefix(o.Ref, SalvageRefPrefix)) {
 			return ErrInvalidRef
 		}
 		ref = o.Ref
@@ -631,11 +654,13 @@ func casDelete(ctx context.Context, remote *git.Remote, auth transport.AuthMetho
 	}
 }
 
-// CreateRefOptions carries a recovery-ref create (PRD #1810 D2). Like DeleteOptions
-// every field is server-derived by the caller: the forge connection, the recovery ref
-// to create (Ref, under RecoveryRefPrefix), the tip it must point at, and the
-// checkpoint ref (SourceRef, under refs/uzi-checkpoints/) origin must currently
-// advertise at exactly that tip.
+// CreateRefOptions carries a recovery-ref create (PRD #1810 D2) or a salvage-ref create
+// (PRD #1867). Like DeleteOptions every field is server-derived by the caller: the forge
+// connection, the ref to create (Ref), the tip it must point at, and the ref (SourceRef)
+// origin must currently advertise at exactly that tip. A recovery Ref (under
+// RecoveryRefPrefix) takes a SourceRef under refs/uzi-checkpoints/ only; a salvage Ref
+// (under SalvageRefPrefix) takes a SourceRef under refs/uzi-checkpoints/ or
+// refs/uzi-recovery/ (validateCreateRef).
 type CreateRefOptions struct {
 	CloneURL  string
 	Username  string
@@ -805,15 +830,16 @@ type ListRefsOptions struct {
 
 // ListRefTips lists origin once and returns the tips of those of refs it advertises
 // (an absent ref has no key; an empty origin yields an empty map). Every ref must lie
-// under refs/uzi-checkpoints/ or refs/uzi-recovery/, else ErrInvalidRef before any
-// network I/O. A read, never a write: a caller uses it to tell the reasons CreateRef
-// reported ErrSourceMissing apart.
+// under refs/uzi-checkpoints/, refs/uzi-recovery/ or refs/uzi-salvage/, else
+// ErrInvalidRef before any network I/O. A read, never a write: a caller uses it to tell
+// the reasons CreateRef reported ErrSourceMissing apart, to pick a salvage source, or to
+// confirm a salvage delete (PRD #1867).
 func ListRefTips(ctx context.Context, o ListRefsOptions, refs ...string) (map[string]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, maxDeleteDuration)
 	defer cancel()
 	want := make(map[plumbing.ReferenceName]bool, len(refs))
 	for _, r := range refs {
-		if !validRefUnder(r, checkpointRefPrefix) && !validRefUnder(r, RecoveryRefPrefix) {
+		if !validManagedRef(r) {
 			return nil, ErrInvalidRef
 		}
 		want[plumbing.ReferenceName(r)] = true
@@ -865,9 +891,20 @@ func emptyPack() []byte {
 	return append(hdr, sum[:]...)
 }
 
-// validateCreateRef checks CreateRef's inputs without touching the network.
+// validateCreateRef checks CreateRef's inputs without touching the network. The target
+// is a recovery ref sourced from a checkpoint ref (PRD #1810), or a salvage ref sourced
+// from a checkpoint or recovery ref (PRD #1867); every other pairing is ErrInvalidRef.
 func validateCreateRef(o CreateRefOptions) error {
-	if !validRefUnder(o.Ref, RecoveryRefPrefix) || !validRefUnder(o.SourceRef, checkpointRefPrefix) {
+	switch {
+	case validRefUnder(o.Ref, RecoveryRefPrefix):
+		if !validRefUnder(o.SourceRef, checkpointRefPrefix) {
+			return ErrInvalidRef
+		}
+	case validRefUnder(o.Ref, SalvageRefPrefix):
+		if !validRefUnder(o.SourceRef, checkpointRefPrefix) && !validRefUnder(o.SourceRef, RecoveryRefPrefix) {
+			return ErrInvalidRef
+		}
+	default:
 		return ErrInvalidRef
 	}
 	if !isObjectID(o.Tip) || plumbing.NewHash(o.Tip).IsZero() {
