@@ -1,7 +1,7 @@
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
 import { replaySegment } from "./batcher.js";
-import type { Outbox } from "./outbox.js";
+import type { Outbox, PendingFinalize } from "./outbox.js";
 import type { RunRunner } from "./runner.js";
 import type { ChatRunner } from "./chat-runner.js";
 import type { JudgeRunner } from "./judge-runner.js";
@@ -143,6 +143,11 @@ export class Worker {
         `toolchain preflight failed: missing ${pf.missing.join(", ")} — baked worker toolchain not on the runner PATH (likely a stale /nix seed after an image roll; see PRD #92)`,
       );
     }
+    // issue #1742 D4(a): snapshot the previous process's recovery records BEFORE register, so the
+    // restart sweep below provably excludes any record a live flight of this process writes later.
+    // A runner stub without the method (older test doubles) simply has nothing to snapshot.
+    const bootRecoveries =
+      typeof this.runner.snapshotBootRecoveries === "function" ? await this.runner.snapshotBootRecoveries() : [];
     await this.registerWithRetry(signal);
     if (signal.aborted) return;
     // PRD #1296 M3 (D3/D5) — after registering (so the worker is authenticated), re-drive
@@ -150,7 +155,7 @@ export class Worker {
     // journaled bundle bytes with NO forge PAT. Fire-and-forget and fully swallowed — a
     // resume failure must never block the claim loops, and the source stays protected by
     // the journal + the server custody hold regardless.
-    void this.runner.resumePendingRecoveries(signal).catch((err) => {
+    void this.runner.resumePendingRecoveries(signal, bootRecoveries).catch((err) => {
       this.log.warn("recovery: restart resume sweep failed", { error: errMessage(err) });
     });
     // PRD #1391 M2: admit any spill tail a crash may have lost, then drain the outbox
@@ -241,6 +246,14 @@ export class Worker {
           send: this.replaySend(entry.run_id, gen),
           signal,
         });
+        // Issue #1742: a crash between installing G's terminal journal and retiring G's finalize
+        // record leaves both files. Once the journal is settled (no longer pending), the finalize
+        // record for the run at generation <= G is obsolete, so retire it or it blocks the retention
+        // sweep. A journal left listed (blocked, transient blip) keeps its finalize record.
+        const stillPending = outbox
+          .listPendingTerminals()
+          .some((p) => p.run_id === entry.run_id && p.claim_generation === gen);
+        if (!stillPending) await outbox.retireFinalizesThrough(entry.run_id, gen);
       } catch (err) {
         this.log.warn("outbox: boot terminal resolve failed for a run; leaving it listed for a later resolve", {
           run_id: entry.run_id,
@@ -332,11 +345,26 @@ export class Worker {
     // initial snapshot with an EMPTY pending subset + `pending_overflow: true` ON the register
     // request, so those outcomes are LEASED before the api's register-time orphan pass can re-claim
     // them. Cap-independent: the empty subset + overflow protects every pending run regardless of the
-    // cap (even cap 0, where a non-empty subset would be rejected whole when cap < count). Built ONCE
-    // before the retry loop so a re-register re-sends the same snapshot. Undefined for an ordinary
-    // worker with no pending journals (or no registry) ⇒ the register wire stays byte-identical.
+    // cap (even cap 0, where a non-empty subset would be rejected whole when cap < count). Issue
+    // #1742: a worker with only finalize-pending records also sends a snapshot (`pending_overflow`
+    // false, `finalize_resume` set). Built ONCE before the retry loop so a re-register re-sends the
+    // same snapshot. Undefined for an ordinary worker with neither (or no registry) ⇒ the register
+    // wire stays byte-identical.
     const pending = this.outbox?.listPendingTerminals() ?? [];
-    const initialSnapshot = this.buildRegisterSnapshot();
+    // Issue #1742: the finalize-pending records offered on this register, captured ONCE with the
+    // snapshot. After an accepted register the offered records (and any lower-generation records of
+    // the same offered runs) are retired, never a re-listing, so a record a live flight writes later
+    // survives.
+    const offeredFinalizes = this.outbox?.listPendingFinalizes() ?? [];
+    const initialSnapshot = this.buildRegisterSnapshot(offeredFinalizes);
+    const sentFinalizes = initialSnapshot?.finalize_resume ?? [];
+    if (sentFinalizes.length > 0) {
+      this.log.info("register finalize snapshot", {
+        count: sentFinalizes.length,
+        claim_generations_sample: sentFinalizes.slice(0, 8).map((entry) => entry.claim_generation),
+        claim_generations_omitted: Math.max(0, sentFinalizes.length - 8),
+      });
+    }
     this.log.info("register terminal snapshot", {
       authenticated_pending: pending.length,
       claim_generations_sample: pending.slice(0, 8).map((entry) => entry.claim_generation),
@@ -451,6 +479,19 @@ export class Worker {
           worker_id: res.worker_id ?? null,
         });
         this.dindPrune?.setWorkerId(res.worker_id);
+        // Issue #1742: the api accepted this register, so retire the offered finalize records
+        // (`sentFinalizes`, what the snapshot carried) and any lower-generation records of the same
+        // offered runs. A failed register never reaches here. A
+        // retire failure must not turn an accepted register into a retry loop.
+        if (sentFinalizes.length > 0) {
+          try {
+            await this.outbox?.retireFinalizes(sentFinalizes);
+          } catch (err) {
+            this.log.warn("register finalize snapshot: retiring the offered records failed", {
+              error: errMessage(err),
+            });
+          }
+        }
         return;
       } catch (err) {
         // A 401/403 is a PERMANENT auth rejection of the worker join token (rotated or
@@ -578,18 +619,24 @@ export class Worker {
   }
 
   /**
-   * PRD #1391 Run B M4 (D7): build the BOOT register snapshot, or undefined for an ordinary worker.
-   * Returned only when the worker holds at least one pending terminal journal — then it is an EMPTY
-   * pending subset + `pending_overflow: true`, which leases every pending run BEFORE the api's
-   * register-time orphan pass, cap-independently. Unlike the heartbeat/claim snapshot this is NOT
-   * gated on the `active_run_snapshot` FEATURE (the feature is only known AFTER register, and #1390's
-   * register handler accepts the field unconditionally): the gate is purely "do we hold a pending
-   * outcome to protect". Undefined when there is no registry or nothing pending.
+   * PRD #1391 Run B M4 (D7) and issue #1742: build the BOOT register snapshot, or undefined for an
+   * ordinary worker. Returned when the worker holds a pending terminal journal OR an offered
+   * finalize-pending record. With pending terminals it is an EMPTY pending subset +
+   * `pending_overflow: true`, which leases every pending run BEFORE the api's register-time orphan
+   * pass, cap-independently. With only finalize records there is nothing to lease, so
+   * `pending_overflow` is false and the snapshot carries just `finalize_resume`. Unlike the
+   * heartbeat/claim snapshot this is NOT gated on the `active_run_snapshot` FEATURE (the feature is
+   * only known AFTER register, and #1390's register handler accepts the field unconditionally): the
+   * gate is purely "do we hold a pending outcome or finalize record to protect". Undefined when there
+   * is no registry or nothing pending.
    */
-  private buildRegisterSnapshot(): ActiveSnapshot | undefined {
+  private buildRegisterSnapshot(finalizes: readonly PendingFinalize[]): ActiveSnapshot | undefined {
     if (!this.activeRuns) return undefined;
-    if (!this.outbox || this.outbox.listPendingTerminals().length === 0) return undefined;
-    return this.activeRuns.buildRegisterSnapshot();
+    if (!this.outbox) return undefined;
+    // Issue #1742: a pending finalize record also warrants the register snapshot (it carries
+    // finalize_resume), even with no pending terminal journal.
+    if (this.outbox.listPendingTerminals().length === 0 && finalizes.length === 0) return undefined;
+    return this.activeRuns.buildRegisterSnapshot(finalizes);
   }
 
   /**
