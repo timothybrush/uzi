@@ -56,6 +56,14 @@ through `[0.52.0]`.)
 - **An isolated, no-internet worker lane and a fetch service for official-sources research, off by default ([#1906](https://github.com/vtmocanu/uzi/issues/1906)).**
   The Helm chart gains `workers.isolatedLane.*`: a third worker namespace (`uzi-workers-isolated`) whose default-deny policy admits only DNS, the api, the new `uzi-fetcher` Deployment and `api.anthropic.com` by exact name, plus the fetcher itself, which checks every URL against a run's site list (https on 443, no userinfo, public addresses only, per-run caps) and logs every attempt. A run in the lane gets a per-run fetch credential, a fixed tool set (`Read`, `Write`, `Edit`, `Grep`, `Glob` and one fetch tool, no shell), and can be claimed only by a worker the api provisioned into the lane. Owners read a run's source log with `uzi run fetches <run>`. Turning it on needs workers, an FQDN egress provider (Antrea or OVN), api TLS and the cluster's pod, service and node CIDRs; use `workers.isolatedLane.fetcher.token.source: existing` under Argo CD, since a generated token changes on every sync. Nothing binds a run to a site list until job creation (PRD #1908), so the lane is idle, and it has not been measured on a live cluster. DNS, the model API and a multi-publisher host admitted by an override remain open channels; see the Isolated research lane operator page and ADR-1906.
 
+### Fixed
+
+- **A Codex child agent gets its full instructions, not just the short description ([#1717](https://github.com/vtmocanu/uzi/issues/1717), [#1933](https://github.com/vtmocanu/uzi/pull/1933)).**
+  When a Codex run delegates to a child agent, an explicit `prompt`, `task`, `input` or `message` now takes precedence over the short `description`, which remains the fallback for description-only delegations.
+
+- **Codex runs honor a larger iteration budget served during execution ([#1726](https://github.com/vtmocanu/uzi/issues/1726), [#1936](https://github.com/vtmocanu/uzi/pull/1936)).**
+  A milestone-scaled budget from the server now raises the Codex implement loop's iteration cap, matching the Claude executor's upward-only rule; an equal, smaller or absent budget keeps the configured cap.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added
