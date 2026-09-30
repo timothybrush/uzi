@@ -207,6 +207,12 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	// unconditional on status, so it would otherwise mis-handle a parked run). `extend` adds time and
 	// resumes in one action (ExtendAndResumeWallPark); `stop` caps the scope, grants the finalize
 	// allowance, and resumes (StopWallPark); `cancel` falls through to CancelRunServerSide unchanged.
+	// PRD #1908 D-E: a job is never extended, on ANY extend path. Refuse it here, above the
+	// budget_exhausted wall-park branch (which routes to ExtendAndResumeWallPark with no kind
+	// filter) and the generic CTE (whose kind list admits a job).
+	if kind == "extend" && run.Kind == runkind.Job {
+		return SubmitInputResult{}, extendRefusalReason(run, 0, 0)
+	}
 	if run.Status == "paused" && run.HoldReason.Valid && run.HoldReason.String == "budget_exhausted" {
 		switch kind {
 		case "extend":
@@ -1182,6 +1188,8 @@ func pauseRefusalReason(run store.Run) error {
 		why = "interactive tasks park after each turn"
 	case run.Kind == runkind.Judge || run.Kind == runkind.MRRework || run.Kind == runkind.CIFix:
 		why = "judge, mr_rework and ci_fix runs are short and finish on their own"
+	case run.Kind == runkind.Job:
+		why = "job runs never park; cancel the job instead"
 	default:
 		why = "pause is not supported for this run"
 	}
@@ -1213,6 +1221,11 @@ func extendRefusalReason(run store.Run, secs, capSeconds int) error {
 	}
 	if run.Kind == runkind.Chat || run.Kind == runkind.Judge || run.Interactive {
 		return fmt.Errorf("%w (a %s run has no wall-clock timeout)", ErrExtendNotTimed, run.Kind)
+	}
+	// PRD #1908 D-E: a job's wall-clock limit is fixed at creation and the run fails at it, so it
+	// is never extended (CreateExtendInput's SQL kind list would otherwise admit it).
+	if run.Kind == runkind.Job {
+		return fmt.Errorf("%w (a job run's wall-clock limit is fixed at creation)", ErrExtendNotTimed)
 	}
 	remaining := capSeconds - int(run.BudgetExtensionSeconds)
 	if remaining < 0 {

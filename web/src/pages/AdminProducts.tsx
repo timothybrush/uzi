@@ -9,7 +9,7 @@
 // Product names/descriptions (admin-written) and token names/owner emails
 // (user-written) are untrusted text: React text nodes only, never HTML.
 
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { api, type AdminProductToken, type Product } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
@@ -40,6 +40,8 @@ import {
   productTokenExpiryText,
 } from "../components/ProductTokens";
 import { PackageIcon } from "../components/icons";
+import { JOB_TYPES, jobTypeLabel } from "../lib/jobTypes";
+import { stripUnsafeChars } from "../lib/safeText";
 
 const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? "" : "s"}`;
 
@@ -101,9 +103,9 @@ export function AdminProducts() {
       {notice && <Alert tone="success" message={notice} />}
 
       <CreateProduct
-        onCreate={(name, description) =>
+        onCreate={(name, description, allowedJobTypes) =>
           run(async () => {
-            const { product } = await api.adminCreateProduct(name, description);
+            const { product } = await api.adminCreateProduct(name, description, allowedJobTypes);
             return `Registered “${product.name}”. Users can now mint tokens for it.`;
           }, "Failed to register product")
         }
@@ -136,6 +138,19 @@ export function AdminProducts() {
                   await api.adminUpdateProduct(p.id, { enabled });
                 }, "Failed to update product")
               }
+              // Reported inline on the card (not the page banner, which can be scrolled
+              // off-screen): resolves to the error text, or to the list the server stored.
+              onJobTypes={async (allowed_job_types) => {
+                let saved: string[];
+                try {
+                  const { product } = await api.adminUpdateProduct(p.id, { allowed_job_types });
+                  saved = product.allowed_job_types ?? allowed_job_types;
+                } catch (err) {
+                  return { error: errorMessage(err, "Failed to save the job types") };
+                }
+                await reload();
+                return { error: null, saved };
+              }}
               onDelete={() =>
                 run(async () => {
                   const res = await api.adminDeleteProduct(p.id);
@@ -156,9 +171,138 @@ export function AdminProducts() {
   );
 }
 
-function CreateProduct({ onCreate }: { onCreate: (name: string, description: string) => Promise<boolean> }) {
+// JOB_TYPE_HINTS says, per job type, what a product allowed it can have uzi do. Keyed by
+// the JOB_TYPES mirror, so a new type is a compile error here until it has a hint.
+const JOB_TYPE_HINTS: Record<(typeof JOB_TYPES)[number], string> = {
+  research: "Works from the inputs it is sent and returns a report with findings.",
+};
+
+// withJobType adds or removes one type, keeping the known types in JOB_TYPES order and
+// preserving any stored type this build does not know (a newer server's), so a toggle here
+// never silently drops it.
+function withJobType(current: string[], type: string, on: boolean): string[] {
+  const set = new Set(current);
+  if (on) set.add(type);
+  else set.delete(type);
+  const known = JOB_TYPES.filter((t) => set.has(t));
+  const unknown = current.filter((t) => set.has(t) && !(JOB_TYPES as readonly string[]).includes(t));
+  return [...known, ...unknown];
+}
+
+// JobTypeChecks is the per-type allow-list: one checkbox per known job type. An empty
+// allow-list lets the product create no jobs at all (the server's fail-closed rule), and the
+// hint under the group says so, so an unchecked box never reads as "anything goes". A stored
+// type this build does not know (a newer server's) has no checkbox; it is named as text, so
+// the hint never claims "only the checked types" over a list whose entries are all unlisted.
+//
+// `saving` dims the boxes and marks them aria-disabled (not native disabled, which would drop
+// keyboard focus mid-save); `status` is the polite live line under the group ("Saving…",
+// "Saved."), always mounted so a screen reader hears each change.
+function JobTypeChecks({
+  legend,
+  value,
+  disabled,
+  saving,
+  status,
+  error,
+  onChange,
+}: {
+  legend: string;
+  value: string[];
+  disabled?: boolean;
+  saving?: boolean;
+  status?: "saving" | "saved" | null;
+  error?: string;
+  onChange: (type: string, on: boolean) => void;
+}) {
+  const baseId = useId();
+  const hintId = `${baseId}-hint`;
+  const errorId = `${baseId}-error`;
+  const inert = disabled || saving;
+  const known = JOB_TYPES.filter((t) => value.includes(t));
+  const unknown = value.filter((t) => !(JOB_TYPES as readonly string[]).includes(t));
+  const hint =
+    value.length === 0
+      ? "None checked: this product cannot create jobs."
+      : unknown.length === 0
+        ? "Users’ tokens for this product can create only the checked types."
+        : known.length === 0
+          ? "No listed type is checked: users’ tokens for this product can create only the types named above."
+          : "Users’ tokens for this product can create only the checked types and the types named above.";
+  return (
+    <fieldset
+      className="space-y-1.5"
+      aria-describedby={error ? `${hintId} ${errorId}` : hintId}
+      aria-busy={saving || undefined}
+    >
+      <legend className="mb-1.5 text-sm font-medium text-muted">{legend}</legend>
+      {JOB_TYPES.map((t) => {
+        const boxId = `${baseId}-${t}`;
+        const typeHintId = `${boxId}-hint`;
+        return (
+          <div
+            key={t}
+            className={`flex items-start gap-2 text-sm text-fg transition-opacity motion-reduce:transition-none ${
+              inert ? "opacity-60" : ""
+            }`}
+          >
+            <input
+              id={boxId}
+              type="checkbox"
+              className={`mt-0.5 h-4 w-4 accent-brand ${saving ? "cursor-progress" : inert ? "cursor-not-allowed" : ""}`}
+              checked={value.includes(t)}
+              // aria-disabled, not native disabled, while a save is in flight: a natively
+              // disabled box drops keyboard focus (the enable switch keeps it the same way).
+              aria-disabled={inert || undefined}
+              aria-describedby={typeHintId}
+              onChange={(e) => {
+                if (!inert) onChange(t, e.target.checked);
+              }}
+            />
+            <div>
+              <label htmlFor={boxId} className={saving ? "cursor-progress" : inert ? "cursor-not-allowed" : ""}>
+                {jobTypeLabel(t)}
+              </label>
+              <p id={typeHintId} className="text-xs text-faint">
+                {JOB_TYPE_HINTS[t]}
+              </p>
+            </div>
+          </div>
+        );
+      })}
+      {unknown.length > 0 && (
+        <p className="text-sm text-muted">
+          Also allowed, not listed on this page:{" "}
+          <span className="font-mono text-fg">{unknown.map(stripUnsafeChars).join(", ")}</span>
+        </p>
+      )}
+      <p id={hintId} className="text-xs text-faint">
+        {hint}
+      </p>
+      {status !== undefined && (
+        <p role="status" className={`min-h-4 text-xs ${status === "saved" ? "text-ok" : "text-muted"}`}>
+          {status === "saving" ? "Saving job types…" : status === "saved" ? "Job types saved." : ""}
+        </p>
+      )}
+      {error && (
+        <p id={errorId} role="alert" className="rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-sm text-danger">
+          {error}
+        </p>
+      )}
+    </fieldset>
+  );
+}
+
+function CreateProduct({
+  onCreate,
+}: {
+  onCreate: (name: string, description: string, allowedJobTypes: string[]) => Promise<boolean>;
+}) {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
+  // Fail-closed default, like the server: a new product may create no job type until one
+  // is checked.
+  const [jobTypes, setJobTypes] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   // Inline mirrors of the server's gate (byte caps, no control characters), so a value
   // the server is certain to refuse never leaves the form.
@@ -170,11 +314,12 @@ function CreateProduct({ onCreate }: { onCreate: (name: string, description: str
     e.preventDefault();
     if (!canSubmit) return;
     setBusy(true);
-    const ok = await onCreate(trimProductText(name), trimProductText(description));
+    const ok = await onCreate(trimProductText(name), trimProductText(description), jobTypes);
     setBusy(false);
     if (ok) {
       setName("");
       setDescription("");
+      setJobTypes([]);
     }
   };
 
@@ -214,6 +359,12 @@ function CreateProduct({ onCreate }: { onCreate: (name: string, description: str
             </p>
           )}
         </Field>
+        <JobTypeChecks
+          legend="Job types it may create"
+          value={jobTypes}
+          disabled={busy}
+          onChange={(t, on) => setJobTypes((cur) => withJobType(cur, t, on))}
+        />
         <Button type="submit" disabled={!canSubmit}>
           {busy ? "Registering…" : "Register product"}
         </Button>
@@ -237,6 +388,7 @@ function ProductCard({
   tokens,
   truncatedAt,
   onToggle,
+  onJobTypes,
   onDelete,
   onRevoke,
 }: {
@@ -246,6 +398,10 @@ function ProductCard({
   // `tokens` does not mean none exist.
   truncatedAt: number | null;
   onToggle: (enabled: boolean) => Promise<boolean>;
+  // Sends the product's whole new allow-list (PATCH allowed_job_types; [] clears it) and
+  // resolves to the error text on failure, or the list the server stored once saved (the
+  // list was then reloaded, but a failed reload keeps the old data, so `saved` is the basis).
+  onJobTypes: (allowed: string[]) => Promise<{ error: string } | { error: null; saved: string[] }>;
   onDelete: () => Promise<boolean>;
   onRevoke: (t: AdminProductToken) => Promise<boolean>;
 }) {
@@ -262,6 +418,36 @@ function ProductCard({
     setBusy(true);
     await fn();
     setBusy(false);
+  };
+
+  // Job types save optimistically: the box shows the new state at once (dimmed, "Saving…"),
+  // then "Saved." on success, or reverts with an inline error beside the boxes on failure.
+  // absent = an api predating PRD #1908 (rollout skew): no job types to edit.
+  // A saved list stays the basis until the product prop changes (a successful reload),
+  // so a failed reload cannot revert the boxes or make the next toggle drop this change.
+  const propTypes = product.allowed_job_types;
+  const [savedTypes, setSavedTypes] = useState<string[] | null>(null);
+  useEffect(() => setSavedTypes(null), [propTypes]);
+  const storedTypes = propTypes === undefined ? undefined : (savedTypes ?? propTypes);
+  const [pendingTypes, setPendingTypes] = useState<string[] | null>(null);
+  const [typesStatus, setTypesStatus] = useState<"saving" | "saved" | null>(null);
+  const [typesError, setTypesError] = useState("");
+  useEffect(() => {
+    if (typesStatus !== "saved") return;
+    const t = setTimeout(() => setTypesStatus(null), 4000);
+    return () => clearTimeout(t);
+  }, [typesStatus]);
+  const toggleType = async (type: string, on: boolean) => {
+    if (pendingTypes !== null || busy) return;
+    const next = withJobType(storedTypes ?? [], type, on);
+    setPendingTypes(next);
+    setTypesStatus("saving");
+    setTypesError("");
+    const res = await onJobTypes(next);
+    if (res.error === null) setSavedTypes(res.saved);
+    setPendingTypes(null);
+    setTypesStatus(res.error === null ? "saved" : null);
+    setTypesError(res.error ?? "");
   };
 
   // What the delete will stop: an enabled product's active tokens. A disabled
@@ -351,6 +537,23 @@ function ProductCard({
               </Button>
             </div>
           </div>
+        )}
+
+        {storedTypes === undefined ? null : deleted ? (
+          <p className="text-sm text-muted">
+            Job types:{" "}
+            {storedTypes.length === 0 ? "none" : storedTypes.map((t) => stripUnsafeChars(jobTypeLabel(t))).join(", ")}
+          </p>
+        ) : (
+          <JobTypeChecks
+            legend="Job types it may create"
+            value={pendingTypes ?? storedTypes}
+            disabled={busy}
+            saving={pendingTypes !== null}
+            status={typesStatus}
+            error={typesError}
+            onChange={(t, on) => void toggleType(t, on)}
+          />
         )}
 
         {tokens.length === 0 ? (

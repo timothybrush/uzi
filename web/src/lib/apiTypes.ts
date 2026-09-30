@@ -1542,6 +1542,12 @@ export interface Product {
   deleted_at: string | null;
   created_at: string;
   active_token_count: number;
+  /** Job types this product may create (apitypes.ProductDTO.AllowedJobTypes, PRD #1908);
+   *  empty allows none (fail-closed). The mapper normalizes a nil slice to [], so it is
+   *  never null on the wire. OPTIONAL for the api/web rollout skew (as Run.credential_override
+   *  and outcome_pending): a mid-deploy api pod predating #1908 omits the key, so every read
+   *  falls back (`?? []`, or hides the editor) instead of crashing the Products page. */
+  allowed_job_types?: string[];
 }
 
 // AdminDeleteProductResponse is DELETE /api/admin/products/{id}
@@ -3057,6 +3063,48 @@ export interface Run {
    *  the same api/web rollout skew as credential_override: a mid-deploy api pod predating
    *  #1391 M3 omits the key. Overlaid on the single-run detail read only (never the list). */
   outcome_pending?: { reason: string } | null;
+  /** PRD #1908 D-D: the job block of a kind='job' run (apitypes.RunDTO.Job, omitempty), so
+   *  absent on every other run kind. Free-text members are untrusted display text. */
+  job?: RunJob;
+}
+
+// RunJob is the job block of GET /api/runs/{id} (apitypes.RunJobDTO).
+export interface RunJob {
+  /** The closed job type enum (today "research"). */
+  type: string;
+  inputs: RunJobInput[];
+  origin: RunJobOrigin;
+  /** null until the job's result row exists. */
+  result: RunJobResult | null;
+}
+
+// RunJobInput is one input of a job: its name and content size in bytes.
+export interface RunJobInput {
+  name: string;
+  size_bytes: number;
+}
+
+// RunJobOrigin is the job's audit origin (apitypes.RunJobOriginDTO). requested_by_label is an
+// UNTRUSTED end-user label (attribution only); product_name is null for a CLI-token job.
+export interface RunJobOrigin {
+  requested_by_label: string | null;
+  product_name: string | null;
+}
+
+// RunJobResult is the stored result of a job run (apitypes.RunJobResultDTO).
+export interface RunJobResult {
+  status: string;
+  report_md: string;
+  findings: RunJobFinding[];
+}
+
+// RunJobFinding is one structured finding; the unused location members are null.
+export interface RunJobFinding {
+  severity: string;
+  message_md: string;
+  url: string | null;
+  file: string | null;
+  line: number | null;
 }
 
 /** CredentialOverride is a run's or schedule's per-run credential choice (PRD #1247 M1):

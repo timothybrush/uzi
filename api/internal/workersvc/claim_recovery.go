@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -267,6 +268,21 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		}
 	}
 	origin := claimAssemblyOrigin(assemblyErr)
+	if credDisabled && run.Kind == runkind.Job {
+		// PRD #1908 D-E: a job never parks. A disabled credential fails it closed, with the
+		// origin the assembly-time credential refusals use, rather than the credential_disabled
+		// park, which keeps worker_id and would leave a job nothing consumes a cancel for.
+		credDisabled = false
+		// Single-prefixed reason: drop the "credential disabled: " lead the assembly error
+		// carries, so the stored text reads "credential unavailable: <detail>". credDisabled is
+		// already cleared, so nothing after this keys on errCredentialDisabled.
+		detail := errCredentialDisabled.Error()
+		if assemblyErr != nil {
+			detail = strings.TrimPrefix(assemblyErr.Error(), errCredentialDisabled.Error()+": ")
+		}
+		assemblyErr = fmt.Errorf("%w: %s", errCredentialUnavailable, detail)
+		origin = "credential_unavailable"
+	}
 	// Only credential authority faults may park, and only on a custody-holding kind: a judge
 	// stays terminal. Guardrail and provisioning failures remain terminal even if an account
 	// changes concurrently.

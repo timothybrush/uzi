@@ -216,6 +216,16 @@ type Client interface {
 	// /api/admin/products, in the admin READ group, so a uza_ token reads it. Every
 	// product, soft-deleted ones included, with its active-token count.
 	AdminListProducts(ctx context.Context) ([]apitypes.ProductDTO, error)
+	// The repo-less job verbs (PRD #1908 M7), over the stable /api/v1/jobs API (a uzc_ token is
+	// accepted there). JobCreate posts a job; JobGet/JobResult/JobCancel address one by id (a
+	// foreign, absent or malformed id is one 404 → ExitNotFound; cancelling a finished job is a
+	// 409 → ExitConflict); JobList is one keyset page, newest first (limit 0 and an empty cursor
+	// take the server defaults).
+	JobCreate(ctx context.Context, req apitypes.V1JobCreateRequest) (apitypes.V1JobDTO, error)
+	JobGet(ctx context.Context, id string) (apitypes.V1JobDTO, error)
+	JobResult(ctx context.Context, id string) (apitypes.V1JobResultDTO, error)
+	JobCancel(ctx context.Context, id string) (apitypes.V1JobDTO, error)
+	JobList(ctx context.Context, limit int, cursor string) (apitypes.V1JobListDTO, error)
 	AdminUsage(ctx context.Context) (apitypes.AdminUsageDTO, error)
 	AdminRateLimits(ctx context.Context) ([]apitypes.AdminRateLimitRowDTO, error)
 	// AdminCodexRateLimits reads the factory-wide per-user Codex rate-limit rows
@@ -1041,7 +1051,7 @@ const ReasonGateRevisionMismatch = "gate_revision_mismatch"
 func statusError(status int, body []byte, retryAfter string) *ExitError {
 	msg := serverErrMsg(body)
 	reason := serverErrReason(body)
-	e := buildStatusError(status, msg, retryAfter)
+	e := buildStatusError(status, msg, reason, retryAfter)
 	e.Reason = reason
 	if reason == ReasonGateRevisionMismatch {
 		e.CurrentGateRevision = serverErrCurrentGateRevision(body)
@@ -1049,7 +1059,7 @@ func statusError(status int, body []byte, retryAfter string) *ExitError {
 	return e
 }
 
-func buildStatusError(status int, msg, retryAfter string) *ExitError {
+func buildStatusError(status int, msg, reason, retryAfter string) *ExitError {
 	switch {
 	case status == http.StatusTooManyRequests:
 		// A 429 is a rate-limit shed, not a bad request: the server (or the forge it
@@ -1087,10 +1097,17 @@ func buildStatusError(status int, msg, retryAfter string) *ExitError {
 		}
 		return Exitf(ExitAuth, "%s", msg)
 	case status == http.StatusForbidden:
-		// The only 403 a CLI read verb hits is the admin_ro scope gate
-		// (RequireAdminRO); owner-scoped reads 404 a foreign resource, never 403.
+		// Two 403 families reach the CLI: the admin_ro scope gate on admin views, and the jobs
+		// API's typed reasons for a uzp_ product token. Owner-scoped reads 404 a foreign
+		// resource, never 403. Branch on the typed reason so each gets the right hint.
 		if msg == "" {
 			msg = "forbidden"
+		}
+		switch reason {
+		case "insufficient_scope":
+			return Exitf(ExitAuth, "%s: this token's scope does not allow that; the jobs API needs a token with the jobs:run scope (create, cancel) or jobs:read scope (reads)", msg)
+		case "job_type_not_allowed":
+			return Exitf(ExitAuth, "%s: this product token is not allowed to create jobs of that type", msg)
 		}
 		return Exitf(ExitAuth, "%s: your token lacks the required scope (admin views need an admin-scoped token)", msg)
 	case status == http.StatusNotFound:

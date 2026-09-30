@@ -276,7 +276,7 @@ export interface AnswerBody {
  *
  *  RUN_KINDS is mirrored from the DB `runs_kind_check` constraint (in DB CHECK
  *  order); agent/test/run-kind-db-parity.test.ts keeps the two in sync. */
-export const RUN_KINDS = ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt", "task", "mr_rework"] as const;
+export const RUN_KINDS = ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt", "task", "mr_rework", "job"] as const;
 export type RunKind = (typeof RUN_KINDS)[number];
 
 /** How a run's plan_md was produced (PRD #209 D4). "agent": the worker's own Phase-1
@@ -1006,6 +1006,39 @@ export interface ReviewCommentsSnapshot {
   truncated: boolean;
 }
 
+/** One structured finding of a job result (PRD #1908): POST /worker/runs/{id}/job-result. `url`
+ *  and `file` are mutually exclusive; `line` requires `file`. */
+export interface JobFindingBody {
+  severity: "info" | "warning" | "error";
+  message_md: string;
+  url?: string;
+  file?: string;
+  line?: number;
+}
+
+/** The job runner's result POST body (PRD #1908). The api decodes it strictly (unknown fields are
+ *  refused) and REQUIRES `claim_generation`, the fence against a stale flight of the same run. */
+export interface JobResultRequest {
+  claim_generation: number;
+  status: string;
+  report_md: string;
+  findings: JobFindingBody[];
+}
+
+/** One named input document of a job (PRD #1908). */
+export interface ClaimJobInput {
+  name: string;
+  content: string;
+}
+
+/** The job block of a kind="job" claim (PRD #1908). */
+export interface ClaimJob {
+  type: string;
+  title: string;
+  prompt: string;
+  inputs: ClaimJobInput[];
+}
+
 /**
  * Response body of a successful (200) claim.
  *
@@ -1042,6 +1075,14 @@ export interface ClaimResponse {
    *  diagnoses + fixes. Present only for kind="ci_fix". Log tails are UNTRUSTED
    *  data — quoted evidence, never instructions. */
   pipeline?: ClaimPipeline | null;
+  /** PRD #1908: the job block of a kind="job" claim (the repo-less run kind): the caller's job
+   *  type, title, prompt and named input documents, in ordinal order. Present only for a job
+   *  claim; a job claim carries no repo, forge PAT, memory or skills. The prompt and input
+   *  contents are UNTRUSTED caller text. */
+  job?: ClaimJob;
+  /** PRD #1908: the job's wall-clock budget in seconds; the job runner aborts and reports
+   *  failed at this bound. Present only on a job claim. */
+  budget_wall_seconds?: number;
   repo: ClaimRepo;
   secrets: ClaimSecrets;
   /** Existing branch on resume/attach; usually `agent/issue-{iid}`. */

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -61,13 +62,21 @@ var limiterNames = [...]string{
 	limHosted,
 	limCLIPoll,
 	limBoardOrder,
+	limV1,
 }
 
 // The limiter names, as constants so a typo in the 146-row table below is a compile
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 220 as of this commit. PRD #1906 M1 added the egress-profile admin routes: GET
+// PRD #1908 M5 added the six /api/v1/jobs routes (GET and POST
+// /api/v1/jobs, GET /api/v1/jobs/{id}, GET .../result, GET .../messages and POST
+// .../cancel) and moved the /api/v1 subtree onto its own tenth limiter, v1Limiter: every
+// /api/v1 route reads limV1, and POST /api/v1/jobs additionally carries authLimiter
+// (limAuthAndV1). GET /api/v1/whoami changed from limAuth to limV1. (The running count in
+// the next sentence predates this and was not re-tallied: the mechanism, not the figure, is
+// what the test enforces.)
+// 220 as of the commit before it. PRD #1906 M1 added the egress-profile admin routes: GET
 // /api/admin/egress-profiles and GET /api/admin/egress-profiles/{name} in the admin READ
 // group, and POST /api/admin/egress-profiles, PUT and DELETE
 // /api/admin/egress-profiles/{name} in the cookie-only admin WRITE group. All five are
@@ -227,6 +236,13 @@ const (
 	// forge calls, so charging it to the forge budget would let a burst of dragging
 	// starve the user's real forge operations.
 	limBoardOrder = "boardOrderLimiter"
+	// PRD #1908 D-B. The dedicated per-user budget of the whole /api/v1 subtree (job clients
+	// poll, which authLimiter's 10/min cannot carry), mounted by r.Use after RequireV1Caller.
+	limV1 = "v1Limiter"
+	// POST /api/v1/jobs carries BOTH: the subtree's v1Limiter and, per route, authLimiter (a
+	// create is the spend action). A route with two per-user limiters is spelled with this
+	// constant; perUserLimiterOn joins the names in limiterNames order.
+	limAuthAndV1 = limAuth + "+" + limV1
 )
 
 type routeMount struct {
@@ -248,8 +264,9 @@ type routeMount struct {
 // /register, /login, /config, the OIDC pair and /cli/start; EIGHT routes take its
 // PerUserMiddleware — /cli/approve, /vault/unlock, /vault/passphrase,
 // /admin/cli-tokens, /admin/products, /admin/product-tokens, the product-token mint
-// POST /me/product-tokens/ and /v1/whoami (the last through the /api/v1 subtree's
-// r.Use, so every future /api/v1 route inherits it).
+// POST /me/product-tokens/ and POST /v1/jobs (a per-route mount inside the /api/v1
+// subtree, whose own r.Use is v1Limiter since PRD #1908 D-B, so every /api/v1 route
+// inherits THAT one and only the create adds authLimiter).
 // This table covers the per-user mounts ONLY —
 // the per-IP ones read as noLimiter here and are not guarded by this file.
 // e2e/run-e2e.sh asserts a 429 on /api/auth/login, which is the per-IP mount and closes
@@ -493,10 +510,19 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/skills/{id}", noLimiter},
 	{"GET", "/api/tool-allowlist/", noLimiter},
 	{"GET", "/api/usage", noLimiter},
-	// PRD #1907 M3 (D15): the stable external API's whoami. The per-user limiter is
-	// mounted on the whole /api/v1 subtree after RequireV1Caller (routes_v1.go), so it
-	// keys on the caller's user, not the token: minting more tokens buys no budget.
-	{"GET", "/api/v1/whoami", limAuth},
+	// PRD #1907 M3 (D15): the stable external API's whoami. The per-user limiter (v1Limiter
+	// since PRD #1908 D-B) is mounted on the whole /api/v1 subtree after RequireV1Caller
+	// (routes_v1.go), so it keys on the caller's user, not the token: minting more tokens
+	// buys no budget.
+	{"GET", "/api/v1/whoami", limV1},
+	// PRD #1908 M5: the jobs endpoints. Every /api/v1 route inherits v1Limiter from the
+	// subtree's r.Use; the create additionally rides authLimiter per user (D-B).
+	{"GET", "/api/v1/jobs", limV1},
+	{"POST", "/api/v1/jobs", limAuthAndV1},
+	{"GET", "/api/v1/jobs/{id}", limV1},
+	{"POST", "/api/v1/jobs/{id}/cancel", limV1},
+	{"GET", "/api/v1/jobs/{id}/messages", limV1},
+	{"GET", "/api/v1/jobs/{id}/result", limV1},
 	{"GET", "/api/vault/status", noLimiter},
 	{"GET", "/api/version", noLimiter},
 	{"GET", "/api/worker/chat/runs", noLimiter},
@@ -800,6 +826,8 @@ var wantRouteMounts = []routeMount{
 	// PRD #400 M4a: the review run's diff-findings POST. Worker-authenticated, no per-user
 	// limiter, matching the judge's worker review POST above it.
 	{"POST", "/api/worker/runs/{id}/task-review", noLimiter},
+	// PRD #1908: the job runner's structured result POST, worker-authenticated and unlimited like task-review.
+	{"POST", "/api/worker/runs/{id}/job-result", noLimiter},
 	{"POST", "/api/worker/runs/{id}/state", noLimiter},
 	// PRD #362 M1: the run-lane executor posts its intent/plan summaries back. Worker
 	// writes scoped to the worker's own run, no forge call → noLimiter. Bounded by the
@@ -997,7 +1025,7 @@ func (p *prober) probe(m func(http.Handler) http.Handler) (budget int, perUser b
 // perUserLimiterOn names the per-user limiter mounted on one route's middleware
 // chain, or noLimiter if there is none.
 func (p *prober) perUserLimiterOn(mws []func(http.Handler) http.Handler) (string, error) {
-	found := noLimiter
+	var found []string
 	for _, m := range mws {
 		budget, perUser := p.probe(m)
 		if budget == 0 || !perUser {
@@ -1008,12 +1036,22 @@ func (p *prober) perUserLimiterOn(mws []func(http.Handler) http.Handler) (string
 				"newProbeLimiters hands out — the probe has lost track of identity", budget, len(limiterNames))
 		}
 		name := limiterNames[budget-1]
-		if found != noLimiter {
-			return "", fmt.Errorf("two per-user limiters mounted (%s and %s); this test assumes at most one", found, name)
+		if slices.Contains(found, name) {
+			return "", fmt.Errorf("the per-user limiter %s is mounted twice on one route", name)
 		}
-		found = name
+		found = append(found, name)
 	}
-	return found, nil
+	if len(found) == 0 {
+		return noLimiter, nil
+	}
+	if len(found) > 2 {
+		return "", fmt.Errorf("%d per-user limiters mounted (%v); this test allows at most the one documented pair (%s)", len(found), found, limAuthAndV1)
+	}
+	// Joined in limiterNames order, so the spelling does not depend on mount order.
+	slices.SortFunc(found, func(a, b string) int {
+		return slices.Index(limiterNames[:], a) - slices.Index(limiterNames[:], b)
+	})
+	return strings.Join(found, "+"), nil
 }
 
 func describeLimiter(name string) string {
@@ -1069,7 +1107,7 @@ func TestChatCreateRoutePatternMatchesMount(t *testing.T) {
 	limiters := newProbeLimiters()
 	h := &Handler{cfg: config.Config{WorkerHostingEnabled: true}}
 	router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
-		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8])
+		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9])
 	routes := router.(chi.Routes)
 
 	p := &prober{}
@@ -1103,7 +1141,7 @@ func TestEveryRouteCarriesItsExpectedPerUserLimiter(t *testing.T) {
 	// routes exist and the table is unconditional.
 	h := &Handler{cfg: config.Config{WorkerHostingEnabled: true, FetcherTokenSHA256: make([]byte, 32)}}
 	router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
-		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8])
+		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9])
 
 	routes, ok := router.(chi.Routes)
 	if !ok {
@@ -1419,6 +1457,7 @@ var limiterConfigFields = map[string]string{
 	limHosted:     "HostedRateLimitMax",
 	limCLIPoll:    "CLIPollRateLimitMax",
 	limBoardOrder: "BoardOrderRateLimitMax",
+	limV1:         "V1RateLimitMax",
 }
 
 // limiterConstruction is one `x := mw.NewLimiter(cfg.Y, …)` found in main.

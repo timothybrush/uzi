@@ -24,6 +24,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -168,6 +169,13 @@ const (
 	// Codex worker at all. Maps to the SAME healthWaitingWorker enum (runs.health_reason is free text).
 	reasonNoCustomCodexCapableWorker     = "no worker supporting custom Codex models is online"
 	reasonNoCodexCompletionCapableWorker = "no online worker implements the Codex completion interlock (codex_completion_interlock_v1); provision a capable worker"
+	// reasonNoJobCapableWorker (PRD #1908, D-A) is emitted for a queued kind='job' run whose owner has
+	// NO online non-docker worker advertising the 'job_runner_v1' protocol capability. Like
+	// reasonNoCodexCapableWorker it names a NON-BYPASSABLE block: ClaimRun's dedicated job clause sits
+	// outside fn_worker_can_claim, required_capabilities and the capability-aware kill-switch, so a
+	// job in a fleet of old-image or docker-only workers is unclaimable until a job-capable worker
+	// comes online. Maps to the SAME healthWaitingWorker enum (runs.health_reason is free text).
+	reasonNoJobCapableWorker = "no online worker supports jobs (job_runner_v1); update or provision a non-Docker worker"
 	// reasonWaitingIsolatedLane (PRD #1906 M5) is the queued reason for a PROFILE-BOUND run: only
 	// a worker the api provisions into the isolated lane can claim it (ClaimRun's two-way lane
 	// clause), so no ordinary worker reason applies. Maps to the SAME healthWaitingWorker enum.
@@ -853,6 +861,17 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			slog.Error("health: count online workers satisfying custom codex", "run_id", r.ID, "error", cerr)
 		} else if c == 0 {
 			return reasonNoCustomCodexCapableWorker
+		}
+	}
+	// PRD #1908 (D-A): a queued JOB whose owner has NO online non-docker worker advertising
+	// job_runner_v1 is genuinely UNPLACEABLE (ClaimRun's non-bypassable job clause can never be
+	// satisfied). Same placement, guard and degrade rules as the Codex rungs above.
+	if r.Kind == runkind.Job {
+		c, cerr := s.q.CountOnlineWorkersSatisfyingJobRunner(ctx, r.UserID)
+		if cerr != nil {
+			slog.Error("health: count online workers satisfying job runner", "run_id", r.ID, "error", cerr)
+		} else if c == 0 {
+			return reasonNoJobCapableWorker
 		}
 	}
 	// All protocol requirements must be present on one worker. A separate count for each

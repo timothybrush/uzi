@@ -165,6 +165,18 @@ func contractCases() []contractCase {
 		// nonNilStrings and make(..., 0, n) in egressProfileToDTO). The nested
 		// EgressProfileWarningDTO rides inside the full fixture's warnings[0].
 		newContractCase[EgressProfileDTO]("egress_profile"),
+		// PRD #1908 M5: the /api/v1/jobs wire. V1JobCreateRequest is a REQUEST body (its
+		// full.json round-trips through DisallowUnknownFields like schedule_input). The
+		// nullable pointers are present-as-null, so the response zero.json files carry nulls.
+		newContractCase[V1JobCreateRequest]("v1_job_create_request"),
+		newContractCase[V1JobDTO]("v1_job"),
+		newContractCase[V1JobListDTO]("v1_job_list"),
+		newContractCase[V1JobResultDTO]("v1_job_result"),
+		newContractCase[V1JobMessagesDTO]("v1_job_messages"),
+		// PRD #1908 D-D: the job block of the run detail. It is omitempty on RunDTO (so
+		// run.zero.json is unchanged) and nested in run.full.json; the standalone pair pins
+		// its own nullability surface (origin members, result).
+		newContractCase[RunJobDTO]("run_job"),
 	}
 }
 

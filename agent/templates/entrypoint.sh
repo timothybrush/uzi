@@ -290,6 +290,24 @@ for d in runner agent-home provision; do
   "$CHOWN" "$RUNNER_TREE_OWNER" "$DATA_DIR/$d"
 done
 
+# `jobs` (PRD #1908): the repo-less job run workspaces. It is grouped to `codex-session` (gid 10004:
+# worker + the runner uid only), NOT `runner`: `runner-cmd` (uid 10003, the Codex command shell)
+# is a member of `runner`, so a `runner` group here would let a concurrent Codex run's shell read
+# other jobs' inputs and plant files in their work/home. Setgid makes every worker-created child
+# inherit codex-session; 3710 (sticky, group traverse only, no world bits) lets the runner uid reach its
+# own <runId> but not list the root or create entries in it (only the worker, the owner, creates them).
+# Unlike the parents above this CONVERGES EVERY BOOT: a `jobs` left worker-owned 0700 (a
+# single-uid start) or worker:runner 3775 (the earlier image) is reclaimed to root (chown needs
+# only CAP_CHOWN), chmod'd (root owns it now, so no CAP_FOWNER needed), then handed back. The
+# content is per-run scratch that the worker's startup reaper removes, so re-owning the root
+# alone is enough; the reaper runs after the drop.
+JOBS_TREE_OWNER=worker:codex-session
+"$MKDIR" -p "$DATA_DIR/jobs"
+require_real_carveout_root "$DATA_DIR/jobs"
+"$CHOWN" 0:0 "$DATA_DIR/jobs"
+"$CHMOD" 3710 "$DATA_DIR/jobs"
+"$CHOWN" "$JOBS_TREE_OWNER" "$DATA_DIR/jobs"
+
 # --- (a2b) PRD #1493 M2: one-time, ownership-aware migration of a POPULATED legacy
 # single-uid /data volume, so uid 10002 (runner) can use it after first split enablement ----
 # migrate_tree "$DATA_DIR" above left every legacy descendant worker:worker, and the carve-out

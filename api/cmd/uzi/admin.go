@@ -329,12 +329,13 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 					pr.Name,
 					productStateCell(pr),
 					strconv.FormatInt(pr.ActiveTokenCount, 10),
+					allowedJobTypesCell(pr.AllowedJobTypes),
 					pr.CreatedAt.UTC().Format(time.RFC3339),
 					// Up to 1000 bytes server-side: cellText bounds the cell.
 					cellText(pr.Description),
 				})
 			}
-			return p.Table([]string{"NAME", "STATE", "ACTIVE_TOKENS", "CREATED", "DESCRIPTION"}, rows)
+			return p.Table([]string{"NAME", "STATE", "ACTIVE_TOKENS", "JOB_TYPES", "CREATED", "DESCRIPTION"}, rows)
 		},
 	}
 
@@ -905,6 +906,14 @@ func productStateCell(p apitypes.ProductDTO) string {
 	default:
 		return "disabled"
 	}
+}
+
+// allowedJobTypesCell renders a product's allowed job types (PRD #1908), "-" for none.
+func allowedJobTypesCell(types []string) string {
+	if len(types) == 0 {
+		return "-"
+	}
+	return cellText(strings.Join(types, ","))
 }
 
 // tsCell renders a nullable timestamp. "-" means the column is genuinely empty, not

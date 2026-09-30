@@ -193,6 +193,10 @@ var (
 	// the lifetime number of revisions requested, not the pending backlog. → 409.
 	ErrReviseCapReached = errors.New("plan revision limit reached")
 	ErrInvalidState     = errors.New("invalid run state")
+	// ErrJobNeverParks marks a worker-reported parking status for a job run (PRD #1908 D-E). It is
+	// always wrapped together with ErrInvalidState, so existing 400 mapping holds; the handler
+	// checks it first to name the refusal instead of listing the state it refused.
+	ErrJobNeverParks = errors.New("a job run never parks")
 	// The two forge-park precedence sentinels (PRD #1392 M1). Both are returned by SetState's
 	// forge-park transaction alongside the run row (nothing else returns them), and the handler
 	// maps each to a 409 whose body carries {run, reason}: ErrForgeParkStaleClaim → reason
@@ -814,6 +818,9 @@ type Store interface {
 	SetRunAwaitingFollowup(ctx context.Context, arg store.SetRunAwaitingFollowupParams) (int64, error)
 	SetRunCompleted(ctx context.Context, arg store.SetRunCompletedParams) (int64, error)
 	SetRunFailed(ctx context.Context, arg store.SetRunFailedParams) (int64, error)
+	// FailJobRunWithoutResult fails a kind='job' run reported completed with no job_results row
+	// (PRD #1908 no-result invariant); 0 rows leaves the completion to SetRunCompleted.
+	FailJobRunWithoutResult(ctx context.Context, arg store.FailJobRunWithoutResultParams) (int64, error)
 	// SetRunFailedPlanRejected is SetRunFailed for a plan_rejected report that also settles the
 	// run's unapplied reject_plan inputs in the same statement (issue #1604).
 	SetRunFailedPlanRejected(ctx context.Context, arg store.SetRunFailedPlanRejectedParams) (int64, error)
@@ -1052,6 +1059,21 @@ type Store interface {
 	// run's non-bypassable custom-model claim clause can never be satisfied. A per-run lookup like
 	// CountOnlineWorkersSatisfyingCodexHarness above, and off the hot path for the same reason.
 	CountOnlineWorkersSatisfyingCustomCodex(ctx context.Context, userID uuid.UUID) (int64, error)
+	// CountOnlineWorkersSatisfyingJobRunner backs PRD #1908's (D-A) queued-reason rung: a queued
+	// kind='job' run whose owner has NO online non-docker worker advertising 'job_runner_v1' gets
+	// reasonNoJobCapableWorker — the run's non-bypassable job-runner claim clause can never be
+	// satisfied. A per-run lookup like CountOnlineWorkersSatisfyingCodexHarness above, and off the
+	// hot path for the same reason.
+	CountOnlineWorkersSatisfyingJobRunner(ctx context.Context, userID uuid.UUID) (int64, error)
+	// ClearJobResultForRun drops a job run's result and findings at claim assembly (PRD #1908):
+	// a result from an earlier flight must not satisfy a later flight's no-result invariant.
+	ClearJobResultForRun(ctx context.Context, runID uuid.UUID) error
+	// ListJobInputsForClaim reads a claimed job's named inputs for claim assembly (PRD #1908).
+	ListJobInputsForClaim(ctx context.Context, runID uuid.UUID) ([]store.ListJobInputsForClaimRow, error)
+	// FailJobsPastWallDeadline is the PRD #1908 D-E wall-clock backstop for claimed/running jobs.
+	FailJobsPastWallDeadline(ctx context.Context, arg store.FailJobsPastWallDeadlineParams) ([]store.FailJobsPastWallDeadlineRow, error)
+	// ListRevokedProductJobs backs the PRD #1908 D14 product-revoke sweep (CancelRevokedProductJobs).
+	ListRevokedProductJobs(ctx context.Context, batch int32) ([]store.ListRevokedProductJobsRow, error)
 	// CountOnlineEligibleWorkersForRepo backs PRD #361's queued Docker-allowlist reason:
 	// how many of the caller's online workers fn_worker_can_claim accepts for this repo/kind,
 	// ignoring availability (free slots AND draining). Since issue #512 M2 it is capability-
@@ -3735,6 +3757,15 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	if req.State == "credential_switch_failed" {
 		return s.failCredentialSwitch(ctx, owned, wkr, req)
 	}
+	// PRD #1908 D-E: a job never parks. The job runner reports only running/completed/failed, and
+	// pauseRefusalReason already refuses an owner pause, so a park report for a job is a protocol
+	// error: refuse it rather than stall a run whose cancel nothing would consume.
+	if owned.Kind == runkind.Job {
+		switch req.State {
+		case "awaiting_input", "awaiting_approval", "awaiting_followup", "paused":
+			return owned, false, fmt.Errorf("%w: %w (%s)", ErrInvalidState, ErrJobNeverParks, req.State)
+		}
+	}
 	// PRD #1247 M5a-1 rework (auditor fail-open finding): FAIL CLOSED for a CAPABILITY worker. The
 	// fence below engages only when the report STAMPS a generation, so a worker advertising
 	// credential_switch_v1 could otherwise bypass it entirely by OMITTING claim_generation on a
@@ -3748,6 +3779,13 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	if req.ClaimGeneration == nil &&
 		stateUsesGenerationFence(req.State, owned) &&
 		slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
+		return owned, false, ErrMissingClaimGeneration
+	}
+	// PRD #1908: a job's no-result check (FailJobRunWithoutResult) is race-free against a result
+	// ingest only on the FOR UPDATE fenced path below, which engages when the report stamps a
+	// generation. Every job_runner_v1 worker is new, so require it on every fenced mutating job
+	// report and refuse its omission whatever capabilities the worker advertises.
+	if req.ClaimGeneration == nil && owned.Kind == runkind.Job && stateUsesForUpdateFence(req.State, owned) {
 		return owned, false, ErrMissingClaimGeneration
 	}
 	// PRD #1247 M5 (D3): the released-generation fence. A CAPABILITY worker stamps
@@ -4230,7 +4268,24 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				return run, true, rerr
 			}
 		} else {
-			rows, err = q.SetRunCompleted(ctx, completedParams)
+			// PRD #1908 no-result invariant: a job run reported completed with no job_results row
+			// is failed (fail_origin job_no_result) by one guarded statement instead. It updates
+			// nothing when a result exists, and only a kind='job' row can match, so every other
+			// kind (and a job with a result) falls through to SetRunCompleted unchanged.
+			var failedNoResult int64
+			if owned.Kind == runkind.Job {
+				failedNoResult, err = q.FailJobRunWithoutResult(ctx, store.FailJobRunWithoutResultParams{
+					FailureReason: pgconv.TextOrNull(jobNoResultFailureReasonText),
+					SessionID:     sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
+				})
+			}
+			switch {
+			case err != nil:
+			case failedNoResult > 0:
+				rows = failedNoResult
+			default:
+				rows, err = q.SetRunCompleted(ctx, completedParams)
+			}
 		}
 	case "limit_wait":
 		rows, err = s.setLimitWait(ctx, owned, wkr, req, sessionID)

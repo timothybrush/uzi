@@ -491,6 +491,8 @@ func Validate(key, value string) error {
 		return validateJudgeDailyBudget(value)
 	case KeyHostedWorkerQuota:
 		return validateHostedWorkerQuota(value)
+	case KeyJobMaxActivePerUser:
+		return validateJobMaxActivePerUser(value)
 	case KeyDockerRepoAllowlist:
 		return validateRepoAllowlist(value)
 	case KeyPublicBaseURL:

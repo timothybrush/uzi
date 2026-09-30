@@ -40,6 +40,7 @@ function aProduct(over: Partial<Product> = {}): Product {
     deleted_at: null,
     created_at: daysAgo(30),
     active_token_count: 3,
+    allowed_job_types: [],
     ...over,
   };
 }
@@ -149,7 +150,7 @@ describe("AdminProducts writes", () => {
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "CRM sync" } });
     fireEvent.change(screen.getByLabelText(/^Description/), { target: { value: "Syncs." } });
     fireEvent.click(screen.getByRole("button", { name: "Register product" }));
-    await waitFor(() => expect(mockApi.adminCreateProduct).toHaveBeenLastCalledWith("CRM sync", "Syncs."));
+    await waitFor(() => expect(mockApi.adminCreateProduct).toHaveBeenLastCalledWith("CRM sync", "Syncs.", []));
   });
 
   it("trims a trailing U+0085 as Go's TrimSpace does, instead of refusing it", async () => {
@@ -161,7 +162,7 @@ describe("AdminProducts writes", () => {
     const register = screen.getByRole("button", { name: "Register product" }) as HTMLButtonElement;
     expect(register.disabled).toBe(false);
     fireEvent.click(register);
-    await waitFor(() => expect(mockApi.adminCreateProduct).toHaveBeenLastCalledWith("Acme", "Syncs."));
+    await waitFor(() => expect(mockApi.adminCreateProduct).toHaveBeenLastCalledWith("Acme", "Syncs.", []));
   });
 
   it("disables an enabled product through the toggle", async () => {
@@ -204,6 +205,183 @@ describe("AdminProducts writes", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Revoke support-prod" }));
     await waitFor(() => expect(mockApi.adminRevokeProductToken).toHaveBeenCalledWith("pt1"));
     await waitFor(() => expect(mockApi.adminListProductTokens).toHaveBeenCalledTimes(2));
+  });
+});
+
+describe("AdminProducts allowed job types (PRD #1908)", () => {
+  const researchIn = (el: HTMLElement) =>
+    within(el).getByRole("checkbox", { name: /^Research/ }) as HTMLInputElement;
+
+  it("registers with no job type by default (fail-closed) and says what that means", async () => {
+    mockApi.adminCreateProduct.mockResolvedValueOnce({ product: aProduct({ id: "new", name: "CRM sync" }) });
+    renderPage();
+    const form = await screen.findByRole("form", { name: "Register a product" });
+    expect(researchIn(form).checked).toBe(false);
+    expect(within(form).getByText("None checked: this product cannot create jobs.")).toBeTruthy();
+    fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "CRM sync" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Register product" }));
+    await waitFor(() => expect(mockApi.adminCreateProduct).toHaveBeenLastCalledWith("CRM sync", "", []));
+  });
+
+  it("sends the checked types on register and resets the boxes after", async () => {
+    mockApi.adminCreateProduct.mockResolvedValueOnce({ product: aProduct({ id: "new", name: "CRM sync" }) });
+    renderPage();
+    const form = await screen.findByRole("form", { name: "Register a product" });
+    fireEvent.click(researchIn(form));
+    expect(researchIn(form).checked).toBe(true);
+    fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "CRM sync" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Register product" }));
+    await waitFor(() =>
+      expect(mockApi.adminCreateProduct).toHaveBeenLastCalledWith("CRM sync", "", ["research"]),
+    );
+    await waitFor(() => expect(researchIn(form).checked).toBe(false));
+  });
+
+  it("checking a type on a product PATCHes the whole new list", async () => {
+    mockApi.adminUpdateProduct.mockResolvedValue({ product: aProduct({ allowed_job_types: ["research"] }) });
+    renderPage();
+    const card = await productCard("Helpdesk assistant");
+    expect(researchIn(card).checked).toBe(false);
+    fireEvent.click(researchIn(card));
+    await waitFor(() =>
+      expect(mockApi.adminUpdateProduct).toHaveBeenCalledWith("prod-a", { allowed_job_types: ["research"] }),
+    );
+  });
+
+  it("unchecking the last type sends [] (clear), not an omitted field", async () => {
+    mockApi.adminListProducts.mockResolvedValue({ products: [aProduct({ allowed_job_types: ["research"] })] });
+    mockApi.adminUpdateProduct.mockResolvedValue({ product: aProduct({ allowed_job_types: [] }) });
+    renderPage();
+    const card = await productCard("Helpdesk assistant");
+    expect(researchIn(card).checked).toBe(true);
+    fireEvent.click(researchIn(card));
+    await waitFor(() =>
+      expect(mockApi.adminUpdateProduct).toHaveBeenCalledWith("prod-a", { allowed_job_types: [] }),
+    );
+  });
+
+  it("keeps a stored type this build does not know when toggling a known one", async () => {
+    mockApi.adminListProducts.mockResolvedValue({ products: [aProduct({ allowed_job_types: ["future_type"] })] });
+    mockApi.adminUpdateProduct.mockResolvedValue({ product: aProduct() });
+    renderPage();
+    fireEvent.click(researchIn(await productCard("Helpdesk assistant")));
+    await waitFor(() =>
+      expect(mockApi.adminUpdateProduct).toHaveBeenCalledWith("prod-a", {
+        allowed_job_types: ["research", "future_type"],
+      }),
+    );
+  });
+
+  it("shows a deleted product's types as text, with no checkbox to change them", async () => {
+    mockApi.adminListProducts.mockResolvedValue({
+      products: [aProduct({ enabled: false, deleted_at: daysAgo(1), allowed_job_types: ["research"] })],
+    });
+    renderPage();
+    const card = await productCard("Helpdesk assistant");
+    expect(within(card).getByText("Job types: Research")).toBeTruthy();
+    // Paired with the positive above, and the live-product tests find this checkbox by the
+    // same query, so its absence here is not vacuous.
+    expect(within(card).queryByRole("checkbox")).toBeNull();
+  });
+});
+
+describe("AdminProducts job-type save feedback (PRD #1908 review)", () => {
+  const researchIn = (el: HTMLElement) =>
+    within(el).getByRole("checkbox", { name: "Research" }) as HTMLInputElement;
+
+  it("shows the new state at once while saving, then says Saved", async () => {
+    let resolve!: (v: { product: Product }) => void;
+    mockApi.adminUpdateProduct.mockReturnValueOnce(new Promise((r) => (resolve = r)));
+    renderPage();
+    const card = await productCard("Helpdesk assistant");
+    fireEvent.click(researchIn(card));
+    // Optimistic: checked immediately, marked busy, and a visible "Saving" line.
+    expect(researchIn(card).checked).toBe(true);
+    expect(researchIn(card).getAttribute("aria-disabled")).toBe("true");
+    expect(within(card).getByRole("status").textContent).toBe("Saving job types…");
+    // A second click mid-save sends nothing more.
+    fireEvent.click(researchIn(card));
+    expect(mockApi.adminUpdateProduct).toHaveBeenCalledTimes(1);
+    mockApi.adminListProducts.mockResolvedValue({ products: [aProduct({ allowed_job_types: ["research"] })] });
+    resolve({ product: aProduct({ allowed_job_types: ["research"] }) });
+    await waitFor(() => expect(within(card).getByRole("status").textContent).toBe("Job types saved."));
+    expect(researchIn(card).checked).toBe(true);
+    expect(researchIn(card).getAttribute("aria-disabled")).toBeNull();
+  });
+
+  it("keeps the saved list as the basis when the reload after a save fails", async () => {
+    mockApi.adminUpdateProduct
+      .mockResolvedValueOnce({ product: aProduct({ allowed_job_types: ["research"] }) })
+      .mockResolvedValueOnce({ product: aProduct({ allowed_job_types: [] }) });
+    renderPage();
+    const card = await productCard("Helpdesk assistant");
+    // The save succeeds but the reload that follows it fails (old data is kept).
+    mockApi.adminListProducts.mockRejectedValue(new Error("network down"));
+    fireEvent.click(researchIn(card));
+    await waitFor(() => expect(within(card).getByRole("status").textContent).toBe("Job types saved."));
+    // Not reverted to the stale stored list while claiming "saved".
+    expect(researchIn(card).checked).toBe(true);
+    // The next toggle is built from the saved list: it unchecks (sends []), not re-checks.
+    fireEvent.click(researchIn(card));
+    await waitFor(() => expect(mockApi.adminUpdateProduct).toHaveBeenCalledTimes(2));
+    expect(mockApi.adminUpdateProduct).toHaveBeenLastCalledWith("prod-a", { allowed_job_types: [] });
+  });
+
+  it("reverts the box and shows the error beside it when the save fails", async () => {
+    mockApi.adminUpdateProduct.mockRejectedValueOnce(new ApiError(400, "allowed_job_types: unknown job type"));
+    renderPage();
+    const card = await productCard("Helpdesk assistant");
+    fireEvent.click(researchIn(card));
+    const alert = await within(card).findByRole("alert");
+    expect(alert.textContent).toBe("allowed_job_types: unknown job type");
+    expect(researchIn(card).checked).toBe(false);
+    expect(within(card).getByRole("status").textContent).toBe("");
+    // Not the page banner, which can sit scrolled off-screen above the list.
+    expect(screen.getAllByRole("alert")).toEqual([alert]);
+  });
+
+  it("links each type's hint as a description, not as part of the checkbox name", async () => {
+    renderPage();
+    const box = researchIn(await productCard("Helpdesk assistant"));
+    const hint = document.getElementById(box.getAttribute("aria-describedby") ?? "");
+    expect(hint?.textContent).toBe("Works from the inputs it is sent and returns a report with findings.");
+  });
+
+  it("names stored types this page does not list, and does not claim 'only the checked types'", async () => {
+    mockApi.adminListProducts.mockResolvedValue({ products: [aProduct({ allowed_job_types: ["future_type"] })] });
+    renderPage();
+    const card = await productCard("Helpdesk assistant");
+    expect(researchIn(card).checked).toBe(false);
+    expect(within(card).getByText("future_type")).toBeTruthy();
+    expect(
+      within(card).getByText("No listed type is checked: users’ tokens for this product can create only the types named above."),
+    ).toBeTruthy();
+    expect(within(card).queryByText(/can create only the checked types\.$/)).toBeNull();
+  });
+
+  it("renders a product from an api that predates job types (field absent) without crashing", async () => {
+    const legacy = aProduct();
+    delete legacy.allowed_job_types;
+    const legacyDeleted = aProduct({ id: "prod-b", name: "Old importer", enabled: false, deleted_at: daysAgo(2) });
+    delete legacyDeleted.allowed_job_types;
+    mockApi.adminListProducts.mockResolvedValue({ products: [legacy, legacyDeleted] });
+    renderPage();
+    const card = await productCard("Helpdesk assistant");
+    // The card renders; there is no job-type editor for a server that cannot store one.
+    expect(within(card).getByRole("switch", { name: "Disable Helpdesk assistant" })).toBeTruthy();
+    expect(within(card).queryByRole("checkbox")).toBeNull();
+    expect(within(await productCard("Old importer")).queryByText(/^Job types:/)).toBeNull();
+  });
+
+  it("locks the register form's boxes while the register request is in flight", async () => {
+    mockApi.adminCreateProduct.mockReturnValueOnce(new Promise(() => {}));
+    renderPage();
+    const form = await screen.findByRole("form", { name: "Register a product" });
+    fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "CRM sync" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Register product" }));
+    await waitFor(() => expect(researchIn(form).getAttribute("aria-disabled")).toBe("true"));
+    fireEvent.click(researchIn(form));
+    expect(researchIn(form).checked).toBe(false);
   });
 });
 

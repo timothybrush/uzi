@@ -781,6 +781,15 @@ func run() error {
 				return q.SweepStrandedFilingFindings(ctx, pgtype.Timestamptz{Time: cutoff, Valid: true})
 			},
 		},
+		// Product-revoke sweep (PRD #1908 D14): cancels non-terminal jobs whose creating product
+		// token was explicitly revoked, whose product is disabled or deleted, or whose owner is
+		// deactivated, through the existing cancel path. Token expiry alone never cancels. It
+		// runs before the ephemeral provision pass so a revoked queued job is cancelled before a
+		// worker is provisioned for it in the same tick.
+		sweeper.Pass{
+			Name: "job_product_revoke_cancel",
+			Run:  wsvc.CancelRevokedProductJobs,
+		},
 		// Ephemeral worker auto-provisioning (PRD #529 M2): find unplaceable queued runs
 		// of opted-in users and spin one run-bound ephemeral hosted worker each, capped
 		// and concurrency-safe. Rides this ticker like the passes above rather than a
@@ -789,6 +798,28 @@ func run() error {
 		sweeper.Pass{
 			Name: "ephemeral_workers_provision",
 			Run:  ephemeralProv.ProvisionPass,
+		},
+		// Unservable-ephemeral job failure (PRD #1908 D-A2). A run-bound ephemeral worker that
+		// registered without job_runner_v1, or never registered by the provision deadline, can
+		// never serve its kind='job' run; this fails the still-queued, unclaimed job (typed
+		// fail_origin) and deletes the worker in one transaction so the gap trigger cannot
+		// re-provision for it forever. It MUST run BEFORE the reap pass below, which would
+		// otherwise delete a never-booted worker silently and leave the job queued.
+		// UNCONDITIONAL (not gated on the ephemeral kill-switch), like the reap.
+		sweeper.Pass{
+			Name: "ephemeral_job_unservable_fail",
+			Run: func(ctx context.Context) (int64, error) {
+				return wsvc.FailJobsWithUnservableEphemeral(ctx, cfg.EphemeralProvisionDeadline)
+			},
+		},
+		// Job wall-clock backstop (PRD #1908 D-E). A job never parks at its wall (the wall-park
+		// passes exclude it), so a claimed or running job past its budget plus a grace, whose
+		// runner died or wedged, is failed with fail_origin='run_timeout'.
+		sweeper.Pass{
+			Name: "job_wall_backstop",
+			Run: func(ctx context.Context) (int64, error) {
+				return wsvc.FailJobsPastWallDeadline(ctx, cfg.RunTimeout)
+			},
 		},
 		// Ephemeral worker orphan/failure GC backstop (PRD #529 M5, Decision 6). Deletes
 		// ephemeral workers that can no longer make progress — owning run terminal/absent,
@@ -1257,6 +1288,9 @@ func run() error {
 	// the forge budget: a reorder makes zero forge calls, and charging it there would
 	// let a burst of dragging starve the user's real forge operations.
 	boardOrderLimiter := mw.NewLimiter(cfg.BoardOrderRateLimitMax, cfg.BoardOrderRateLimitWindow, cfg.TrustedProxies)
+	// Dedicated per-user budget for the whole /api/v1 subtree (PRD #1908 D-B): job clients poll,
+	// which the 10/min authLimiter budget PRD #1907 used there cannot carry.
+	v1Limiter := mw.NewLimiter(cfg.V1RateLimitMax, cfg.V1RateLimitWindow, cfg.TrustedProxies)
 	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub, settingsCache)
 	// GitHub Projects v2 Status-sync provisioning service (PRD #364 M3), wired
 	// post-construction like the other optional forge collaborators.
@@ -1343,7 +1377,7 @@ func run() error {
 	// the SAME api on a second port, not a second surface. Building Routes twice
 	// would be two independent middleware chains — and two rate limiters, so a
 	// per-IP budget would silently double.
-	routes := h.Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter, cliPollLimiter, boardOrderLimiter)
+	routes := h.Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter, cliPollLimiter, boardOrderLimiter, v1Limiter)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

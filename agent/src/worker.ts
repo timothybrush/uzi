@@ -5,6 +5,7 @@ import type { Outbox } from "./outbox.js";
 import type { RunRunner } from "./runner.js";
 import type { ChatRunner } from "./chat-runner.js";
 import type { JudgeRunner } from "./judge-runner.js";
+import type { JobRunner } from "./job-runner.js";
 import type { ReviewRunner } from "./review-runner.js";
 import type { IsolatedRunner } from "./isolated-runner.js";
 import type { Logger } from "./log.js";
@@ -96,6 +97,13 @@ export class Worker {
     // Undefined only in tests that never see one; an isolated claim then fails closed here
     // (see executeIsolated), never falling through to the RunRunner.
     private readonly isolatedRunner?: IsolatedRunner,
+    // PRD #1908 M4: the repo-less `job` run lane's runner. Trailing so no existing positional
+    // caller moves. The default rejects a job claim instead of running it (the rejection is only logged as a warning by the claim loop, the run is not reported failed): production
+    // (main.ts) always passes the real runner, and the api only routes a job to a worker that
+    // advertised job_runner_v1, which this image advertises unconditionally (main.ts always wires the real runner; a Worker built without one, as in tests, rejects the claim).
+    private readonly jobRunner: Pick<JobRunner, "execute"> = {
+      execute: () => Promise.reject(new Error("no job runner wired")),
+    },
   ) {}
 
   /** The run lane's in-flight executions (issue #1759: a field so {@link isIdle} can read it). */
@@ -389,6 +397,10 @@ export class Worker {
           // advice post only from a worker advertising this, never on credential_switch_v1, which
           // shipped before advice posts were stamped, so older images keep posting mid-upgrade.
           "advice_claim_fence_v1",
+          // PRD #1908 M4: this image runs the repo-less `job` run kind (job-runner.ts). Advertised
+          // UNCONDITIONALLY: the api's ClaimRun job clause reads 'job_runner_v1' =
+          // ANY(workers.protocol_capabilities), so an image without it never claims a job.
+          "job_runner_v1",
         ];
         // PRD #1906 M4: advertise isolated_fetch_v1 ONLY when this worker is configured for the
         // isolated lane (UZI_FETCHER_URL and UZI_FETCHER_CA_FILE both set, which the chart does
@@ -748,6 +760,7 @@ export class Worker {
             ? this.reviewRunner.execute(claim)
             : claim.kind === "judge"
               ? this.judgeRunner.execute(claim)
+              : claim.kind === "job" ? this.jobRunner.execute(claim)
               : this.runner.execute(claim);
           const run = exec.catch((err) =>
             this.log.warn("claim/execute cycle failed", { error: errMessage(err) }),
