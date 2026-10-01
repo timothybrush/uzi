@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -101,9 +102,17 @@ type Handler struct {
 	// box is the generic secret cipher used by the per-user secret endpoints
 	// (Anthropic token). svc owns the forge-specific machinery (which also holds
 	// its own box for PAT sealing); the two share the same key material.
-	box  *secretbox.Box
-	svc  *forgesvc.Service
-	wsvc *workersvc.Service
+	box *secretbox.Box
+	// productSkillsFetch reads a product's skills repo (PRD #1909 M6). nil means
+	// agentsource.FetchSkillFiles; a test injects a fake so the admin sync route is exercised
+	// without a network clone.
+	productSkillsFetch productSkillsFetcher
+	// productSkillsSyncing is the per-process single-flight of the product skills sync: one
+	// clone of an untrusted repo at a time, so concurrent admin syncs cannot multiply the
+	// memory a clone decodes. A second sync while one runs is refused with a 429.
+	productSkillsSyncing atomic.Bool
+	svc                  *forgesvc.Service
+	wsvc                 *workersvc.Service
 	// pcheck runs the PAT least-privilege checks (PRD #5): the save-time token
 	// gate and the on-demand full connection check.
 	pcheck *privcheck.Service
@@ -508,6 +517,8 @@ func (h *Handler) recoveryLimits() recovery.Limits {
 		MaxConcurrentDownloads: h.cfg.RecoveryMaxConcurrentDownloads,
 		RequestDeadline:        h.cfg.RecoveryRequestDeadline,
 		UploadRetryWindow:      h.cfg.RecoveryUploadRetryWindow,
+		// PRD #1909 D2: recovery admission counts job-file bytes against the shared budget.
+		StoredFilesBudgetBytes: h.cfg.StoredFilesBudgetBytes,
 		// PRD #1349 M5 (D6/D10): the owner custody-hold aggregate reports the SAME admission
 		// ceiling ClaimRun/health gate on, so the board alert and `uzi run recovery` never
 		// disagree with the claim path. Sourced from workersvc's exported constant rather than
@@ -1243,6 +1254,19 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// body's claim_generation; job runs only (any other kind is 403 not_for_job). Idempotent:
 		// one transaction upserts the result and replaces the run's findings.
 		r.Post("/runs/{id}/job-result", h.WorkerJobResult)
+
+		// Job input download (PRD #1909 D8): the worker pulls each attached input file named in
+		// its claim. Fenced on the worker holding the run, the claim generation (query param) and
+		// the file being an attached input of THIS run. Deliberately NOT in laneWorkerAllowlist
+		// (a job is not a lane run yet; PRD #1906 M8 adds the route when jobs move to the lane).
+		r.Get("/runs/{id}/files/{fileID}", h.WorkerJobInputFile)
+
+		// Job output upload (PRD #1909 D4, M4): the worker stores the files it kept before it
+		// posts the result (the report and the findings JSON are the server's, stored from the
+		// result). Raw body + X-Uzi-Job-File metadata header; fenced exactly like the job-result
+		// route, BEFORE the body is read. Also NOT in laneWorkerAllowlist, for the same reason as
+		// the download above.
+		r.Post("/runs/{id}/files", h.WorkerJobOutputFile)
 
 		// Chat-agent read surface (PRD #39 M3, Decision 7): the chat agent
 		// investigates its OWNER'S runs. Every query is scoped to the worker's

@@ -783,6 +783,12 @@ export interface ClaimConfig {
    *  question_timeout_seconds for the completion hold. Default 900s; consumed in a later unit.
    *  Absent or <= 0 from an older server ⇒ the worker falls back to its own default. */
   completion_hold_window_seconds?: number;
+  /** PRD #1909 D1: the server's job-input limits, on a job claim only (one file's bytes, files per
+   *  job, total bytes per job). Optional: a job runner clamps them to its own fixed ceilings and
+   *  uses the ceilings alone when they are absent (an older server). */
+  job_input_file_max_bytes?: number;
+  job_inputs_max_files?: number;
+  job_inputs_max_bytes?: number;
   /** The run owner's per-user default model (PRD #17). When present it overrides
    *  the lead template's model for the main thread; absent when the owner set no
    *  default, so the worker falls back to the lead template's model. */
@@ -1034,6 +1040,38 @@ export interface JobResultRequest {
   status: string;
   report_md: string;
   findings: JobFindingBody[];
+  /** The output files the worker dropped itself (PRD #1909 M4): the api records each as a refusal
+   *  the caller can read. Omitted when there are none. */
+  refused_outputs?: JobRefusedOutput[];
+}
+
+/** One output the worker dropped: its display name and why (the api's fixed allowlist). */
+export interface JobRefusedOutput {
+  display_name: string;
+  reason: "worker_empty" | "worker_too_large" | "worker_unreadable" | "worker_upload_failed" | "worker_busy";
+}
+
+/** The metadata of one output-file upload (PRD #1909 M4): the `X-Uzi-Job-File` header of
+ *  POST /worker/runs/{id}/files, whose body is the file's raw bytes. `claim_generation` is the
+ *  fence, `size` and `sha256` are what the api verifies against the streamed bytes. */
+export interface JobFileUploadMeta {
+  claim_generation: number;
+  display_name: string;
+  size: number;
+  sha256: string;
+}
+
+/** The api's answer to a stored output (mirrors apitypes.V1FileDTO): 201 for a new file, 200
+ *  when a retry found the file its first attempt stored. */
+export interface JobFileUploadResponse {
+  id: string;
+  display_name: string;
+  storage_name: string;
+  content_type: string;
+  byte_size: number;
+  sha256: string;
+  state: string;
+  expires_at: string | null;
 }
 
 /** One named input document of a job (PRD #1908). */
@@ -1042,12 +1080,26 @@ export interface ClaimJobInput {
   content: string;
 }
 
+/** One attached input file of a job (PRD #1909 D8; mirrors workersvc.ClaimJobFile). `name` is the
+ *  storage name `<sha256>.<ext>` the file lands under in `inputs/`; `display_name` is the
+ *  uploader's label and is UNTRUSTED text. */
+export interface ClaimJobFile {
+  id: string;
+  name: string;
+  display_name: string;
+  size: number;
+  sha256: string;
+  content_type: string;
+}
+
 /** The job block of a kind="job" claim (PRD #1908). */
 export interface ClaimJob {
   type: string;
   title: string;
   prompt: string;
   inputs: ClaimJobInput[];
+  /** PRD #1909: the attached input files; absent from an older server's claim. */
+  files?: ClaimJobFile[];
 }
 
 /**
@@ -1088,8 +1140,9 @@ export interface ClaimResponse {
   pipeline?: ClaimPipeline | null;
   /** PRD #1908: the job block of a kind="job" claim (the repo-less run kind): the caller's job
    *  type, title, prompt and named input documents, in ordinal order. Present only for a job
-   *  claim; a job claim carries no repo, forge PAT, memory or skills. The prompt and input
-   *  contents are UNTRUSTED caller text. */
+   *  claim; a job claim carries no repo, forge PAT or memory, and its `skills` are ONLY the
+   *  approved skills of the product that started the job (PRD #1909 D9; none for a uzc_ job).
+   *  The prompt and input contents are UNTRUSTED caller text. */
   job?: ClaimJob;
   /** PRD #1908: the job's wall-clock budget in seconds; the job runner aborts and reports
    *  failed at this bound. Present only on a job claim. */

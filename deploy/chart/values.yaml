@@ -259,6 +259,26 @@ api:
     # UZI_EPHEMERAL_DEFAULT_SIZE: m            # provision size preset: s|m|l
     # UZI_EPHEMERAL_PROVISION_DEADLINE: 10m    # GC deadline for never-booted / idle-stolen workers
     # UZI_EPHEMERAL_SATURATION_DELAY: 90s     # debounce before bursting on a saturated (all capable workers full) fleet
+    # Job files and product skill sets (PRD #1909). Unset => config.go's defaults
+    # (docs/configuration.md; the commented values below are those defaults, except
+    # the product-skills allowlist, which defaults to empty). UZI_STORED_FILES_BUDGET_BYTES
+    # is the one ceiling shared by job files and run recovery archives: job files
+    # are sealed chunks in Postgres, so keep it below the database volume's size
+    # (database.simple.storage.size, or postgres.cluster.storage.size with
+    # the CNPG cluster). An empty UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS (the default) keeps
+    # product skill sets off. Uncomment to override.
+    # UZI_JOB_INPUT_FILE_MAX_BYTES: "26214400"      # 25 MiB per input file
+    # UZI_JOB_INPUTS_MAX_FILES: "10"
+    # UZI_JOB_INPUTS_MAX_BYTES: "52428800"          # 50 MiB of inputs per job
+    # UZI_JOB_OUTPUT_FILE_MAX_BYTES: "26214400"     # 25 MiB per output file
+    # UZI_JOB_OUTPUTS_MAX_FILES: "50"
+    # UZI_JOB_OUTPUTS_MAX_BYTES: "104857600"        # 100 MiB of outputs per job
+    # UZI_JOB_FILES_PER_OWNER_BYTES: "268435456"    # 256 MiB retained per owner
+    # UZI_JOB_FILES_INSTANCE_BYTES: "1073741824"    # 1 GiB retained instance-wide
+    # UZI_STORED_FILES_BUDGET_BYTES: "4294967296"   # 4 GiB: job files + recovery archives
+    # UZI_JOB_FILES_RETENTION: 168h
+    # UZI_JOB_UPLOAD_TTL: 1h
+    # UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS: https://github.com   # EXAMPLE, not a default (default: empty, feature off)
   # Infisical-synced secret env: ENV_VAR -> the key in the `uzi-secrets` Secret.
   # JWT_SECRET and UZI_SECRET_KEY are REQUIRED (the api refuses to boot without
   # them — that guard is the backstop, so the k8s secretKeyRef stays optional:true
@@ -1417,6 +1437,12 @@ web:
       # self-heals, but churn is avoided).
       nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
       nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+      # Input-file upload (PRD #1909, POST /api/v1/files): ingress-nginx defaults the request
+      # body limit to 1m and would refuse any real upload before web nginx sees it. 26m = the
+      # api's default per-file cap (25 MiB) plus multipart framing, matching web nginx's
+      # `location = /api/v1/files`; web nginx still limits every other /api/ path to 1m. Raise it
+      # together with UZI_JOB_INPUT_FILE_MAX_BYTES.
+      nginx.ingress.kubernetes.io/proxy-body-size: "26m"
     # dev-cluster serves a *.example.com default wildcard cert at the
     # controller, so no per-host TLS block is needed there. Set tls.enabled: true +
     # a secretName (and a cert-manager annotation) for a cluster without one.
@@ -1430,6 +1456,9 @@ web:
   # Gateway (or the router in front of it) terminates it; nothing TLS-specific renders here.
   # /api/ws is a long-lived WebSocket: raise the idle timeout on whatever sits in front of
   # the Gateway, as the ingress-nginx annotations above do for Ingress.
+  # Likewise the request BODY limit: POST /api/v1/files carries up to ~26 MiB (25 MiB file +
+  # multipart framing), so raise any body-size limit on the Gateway/router in front to at least
+  # that (the annotation mechanism, if any, is implementation-specific, so none is set here).
   httpRoute:
     enabled: false
     # e.g. [uzi.example.com]

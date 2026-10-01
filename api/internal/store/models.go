@@ -429,6 +429,32 @@ type IssueProposal struct {
 	ConfirmingSince pgtype.Timestamptz `json:"confirming_since"`
 }
 
+type JobFile struct {
+	ID              uuid.UUID          `json:"id"`
+	UserID          uuid.UUID          `json:"user_id"`
+	ProductID       pgtype.UUID        `json:"product_id"`
+	RunID           pgtype.UUID        `json:"run_id"`
+	Direction       string             `json:"direction"`
+	ClaimGeneration pgtype.Int8        `json:"claim_generation"`
+	StorageName     pgtype.Text        `json:"storage_name"`
+	DisplayName     string             `json:"display_name"`
+	ContentType     pgtype.Text        `json:"content_type"`
+	ByteSize        int64              `json:"byte_size"`
+	Sha256          pgtype.Text        `json:"sha256"`
+	ChunkCount      int32              `json:"chunk_count"`
+	State           string             `json:"state"`
+	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
+type JobFileChunk struct {
+	FileID     uuid.UUID `json:"file_id"`
+	ChunkIndex int32     `json:"chunk_index"`
+	Length     int32     `json:"length"`
+	Sealed     []byte    `json:"sealed"`
+}
+
 type JobFinding struct {
 	ID        uuid.UUID   `json:"id"`
 	RunID     uuid.UUID   `json:"run_id"`
@@ -453,6 +479,16 @@ type JobOrigin struct {
 	ProductTokenID   pgtype.UUID        `json:"product_token_id"`
 	RequestedByLabel pgtype.Text        `json:"requested_by_label"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
+type JobOutputRefusal struct {
+	ID          uuid.UUID          `json:"id"`
+	RunID       uuid.UUID          `json:"run_id"`
+	DisplayName string             `json:"display_name"`
+	ByteSize    int64              `json:"byte_size"`
+	Reason      string             `json:"reason"`
+	PostID      pgtype.Int8        `json:"post_id"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 }
 
 type JobResult struct {
@@ -523,15 +559,30 @@ type PrDescriptionVersion struct {
 }
 
 type Product struct {
-	ID              uuid.UUID          `json:"id"`
-	Name            string             `json:"name"`
-	Description     string             `json:"description"`
-	Enabled         bool               `json:"enabled"`
-	DeletedAt       pgtype.Timestamptz `json:"deleted_at"`
-	CreatedBy       pgtype.UUID        `json:"created_by"`
-	CreatedAt       pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
-	AllowedJobTypes []string           `json:"allowed_job_types"`
+	ID                uuid.UUID          `json:"id"`
+	Name              string             `json:"name"`
+	Description       string             `json:"description"`
+	Enabled           bool               `json:"enabled"`
+	DeletedAt         pgtype.Timestamptz `json:"deleted_at"`
+	CreatedBy         pgtype.UUID        `json:"created_by"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	AllowedJobTypes   []string           `json:"allowed_job_types"`
+	SkillsRepoUrl     string             `json:"skills_repo_url"`
+	SkillsRef         string             `json:"skills_ref"`
+	SkillsTokenSealed []byte             `json:"skills_token_sealed"`
+	SkillsAppliedSha  string             `json:"skills_applied_sha"`
+	SkillsAppliedBy   pgtype.UUID        `json:"skills_applied_by"`
+	SkillsAppliedAt   pgtype.Timestamptz `json:"skills_applied_at"`
+}
+
+type ProductSkillStaged struct {
+	ProductID uuid.UUID          `json:"product_id"`
+	SourceSha string             `json:"source_sha"`
+	StagedBy  pgtype.UUID        `json:"staged_by"`
+	StagedAt  pgtype.Timestamptz `json:"staged_at"`
+	Skills    []byte             `json:"skills"`
+	Dropped   []byte             `json:"dropped"`
 }
 
 type ProductToken struct {
@@ -598,6 +649,7 @@ type RecoveryCapture struct {
 	ExpiresAt              pgtype.Timestamptz `json:"expires_at"`
 	CreatedAt              pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+	ReservedBytes          pgtype.Int8        `json:"reserved_bytes"`
 }
 
 type RecoveryCaptureChunk struct {
@@ -827,6 +879,7 @@ type Run struct {
 	JobType                     pgtype.Text        `json:"job_type"`
 	// Issue #1742: the exact claim generation at which Register's one-shot finalize-resume allowance re-queued this run over its budget. NULL = never used; once set the allowance never fires again for the run.
 	FinalizeResumeGeneration pgtype.Int8 `json:"finalize_resume_generation"`
+	JobProtocol              pgtype.Int2 `json:"job_protocol"`
 }
 
 type RunCompletionAttempt struct {
@@ -1043,6 +1096,7 @@ type Skill struct {
 	UpdatedBy   pgtype.UUID        `json:"updated_by"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+	ProductID   pgtype.UUID        `json:"product_id"`
 }
 
 type SlackRunMessage struct {

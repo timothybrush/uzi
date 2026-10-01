@@ -55,6 +55,22 @@ func (h *Handler) mountV1Routes(r chi.Router, authLimiter, v1Limiter *mw.Limiter
 		r.With(read).Get("/jobs/{id}", h.V1JobGet)
 		r.With(read).Get("/jobs/{id}/result", h.V1JobResult)
 		r.With(read).Get("/jobs/{id}/messages", h.V1JobMessages)
+		// PRD #1909 M5: a job's files (inputs and outputs, with metadata and the refused outputs)
+		// and a file's bytes. Both need jobs:read; visibility is the job's (GET /jobs/{id}) for the
+		// listing and the caller's own file, within the caller's product, for the download.
+		r.With(read).Get("/jobs/{id}/files", h.V1JobFiles)
+		r.With(read).Get("/files/{id}", h.V1FileDownload)
 		r.With(run).Post("/jobs/{id}/cancel", h.V1JobCancel)
+
+		// PRD #1909 D5: upload an input file, then reference it from POST /jobs (input_file_ids).
+		// The jobs:run scope: a caller that may create jobs may upload their inputs. No extra
+		// limiter: the per-user v1Limiter above bounds request rate, the byte quotas
+		// (workersvc.JobFiles.Reserve) bound what a caller can hold, and the concurrent-write
+		// slots (workersvc.JobFiles.AcquireWrite, process-wide and per owner) bound how many
+		// uploads stream at once; cmd/server clamps them to half the database pool
+		// (workersvc.ClampWriteSlots), so stalled uploads cannot take every connection. The request rate does NOT bound that: each streaming upload holds
+		// a pooled database connection until its body is read, however few requests per minute.
+		// V1FileUpload also sets the route's own body read deadline.
+		r.With(run).Post("/files", h.V1FileUpload)
 	})
 }

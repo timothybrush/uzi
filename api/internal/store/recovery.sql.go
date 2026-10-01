@@ -23,7 +23,7 @@ SET manifest_bound = true,
     updated_at = now()
 WHERE id = $5
   AND (manifest_bound = false OR (byte_size = $1 AND checksum = $2))
-RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at
+RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes
 `
 
 type BindCaptureManifestParams struct {
@@ -75,6 +75,7 @@ func (q *Queries) BindCaptureManifest(ctx context.Context, arg BindCaptureManife
 		&i.ExpiresAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ReservedBytes,
 	)
 	return i, err
 }
@@ -315,7 +316,7 @@ func (q *Queries) ExpireStalledUploads(ctx context.Context, retryWindow pgtype.I
 }
 
 const getCaptureForOwner = `-- name: GetCaptureForOwner :one
-SELECT id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at FROM recovery_captures
+SELECT id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes FROM recovery_captures
 WHERE id = $1 AND run_id = $2 AND user_id = $3
 `
 
@@ -352,6 +353,7 @@ func (q *Queries) GetCaptureForOwner(ctx context.Context, arg GetCaptureForOwner
 		&i.ExpiresAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ReservedBytes,
 	)
 	return i, err
 }
@@ -657,7 +659,7 @@ func (q *Queries) ListCaptureSourceShasForHold(ctx context.Context, arg ListCapt
 }
 
 const listCapturesForRunOwner = `-- name: ListCapturesForRunOwner :many
-SELECT id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at FROM recovery_captures
+SELECT id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes FROM recovery_captures
 WHERE run_id = $1 AND user_id = $2
 ORDER BY created_at
 `
@@ -699,6 +701,7 @@ func (q *Queries) ListCapturesForRunOwner(ctx context.Context, arg ListCapturesF
 			&i.ExpiresAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.ReservedBytes,
 		); err != nil {
 			return nil, err
 		}
@@ -1098,11 +1101,56 @@ func (q *Queries) ListReleasableCustodyHolds(ctx context.Context) ([]ListReleasa
 	return items, nil
 }
 
+const markCaptureFailed = `-- name: MarkCaptureFailed :one
+UPDATE recovery_captures
+SET state = 'needs_action', reason = $1, updated_at = now()
+WHERE id = $2 AND state IN ('preparing', 'uploading', 'needs_action')
+RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes
+`
+
+type MarkCaptureFailedParams struct {
+	Reason pgtype.Text `json:"reason"`
+	ID     uuid.UUID   `json:"id"`
+}
+
+// The upload-failure write: needs_action with a bounded reason, but ONLY from a state an upload can
+// still be in. The state guard is the write's own compare-and-set, so a discard, expiry or success
+// that commits between the caller's read and this write is never overwritten (and a discarded
+// capture is never revived by a later retry). Zero rows: the capture moved on; nothing was written.
+func (q *Queries) MarkCaptureFailed(ctx context.Context, arg MarkCaptureFailedParams) (RecoveryCapture, error) {
+	row := q.db.QueryRow(ctx, markCaptureFailed, arg.Reason, arg.ID)
+	var i RecoveryCapture
+	err := row.Scan(
+		&i.ID,
+		&i.HoldID,
+		&i.RunID,
+		&i.UserID,
+		&i.OriginalWorkerID,
+		&i.OriginalWorkerIdentity,
+		&i.SourceSha,
+		&i.AttemptedHeadSha,
+		&i.IdempotencyKey,
+		&i.State,
+		&i.ManifestBound,
+		&i.ByteSize,
+		&i.Checksum,
+		&i.ChunkCount,
+		&i.PrerequisiteShas,
+		&i.Reason,
+		&i.Context,
+		&i.ExpiresAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.ReservedBytes,
+	)
+	return i, err
+}
+
 const markCaptureReady = `-- name: MarkCaptureReady :one
 UPDATE recovery_captures
 SET state = 'available', expires_at = $1, updated_at = now()
 WHERE id = $2 AND manifest_bound = true
-RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at
+RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes
 `
 
 type MarkCaptureReadyParams struct {
@@ -1138,6 +1186,7 @@ func (q *Queries) MarkCaptureReady(ctx context.Context, arg MarkCaptureReadyPara
 		&i.ExpiresAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ReservedBytes,
 	)
 	return i, err
 }
@@ -1146,7 +1195,7 @@ const markCaptureState = `-- name: MarkCaptureState :one
 UPDATE recovery_captures
 SET state = $1, reason = $2, updated_at = now()
 WHERE id = $3
-RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at
+RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes
 `
 
 type MarkCaptureStateParams struct {
@@ -1183,6 +1232,7 @@ func (q *Queries) MarkCaptureState(ctx context.Context, arg MarkCaptureStatePara
 		&i.ExpiresAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ReservedBytes,
 	)
 	return i, err
 }
@@ -1525,7 +1575,7 @@ WHERE h.run_id = $1
 ORDER BY h.created_at DESC
 LIMIT 1
 ON CONFLICT (hold_id, idempotency_key) DO UPDATE SET updated_at = now()
-RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at
+RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes
 `
 
 type ReserveCaptureExactParams struct {
@@ -1591,6 +1641,7 @@ func (q *Queries) ReserveCaptureExact(ctx context.Context, arg ReserveCaptureExa
 		&i.ExpiresAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ReservedBytes,
 	)
 	return i, err
 }

@@ -21,6 +21,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -548,6 +549,7 @@ type Store interface {
 	InsertCaptureChunk(ctx context.Context, arg store.InsertCaptureChunkParams) error
 	MarkCaptureReady(ctx context.Context, arg store.MarkCaptureReadyParams) (store.RecoveryCapture, error)
 	MarkCaptureState(ctx context.Context, arg store.MarkCaptureStateParams) (store.RecoveryCapture, error)
+	MarkCaptureFailed(ctx context.Context, arg store.MarkCaptureFailedParams) (store.RecoveryCapture, error)
 	GetCaptureForOwner(ctx context.Context, arg store.GetCaptureForOwnerParams) (store.RecoveryCapture, error)
 	ListCapturesForRunOwner(ctx context.Context, arg store.ListCapturesForRunOwnerParams) ([]store.RecoveryCapture, error)
 	ListCaptureChunks(ctx context.Context, captureID uuid.UUID) ([]store.RecoveryCaptureChunk, error)
@@ -1068,12 +1070,14 @@ type Store interface {
 	// reasonNoJobCapableWorker — the run's non-bypassable job-runner claim clause can never be
 	// satisfied. A per-run lookup like CountOnlineWorkersSatisfyingCodexHarness above, and off the
 	// hot path for the same reason.
-	CountOnlineWorkersSatisfyingJobRunner(ctx context.Context, userID uuid.UUID) (int64, error)
+	CountOnlineWorkersSatisfyingJobRunner(ctx context.Context, arg store.CountOnlineWorkersSatisfyingJobRunnerParams) (int64, error)
 	// ClearJobResultForRun drops a job run's result and findings at claim assembly (PRD #1908):
 	// a result from an earlier flight must not satisfy a later flight's no-result invariant.
 	ClearJobResultForRun(ctx context.Context, runID uuid.UUID) error
 	// ListJobInputsForClaim reads a claimed job's named inputs for claim assembly (PRD #1908).
 	ListJobInputsForClaim(ctx context.Context, runID uuid.UUID) ([]store.ListJobInputsForClaimRow, error)
+	// ListJobInputFilesForClaim reads a claimed job's attached input files for the claim manifest (PRD #1909).
+	ListJobInputFilesForClaim(ctx context.Context, runID pgtype.UUID) ([]store.ListJobInputFilesForClaimRow, error)
 	// FailJobsPastWallDeadline is the PRD #1908 D-E wall-clock backstop for claimed/running jobs.
 	FailJobsPastWallDeadline(ctx context.Context, arg store.FailJobsPastWallDeadlineParams) ([]store.FailJobsPastWallDeadlineRow, error)
 	// ListRevokedProductJobs backs the PRD #1908 D14 product-revoke sweep (CancelRevokedProductJobs).
@@ -1307,6 +1311,9 @@ type Store interface {
 	// owner's own allocated user templates ride the claim, not every template.
 	ListClaimAgentTemplates(ctx context.Context, userID pgtype.UUID) ([]store.AgentTemplate, error)
 	ListRunSkillAllocations(ctx context.Context, userID pgtype.UUID) ([]store.ListRunSkillAllocationsRow, error)
+	// ListProductSkillsForRun reads the approved product skills of the product that started a
+	// JOB run (PRD #1909 D9), from job_origins. Empty for a uzc_ job and for every non-job run.
+	ListProductSkillsForRun(ctx context.Context, runID uuid.UUID) ([]store.ListProductSkillsForRunRow, error)
 	// Tier-1 tool provisioning (PRD #18 M4): the run owner's per-repo package list
 	// and the admin allowlist it is re-validated against at claim time.
 	GetRepoToolProfile(ctx context.Context, arg store.GetRepoToolProfileParams) (store.RepoToolProfile, error)
@@ -1434,6 +1441,10 @@ type Params struct {
 	// the claim so the worker enforces the same limits (no server/worker drift).
 	SkillMaxBytes   int
 	SkillsMaxPerRun int
+	// ProductSkillsEnabled mirrors "UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS is non-empty" (PRD
+	// #1909 D9): with it false the feature is off instance-wide and a job claim carries no
+	// product skills, even if some were applied while the allowlist was set.
+	ProductSkillsEnabled bool
 
 	// Chat lifecycle knobs (PRD #39 Decision 3). ChatIdleTimeout is the SERVER idle
 	// backstop the sweep applies (complete a chat whose last message is older than
@@ -1701,6 +1712,35 @@ type Service struct {
 	q   Store
 	box *secretbox.Box
 	p   Params
+	// jobFiles is the PRD #1909 job-file store the upload/download surfaces reach through
+	// JobFiles(). Optional (nil-safe); set via SetJobFiles.
+	jobFiles *JobFiles
+	// genMu guards genRuns (the runs with a generated-output storage in flight, each with at most
+	// one pending behind it) and genClosed (set by DrainGeneratedOutputs); genWG tracks the detached
+	// generated-output storages (startJobResultOutputs); genTimeout, genReplyBound and genMax
+	// override the package defaults when positive (tests).
+	genMu         sync.Mutex
+	genRuns       map[uuid.UUID]*runGen
+	genClosed     bool
+	genMax        int
+	genDrainBound time.Duration
+	// genOwners counts, per owner (run.UserID), the runs with a generation in flight (genMu);
+	// genBase is the context every generation derives from, genCancel its cancel, used by
+	// DrainGeneratedOutputs when its bound elapses (genMu); genCancelGrace overrides the wait after
+	// that cancel when positive (tests).
+	genActive       int
+	genQueue        []uuid.UUID
+	genQueuedOwners map[uuid.UUID]int
+	genOwners       map[uuid.UUID]int
+	genBase         context.Context
+	genCancel       context.CancelCauseFunc
+	genCancelGrace  time.Duration
+	genStartHook    func(*genJob)             // test seam: before the generation goroutine starts work
+	genHook         func(*genJob)             // test seam: called at the start of each generation
+	genPostHook     func(JobResultSubmission) // test seam: called after the result commit, before its generation is queued
+	genWG           sync.WaitGroup
+	genTimeout      time.Duration
+	genReplyBound   time.Duration
 	// now is time.Now in production; overridable in tests for deterministic
 	// cutoffs.
 	now func() time.Time

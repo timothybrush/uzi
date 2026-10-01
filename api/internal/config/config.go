@@ -145,6 +145,12 @@ type Config struct {
 	// means nothing is allowed until an admin configures it (AgentSourceBaseURLAllowed
 	// returns false on a nil list).
 	AgentSourceAllowedBaseURLs []string
+	// ProductSkillsAllowedBaseURLs is the SEPARATE SSRF allowlist for product skill sets
+	// (PRD #1909 D9, UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS): the only base URLs a product's
+	// skills_repo_url may target. Same shape as AgentSourceAllowedBaseURLs (normalized
+	// scheme+host, https only) but a DISTINCT list, so enabling one source never widens the
+	// other. EMPTY means the feature is off: ProductSkillsBaseURLAllowed is false for every URL.
+	ProductSkillsAllowedBaseURLs []string
 	// ForgePollInterval is the per-enabled-repo incremental poll cadence.
 	ForgePollInterval time.Duration
 	// ForgeReconcileEvery is the number of incremental polls between full
@@ -744,6 +750,21 @@ type Config struct {
 	RecoveryMaxConcurrentDownloads int           // UZI_RECOVERY_MAX_CONCURRENT_DOWNLOADS — concurrent downloads per API process. Default 2.
 	RecoveryRequestDeadline        time.Duration // UZI_RECOVERY_REQUEST_DEADLINE — per upload/download request+transaction deadline. Default 120s.
 
+	// Job-file limits (PRD #1909 D1). Every knob is operator-configurable with the PRD default;
+	// byte ceilings are int64. parseInt/parseInt64/parseDuration floor at >0, so a non-positive
+	// or malformed override falls back to the default rather than disabling a ceiling.
+	JobInputFileMaxBytes   int64         // UZI_JOB_INPUT_FILE_MAX_BYTES — one input file. Default 25 MiB.
+	JobInputsMaxFiles      int           // UZI_JOB_INPUTS_MAX_FILES — input files per job. Default 10.
+	JobInputsMaxBytes      int64         // UZI_JOB_INPUTS_MAX_BYTES — total input bytes per job. Default 50 MiB.
+	JobOutputFileMaxBytes  int64         // UZI_JOB_OUTPUT_FILE_MAX_BYTES — one output file. Default 25 MiB.
+	JobOutputsMaxFiles     int           // UZI_JOB_OUTPUTS_MAX_FILES — output files per job. Default 50.
+	JobOutputsMaxBytes     int64         // UZI_JOB_OUTPUTS_MAX_BYTES — total output bytes per job. Default 100 MiB.
+	JobFilesPerOwnerBytes  int64         // UZI_JOB_FILES_PER_OWNER_BYTES — retained job-file bytes per owner. Default 256 MiB.
+	JobFilesInstanceBytes  int64         // UZI_JOB_FILES_INSTANCE_BYTES — retained job-file bytes, instance-wide. Default 1 GiB.
+	StoredFilesBudgetBytes int64         // UZI_STORED_FILES_BUDGET_BYTES — the shared ceiling on job files PLUS recovery archives (job-file bytes + recovery bytes, reservations included). Default 4 GiB.
+	JobFilesRetention      time.Duration // UZI_JOB_FILES_RETENTION — how long a finished job's files stay downloadable. Default 168h (7d).
+	JobUploadTTL           time.Duration // UZI_JOB_UPLOAD_TTL — an uploaded input never attached to a job. Default 1h.
+
 	// SalvageForges (PRD #1867, UZI_SALVAGE_FORGES) is the comma list of forge kinds
 	// (github, gitlab, forgejo; trimmed and lower-cased) whose failed runs the salvage sweep
 	// copies into refs/uzi-salvage/<run-id>. Default empty: OFF. It is enabled per forge only
@@ -876,6 +897,12 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.AgentSourceAllowedBaseURLs = agentSourceAllowed
+	// PRD #1909 M6: the product-skills allowlist, default EMPTY (feature off, instance still boots).
+	productSkillsAllowed, err := parseBaseURLAllowlist("UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS", getenv("UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS", ""))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ProductSkillsAllowedBaseURLs = productSkillsAllowed
 	cfg.ForgePollInterval = parseDuration("FORGE_POLL_INTERVAL", time.Minute)
 	cfg.ForgeReconcileEvery = parseInt("FORGE_RECONCILE_EVERY", 10)
 	cfg.ForgeHTTPTimeout = parseDuration("FORGE_HTTP_TIMEOUT", 15*time.Second)
@@ -1271,6 +1298,19 @@ func Load() (Config, error) {
 	cfg.RecoveryMaxConcurrentUploads = parseInt("UZI_RECOVERY_MAX_CONCURRENT_UPLOADS", 2)
 	cfg.RecoveryMaxConcurrentDownloads = parseInt("UZI_RECOVERY_MAX_CONCURRENT_DOWNLOADS", 2)
 	cfg.RecoveryRequestDeadline = parseDuration("UZI_RECOVERY_REQUEST_DEADLINE", 120*time.Second)
+
+	// Job-file limits (PRD #1909 D1).
+	cfg.JobInputFileMaxBytes = clampToWorkerCeiling("UZI_JOB_INPUT_FILE_MAX_BYTES", parseInt64("UZI_JOB_INPUT_FILE_MAX_BYTES", 25<<20), WorkerJobInputFileMaxBytes)
+	cfg.JobInputsMaxFiles = int(clampToWorkerCeiling("UZI_JOB_INPUTS_MAX_FILES", int64(parseInt("UZI_JOB_INPUTS_MAX_FILES", 10)), WorkerJobInputsMaxFiles))
+	cfg.JobInputsMaxBytes = clampToWorkerCeiling("UZI_JOB_INPUTS_MAX_BYTES", parseInt64("UZI_JOB_INPUTS_MAX_BYTES", 50<<20), WorkerJobInputsMaxBytes)
+	cfg.JobOutputFileMaxBytes = parseInt64("UZI_JOB_OUTPUT_FILE_MAX_BYTES", 25<<20)
+	cfg.JobOutputsMaxFiles = parseInt("UZI_JOB_OUTPUTS_MAX_FILES", 50)
+	cfg.JobOutputsMaxBytes = parseInt64("UZI_JOB_OUTPUTS_MAX_BYTES", 100<<20)
+	cfg.JobFilesPerOwnerBytes = parseInt64("UZI_JOB_FILES_PER_OWNER_BYTES", 256<<20)
+	cfg.JobFilesInstanceBytes = parseInt64("UZI_JOB_FILES_INSTANCE_BYTES", 1<<30)
+	cfg.StoredFilesBudgetBytes = parseInt64("UZI_STORED_FILES_BUDGET_BYTES", 4<<30)
+	cfg.JobFilesRetention = parseDuration("UZI_JOB_FILES_RETENTION", 7*24*time.Hour)
+	cfg.JobUploadTTL = parseDuration("UZI_JOB_UPLOAD_TTL", time.Hour)
 
 	salvageForges, err := parseSalvageForges(getenv("UZI_SALVAGE_FORGES", ""))
 	if err != nil {
@@ -1892,6 +1932,14 @@ func (c Config) ForgeBaseURLAllowed(raw string) bool {
 // instance must still boot. Nothing is allowed until the list is configured, which
 // AgentSourceBaseURLAllowed enforces by returning false on a nil list.
 func parseAgentSourceAllowedBaseURLs(raw string) ([]string, error) {
+	return parseBaseURLAllowlist("AGENT_SOURCE_ALLOWED_BASE_URLS", raw)
+}
+
+// parseBaseURLAllowlist is the shared parser of the optional (may-be-empty) https base-URL
+// allowlists: every present entry is normalized via NormalizeForgeBaseURL and deduped, a
+// non-https or malformed entry is a hard boot error naming envName, and an empty list returns nil
+// (feature off).
+func parseBaseURLAllowlist(envName, raw string) ([]string, error) {
 	var out []string
 	seen := map[string]struct{}{}
 	for _, part := range strings.Split(raw, ",") {
@@ -1901,7 +1949,7 @@ func parseAgentSourceAllowedBaseURLs(raw string) ([]string, error) {
 		}
 		norm, err := NormalizeForgeBaseURL(part)
 		if err != nil {
-			return nil, fmt.Errorf("AGENT_SOURCE_ALLOWED_BASE_URLS: %w", err)
+			return nil, fmt.Errorf("%s: %w", envName, err)
 		}
 		if _, dup := seen[norm]; dup {
 			continue
@@ -1910,6 +1958,23 @@ func parseAgentSourceAllowedBaseURLs(raw string) ([]string, error) {
 		out = append(out, norm)
 	}
 	return out, nil
+}
+
+// ProductSkillsBaseURLAllowed reports whether raw normalizes to an allowlisted product-skills
+// base URL (PRD #1909 D9). It checks the SEPARATE ProductSkillsAllowedBaseURLs list and is false
+// when that list is empty. NormalizeForgeBaseURL keeps only scheme and host, so it does NOT
+// reject URL userinfo: the caller (the admin product PATCH) refuses userinfo itself.
+func (c Config) ProductSkillsBaseURLAllowed(raw string) bool {
+	norm, err := NormalizeForgeBaseURL(raw)
+	if err != nil {
+		return false
+	}
+	for _, a := range c.ProductSkillsAllowedBaseURLs {
+		if a == norm {
+			return true
+		}
+	}
+	return false
 }
 
 // AgentSourceBaseURLAllowed reports whether raw normalizes to an allowlisted
@@ -1995,6 +2060,27 @@ func parseDuration(key string, def time.Duration) time.Duration {
 		return d
 	}
 	return def
+}
+
+// The worker's fixed ceilings on one job's uploaded input files (PRD #1909 D1). They mirror
+// JOB_INPUT_CEILINGS in agent/src/job-workspace.ts (TestWorkerJobInputCeilingsMatchTheAgent pins the
+// two together): a worker refuses any manifest over them whatever the claim says, so an operator
+// limit above them would accept jobs that every worker then refuses. Load clamps to them.
+const (
+	WorkerJobInputFileMaxBytes int64 = 256 << 20
+	WorkerJobInputsMaxFiles    int64 = 64
+	WorkerJobInputsMaxBytes    int64 = 1 << 30
+)
+
+// clampToWorkerCeiling returns v, or ceiling with a warning when v is above it.
+func clampToWorkerCeiling(key string, v, ceiling int64) int64 {
+	if v <= ceiling {
+		return v
+	}
+	slog.Warn(key+" is above the worker's fixed ceiling; clamping (a worker refuses any job input over it, so a higher limit would accept jobs every worker then refuses)",
+		"configured", v,
+		"clamped_to", ceiling)
+	return ceiling
 }
 
 func parseInt(key string, def int) int {

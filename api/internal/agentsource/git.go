@@ -1,6 +1,7 @@
 package agentsource
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	"github.com/go-git/go-git/v5/storage/memory"
 
+	"github.com/vtmocanu/uzi/api/internal/packbudget"
 	"github.com/vtmocanu/uzi/api/internal/redirectguard"
 )
 
@@ -55,16 +57,44 @@ const maxTotalBytes = MaxFiles * MaxBytes
 // and a real roster repo's pack plus git/protocol overhead is a few MB — so a
 // legitimate source never trips it, while a hostile one is bounded to tens of MiB.
 //
-// RESIDUAL (documented, see adr/0602 threat model): this bounds COMPRESSED wire bytes,
-// not the RECONSTRUCTED/inflated size. A zlib decompression-bomb pack (small on the
-// wire, huge inflated) still inflates into the storer under this cap. Closing that half
-// needs a reconstructed-size pre-scan of the pack analogous to
-// pushbroker.scanPackBudget; it is a deliberate follow-up, not implemented here. The
-// mitigating preconditions make the residual acceptable: the source must be on the
-// admin-configured AGENT_SOURCE_ALLOWED_BASE_URLS allowlist AND the feature explicitly
-// enabled (both off by default), reconcile is single-flight on one goroutine, and the
-// 60s cloneTimeout bounds the inflation wall-clock.
+// This bounds COMPRESSED wire bytes only. The RECONSTRUCTED/inflated size is bounded
+// separately by the per-caller packbudget.Limits (skillPackLimits, rolePackLimits), enforced
+// by packbudget.Scan over the fetched pack BEFORE it is decoded into the storer
+// (fetchCommit), so a zlib or delta bomb that is small on the wire is refused rather than
+// inflated. The source must also be on the admin-configured allowlist and the 60s
+// cloneTimeout bounds wall-clock.
 const maxCloneWireBytes = 48 << 20 // 48 MiB cumulative off-the-wire ceiling
+
+// skillPackLimits is the reconstructed-size budget FetchSkillFiles applies to the fetched pack
+// (packbudget.Scan). A SKILL.md is capped well under 1 MiB and a skill set is a handful of small
+// files, so 16 MiB per object and 64 MiB reconstructed in total leave room for the rest of a
+// skills repo's tip while keeping the reconstructed heap a hostile source can force small. The
+// real per-clone peak is the wire buffer (up to maxCloneWireBytes) plus this reconstructed
+// budget plus go-git parser overhead, not the budget alone. The inflation-work cap bounds the
+// scan's own CPU.
+var skillPackLimits = packbudget.Limits{
+	ObjectBytes:        16 << 20,
+	TotalBytes:         64 << 20,
+	InflationWorkBytes: 128 << 20,
+	Objects:            50000,
+}
+
+// rolePackLimits is the budget FetchRoleFiles applies. The agent source is any allowlisted repo
+// (the default folder is .claude/agents of an ordinary code repo), so its depth-1 tip holds
+// arbitrary non-role files, and before the pre-scan existed only the 48 MiB wire cap applied. The
+// limits are sized so anything that cap admitted in practice still syncs: incompressible content
+// is at most ~48 MiB per object and a typical repo inflates to a few times its wire size (this
+// repo is ~35 MiB wire, ~94 MiB inflated), so 64 MiB per object, 512 MiB reconstructed in total
+// and 1 GiB of inflation work leave headroom, while a bomb (a ~1 MiB pack can declare GiBs) is
+// still refused before it is inflated. The worst case a hostile allowlisted source can force is
+// the wire buffer plus up to TotalBytes of reconstructed heap; the source must be allowlisted and
+// enabled by an admin, reconcile is single-flight and cloneTimeout bounds wall-clock.
+var rolePackLimits = packbudget.Limits{
+	ObjectBytes:        64 << 20,
+	TotalBytes:         512 << 20,
+	InflationWorkBytes: 1 << 30,
+	Objects:            50000,
+}
 
 // maxCloneRedirects caps redirect hops on the http(s) clone. go-git's own policy
 // already permits a redirect only on the initial ref-advertisement request; this is a
@@ -78,6 +108,10 @@ var sha40Re = regexp.MustCompile(`^[0-9a-fA-F]{40}$`)
 // wire cap is crossed. It surfaces through go-git's pack decode as a read error; the
 // fetch wrapper detects the trip flag and reports a clean, PAT-free message.
 var errCloneWireBudget = errors.New("agentsource: clone exceeded wire budget")
+
+// ErrPackBudget is returned (wrapped) when the fetched pack would inflate past the caller's packbudget.Limits:
+// a decompression or delta bomb, refused before any object is decoded.
+var ErrPackBudget = packbudget.ErrTooLarge
 
 // CloneOptions carries the (already-trimmed, already-allowlist-rechecked) inputs a
 // single fetch needs. Token is the sealed clone credential decrypted by the caller;
@@ -119,39 +153,65 @@ type CloneOptions struct {
 // is PAT-scrubbed.
 func FetchRoleFiles(ctx context.Context, opts CloneOptions) (sha string, files []SourceFile, err error) {
 	scrub := scrubber(opts.Token)
+	commit, resolved, terr := fetchTip(ctx, opts, rolePackLimits)
+	if terr != nil {
+		return "", nil, terr
+	}
+	files, ferr := readRoleFiles(commit, opts.Dir)
+	if ferr != nil {
+		return "", nil, fmt.Errorf("agentsource: read role files: %s", scrub(ferr.Error()))
+	}
+	return resolved, files, nil
+}
+
+// fetchTip is the bounded, guarded clone shared by FetchRoleFiles and FetchSkillFiles: validate
+// the ref, run the ONE ref-advertisement round trip, resolve the wanted hash, shallow-fetch that
+// single commit into an in-memory storer and return it with its full SHA. Every control
+// documented on FetchRoleFiles (the redirect allowlist and same-origin guard, the wire-size cap,
+// the 60s timeout, the clone-token scrub, BasicAuth attached only when a token is set) lives
+// here, so a second reader of a clone cannot drift from the first. Every returned error is
+// scrubbed of opts.Token.
+func fetchTip(ctx context.Context, opts CloneOptions, lim packbudget.Limits) (*object.Commit, string, error) {
+	scrub := scrubber(opts.Token)
 
 	// The ref is validated with go-git plumbing (git-check-ref-format via
 	// ReferenceName.Validate, or a 40-hex SHA) BEFORE any network op — a hostile ref
 	// name never reaches the refspec layer (the fetch asks for a resolved HASH).
 	refName, isSHA, rerr := classifyRef(opts.Ref)
 	if rerr != nil {
-		return "", nil, rerr
+		return nil, "", rerr
 	}
 
 	// advertise performs the single ref-advertisement round trip (URL validate →
 	// guarded transport → upload-pack session → AdvertisedReferencesContext), the setup
-	// FetchRoleFiles shares with ListRemoteRefs. It resolves both jobs the previous
+	// fetchTip shares with ListRemoteRefs. It resolves both jobs the previous
 	// implementation used two round trips for: resolving a named branch/tag to a hash,
 	// and driving the fetch.
 	adv, aerr := advertise(ctx, opts)
 	if aerr != nil {
-		return "", nil, aerr
+		return nil, "", aerr
 	}
 	defer adv.close()
 
 	want, werr := resolveWant(adv.refs, refName)
 	if werr != nil {
-		return "", nil, werr
+		return nil, "", werr
 	}
 
 	st := memory.NewStorage()
-	if ferr := fetchCommit(adv.ctx, adv.session, adv.refs.Capabilities, want, st); ferr != nil {
-		return "", nil, adv.wrap("clone failed", ferr)
+	if ferr := fetchCommit(adv.ctx, adv.session, adv.refs.Capabilities, want, st, lim); ferr != nil {
+		if errors.Is(ferr, packbudget.ErrTooLarge) {
+			// The pre-scan refused the pack; its text names the bound that tripped and its
+			// limit and carries no URL or token. %w keeps the sentinel matchable
+			// (ErrPackBudget) for callers and tests.
+			return nil, "", fmt.Errorf("agentsource: clone failed: %w", ferr)
+		}
+		return nil, "", adv.wrap("clone failed", ferr)
 	}
 
 	commit, commitErr := resolveCommit(st, want)
 	if commitErr != nil {
-		return "", nil, fmt.Errorf("agentsource: resolve commit: %s", scrub(commitErr.Error()))
+		return nil, "", fmt.Errorf("agentsource: resolve commit: %s", scrub(commitErr.Error()))
 	}
 	resolved := commit.Hash.String()
 
@@ -159,16 +219,11 @@ func FetchRoleFiles(ctx context.Context, opts CloneOptions) (sha string, files [
 	// (Depth 1 fetches only the default branch's tip snapshot — an arbitrary historical
 	// SHA's objects are not present). Fail with a clear, non-hanging error otherwise.
 	if isSHA && !strings.EqualFold(resolved, strings.TrimSpace(opts.Ref)) {
-		return "", nil, fmt.Errorf(
+		return nil, "", fmt.Errorf(
 			"agentsource: pinned commit %s is not the fetched tip %s (a full-SHA pin must be the source's current default-branch tip at shallow clone depth; pin a tag or branch instead)",
 			strings.TrimSpace(opts.Ref), resolved)
 	}
-
-	files, ferr := readRoleFiles(commit, opts.Dir)
-	if ferr != nil {
-		return "", nil, fmt.Errorf("agentsource: read role files: %s", scrub(ferr.Error()))
-	}
-	return resolved, files, nil
+	return commit, resolved, nil
 }
 
 // transportForEndpoint builds the transport that drives ONE fetch. For an http(s)
@@ -276,7 +331,7 @@ func (b *boundedBody) Close() error { return b.rc.Close() }
 // capabilities, ask for depth 1, then demux the sideband (if negotiated) and decode the
 // pack into the storer. Depth 1 bounds history to the single tip snapshot — exactly the
 // tree readRoleFiles needs — and coexists with the wire-size cap the transport enforces.
-func fetchCommit(ctx context.Context, session transport.UploadPackSession, adv *capability.List, want plumbing.Hash, st storer.Storer) error {
+func fetchCommit(ctx context.Context, session transport.UploadPackSession, adv *capability.List, want plumbing.Hash, st storer.Storer, lim packbudget.Limits) error {
 	req := packp.NewUploadPackRequestFromCapabilities(adv)
 	req.Depth = packp.DepthCommits(1)
 	if err := req.Capabilities.Set(capability.Shallow); err != nil {
@@ -293,7 +348,17 @@ func fetchCommit(ctx context.Context, session transport.UploadPackSession, adv *
 	}
 	defer func() { _ = resp.Close() }()
 
-	return packfile.UpdateObjectStorage(st, buildSideband(req.Capabilities, resp))
+	// Buffer the (wire-capped, compressed) pack and pre-scan it for its RECONSTRUCTED size
+	// BEFORE it is decoded into the unbounded in-memory storer: a zlib or delta bomb is small
+	// on the wire and would otherwise inflate fully before any per-file cap runs.
+	pack, err := io.ReadAll(buildSideband(req.Capabilities, resp))
+	if err != nil {
+		return err
+	}
+	if err := packbudget.Scan(ctx, pack, lim); err != nil {
+		return err
+	}
+	return packfile.UpdateObjectStorage(st, bytes.NewReader(pack))
 }
 
 // buildSideband wraps the upload-pack response in a sideband demuxer when the negotiated
@@ -382,9 +447,9 @@ func resolveCommit(s storer.EncodedObjectStorer, h plumbing.Hash) (*object.Commi
 // its blob is read. A missing directory is a valid empty source (no error).
 //
 // These caps run AFTER the pack has been decoded into the storer, so they are NOT the
-// OOM defense against a hostile tip — that is the transport's maxCloneWireBytes wire cap
-// (see its doc for the residual inflate-bomb note). These caps bound what is handed to
-// ParseSet.
+// OOM defense against a hostile tip: that is maxCloneWireBytes (compressed bytes) plus the
+// reconstructed-size pre-scan of the pack under rolePackLimits (see fetchCommit). These caps
+// bound what is handed to ParseSet.
 func readRoleFiles(commit *object.Commit, dir string) ([]SourceFile, error) {
 	tree, err := commit.Tree()
 	if err != nil {

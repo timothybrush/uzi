@@ -19,12 +19,15 @@ import (
 // Job-result bounds. The job_results / job_findings CHECKs (migration 00275) are the backstop;
 // these are the ingest caps the handler enforces before anything is persisted.
 const (
-	JobResultMaxFindings         = 200
-	JobResultReportMaxBytes      = 1 << 20  // job_results.report_md CHECK
-	JobFindingMessageMaxBytes    = 64 << 10 // job_findings.message_md CHECK
-	JobFindingURLMaxBytes        = 2048     // job_findings.url CHECK
-	JobFindingFileMaxBytes       = 1024     // job_findings.file CHECK
-	JobFindingMaxLine            = 1 << 24  // a sane ceiling well inside int4
+	JobResultMaxFindings      = 200
+	JobResultReportMaxBytes   = 1 << 20  // job_results.report_md CHECK
+	JobFindingMessageMaxBytes = 64 << 10 // job_findings.message_md CHECK
+	JobFindingURLMaxBytes     = 2048     // job_findings.url CHECK
+	JobFindingFileMaxBytes    = 1024     // job_findings.file CHECK
+	JobFindingMaxLine         = 1 << 24  // a sane ceiling well inside int4
+	// JobResultMaxRefusedOutputs bounds the worker-reported dropped outputs of one result: the
+	// worker's own file ceiling. The service further bounds what it records by OutputsMaxFiles.
+	JobResultMaxRefusedOutputs   = 64
 	jobNoResultFailureReasonText = "The job finished without submitting a result."
 )
 
@@ -48,11 +51,20 @@ type JobFindingSubmission struct {
 	Line      *int32
 }
 
+// JobRefusedOutput is an output the worker reports it dropped itself (see WorkerRefusalReasons):
+// DisplayName already sanitised, Reason from the allowlist.
+type JobRefusedOutput struct {
+	DisplayName string
+	Reason      string
+}
+
 // JobResultSubmission is a validated, scrubbed job result.
 type JobResultSubmission struct {
 	Status   string
 	ReportMD string
 	Findings []JobFindingSubmission
+	// RefusedOutputs are the worker-side drops, deduped and bounded by the handler.
+	RefusedOutputs []JobRefusedOutput
 }
 
 // SubmitJobResult persists a job run's result for the worker that holds it. The run row is locked
@@ -60,6 +72,13 @@ type JobResultSubmission struct {
 // unreleased, not terminal) and then the result is upserted, the run's earlier findings deleted
 // and the new ones inserted, all in ONE transaction: a retried POST replaces the earlier body and
 // a failure part-way leaves the earlier result untouched.
+//
+// The generation_pending markers and the outputs the worker reported dropping are recorded in the
+// same transaction. After the commit
+// the server stores the result's report.md and findings.json as output files (startJobResultOutputs;
+// its comment has the lock order and the bounds: those writes run OUTSIDE this transaction, on a
+// context detached from the request, and the reply waits for them at most a few seconds). They never
+// fail the ingest.
 //
 // Errors: ErrRunNotFound (not held by this worker), ErrNotJobRun, ErrStaleClaim (generation
 // mismatch or released claim), ErrRunTerminal.
@@ -112,7 +131,41 @@ func (s *Service) SubmitJobResult(ctx context.Context, wkr store.Worker, runID u
 			return err
 		}
 	}
-	return tx.Commit(ctx)
+	// The generation_pending markers of the files the server will generate, and the outputs the
+	// worker reported dropping, are recorded here, in the result transaction, so neither depends on
+	// the detached generation below (fenced on the claim generation in the statement itself; the
+	// worker drops are bounded by the per-run output file cap, the markers are not: they carry the
+	// post id and do not count against it). The markers make a generation that never finishes
+	// (crash, kill) visible instead of silent: see RefusalGenerationPending.
+	var postID int64
+	if s.jobFiles != nil {
+		// Drawn after the run row lock above, so this run's posts take ascending ids in commit order.
+		if postID, err = qtx.NextJobOutputPostID(ctx); err != nil {
+			return err
+		}
+		if err = s.jobFiles.markGenerationPending(ctx, qtx, runID, claimGeneration, postID, sub); err != nil {
+			return err
+		}
+		for i, r := range sub.RefusedOutputs {
+			if i >= s.jobFiles.limits.OutputsMaxFiles {
+				break
+			}
+			if _, err = qtx.InsertJobOutputRefusal(ctx, store.InsertJobOutputRefusalParams{
+				RunID: runID, DisplayName: r.DisplayName, Reason: r.Reason,
+				ClaimGeneration: claimGeneration, MaxRows: int64(s.jobFiles.limits.OutputsMaxFiles),
+			}); err != nil {
+				return err
+			}
+		}
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return err
+	}
+	if s.genPostHook != nil {
+		s.genPostHook(sub)
+	}
+	s.startJobResultOutputs(ctx, wkr, run, claimGeneration, postID, sub)
+	return nil
 }
 
 // CheckJobResultTarget is the cheap pre-body check of the job-result route: the run must be held

@@ -346,6 +346,7 @@ var wantRouteMounts = []routeMount{
 	// /cli-tokens sibling) ride the same credential-surface limiter, each in its own
 	// (pattern, user) bucket.
 	{"GET", "/api/admin/products", limAuth},
+	{"GET", "/api/admin/products/{id}/skills", limAuth},
 	{"GET", "/api/admin/product-tokens", limAuth},
 	// PRD #66 M9 (D8): the admin cross-user blocked-repos list reads the STORED
 	// privilege_report (no forge call) → noLimiter.
@@ -515,12 +516,19 @@ var wantRouteMounts = []routeMount{
 	// (routes_v1.go), so it keys on the caller's user, not the token: minting more tokens
 	// buys no budget.
 	{"GET", "/api/v1/whoami", limV1},
+	// PRD #1909 M2: the input-file upload rides only the subtree's per-user v1Limiter; the byte
+	// quotas (workersvc.JobFiles.Reserve) bound what a caller can store.
+	{"POST", "/api/v1/files", limV1},
+	// PRD #1909 M5: the job-file reads (the listing above and the download) ride only the subtree's
+	// per-user v1Limiter, like the other jobs:read routes.
+	{"GET", "/api/v1/files/{id}", limV1},
 	// PRD #1908 M5: the jobs endpoints. Every /api/v1 route inherits v1Limiter from the
 	// subtree's r.Use; the create additionally rides authLimiter per user (D-B).
 	{"GET", "/api/v1/jobs", limV1},
 	{"POST", "/api/v1/jobs", limAuthAndV1},
 	{"GET", "/api/v1/jobs/{id}", limV1},
 	{"POST", "/api/v1/jobs/{id}/cancel", limV1},
+	{"GET", "/api/v1/jobs/{id}/files", limV1},
 	{"GET", "/api/v1/jobs/{id}/messages", limV1},
 	{"GET", "/api/v1/jobs/{id}/result", limV1},
 	{"GET", "/api/vault/status", noLimiter},
@@ -603,6 +611,8 @@ var wantRouteMounts = []routeMount{
 	// PRD #1907 M4: register a product and admin-revoke one product token (D8) —
 	// cookie-only admin DB writes, no forge call → noLimiter.
 	{"POST", "/api/admin/products", noLimiter},
+	{"POST", "/api/admin/products/{id}/skills/apply", noLimiter},
+	{"POST", "/api/admin/products/{id}/skills/sync", noLimiter},
 	{"POST", "/api/admin/product-tokens/{id}/revoke", noLimiter},
 	// PRD #1184 M3: the admin "All users" FILE issue write — files a coordinate's newest open
 	// occurrence through the owner filer's forge path (claim-first → CreateIssue → settle). A
@@ -828,6 +838,10 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/task-review", noLimiter},
 	// PRD #1908: the job runner's structured result POST, worker-authenticated and unlimited like task-review.
 	{"POST", "/api/worker/runs/{id}/job-result", noLimiter},
+	// PRD #1909 M3: the worker input-file download, worker-authenticated and unlimited like job-result.
+	{"GET", "/api/worker/runs/{id}/files/{fileID}", noLimiter},
+	// PRD #1909 M4: the worker output-file upload, worker-authenticated and unlimited like the download above (bounded by the upload slots).
+	{"POST", "/api/worker/runs/{id}/files", noLimiter},
 	{"POST", "/api/worker/runs/{id}/state", noLimiter},
 	// PRD #362 M1: the run-lane executor posts its intent/plan summaries back. Worker
 	// writes scoped to the worker's own run, no forge call → noLimiter. Bounded by the

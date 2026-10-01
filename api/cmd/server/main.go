@@ -333,6 +333,7 @@ func run() error {
 		WorkerBackgroundGrace:       cfg.WorkerBackgroundGrace,
 		SkillMaxBytes:               cfg.SkillMaxBytes,
 		SkillsMaxPerRun:             cfg.SkillsMaxPerRun,
+		ProductSkillsEnabled:        len(cfg.ProductSkillsAllowedBaseURLs) > 0,
 		ChatIdleTimeout:             cfg.ChatIdleTimeout,
 		ChatMaxTurns:                cfg.ChatMaxTurns,
 		WorkerChatIdleTimeout:       cfg.WorkerChatIdleTimeout,
@@ -373,6 +374,28 @@ func run() error {
 		// pass enqueues (UZI_SALVAGE_FORGES). Empty is off; it gates only the enqueue.
 		SalvageForges: cfg.SalvageForges,
 	})
+
+	// Job files (PRD #1909 M1): the bounded, sealed file store the /api/v1 upload and the worker
+	// transfer routes reach through wsvc.JobFiles(), and the job_files_sweep pass below. The
+	// request deadline is the recovery archive's: both are one bounded upload transaction.
+	// The upload write slots are clamped to half the actual pool (ClampWriteSlots): each streaming
+	// upload holds a pooled connection, and store.OpenPool sets no pool_max_conns, so the pgx
+	// default (max(4, NumCPU)) can equal the fixed slot count.
+	jobFiles := workersvc.NewJobFiles(pool, box, workersvc.ClampWriteSlots(pool.Config().MaxConns, workersvc.JobFileLimits{
+		InputFileMaxBytes:      cfg.JobInputFileMaxBytes,
+		InputsMaxFiles:         cfg.JobInputsMaxFiles,
+		InputsMaxBytes:         cfg.JobInputsMaxBytes,
+		OutputFileMaxBytes:     cfg.JobOutputFileMaxBytes,
+		OutputsMaxFiles:        cfg.JobOutputsMaxFiles,
+		OutputsMaxBytes:        cfg.JobOutputsMaxBytes,
+		PerOwnerBytes:          cfg.JobFilesPerOwnerBytes,
+		InstanceBytes:          cfg.JobFilesInstanceBytes,
+		StoredFilesBudgetBytes: cfg.StoredFilesBudgetBytes,
+		Retention:              cfg.JobFilesRetention,
+		UploadTTL:              cfg.JobUploadTTL,
+		RequestDeadline:        cfg.RecoveryRequestDeadline,
+	}), nil)
+	wsvc.SetJobFiles(jobFiles)
 
 	// Plan-approval gatekeeper (PRD #25 M4): handles the Slack Approve / Reject /
 	// Reject-without-reason buttons. It rides workersvc's ownership-checked
@@ -852,6 +875,14 @@ func run() error {
 		sweeper.Pass{
 			Name: "fetch_reservations_stale",
 			Run:  fetchctl.New(pool, settingsCache).SweepStale,
+		},
+		// Job files (PRD #1909 M1): release stale reservations, move a finished job's files to
+		// 'available' with the retention clock, and expire unattached/available files past
+		// expires_at (chunks deleted, row kept). Always registered: with no job files it is three
+		// statements matching nothing.
+		sweeper.Pass{
+			Name: "job_files_sweep",
+			Run:  jobFiles.SweepPass,
 		},
 	)
 	// Admin-health loop-beat: the run-liveness sweeper is one of the four loops (PRD #1484
@@ -1498,6 +1529,23 @@ func run() error {
 		go drain(tlsSrv)
 	}
 	drainWG.Wait()
+	// Generated job outputs (report.md, findings.json) are stored by detached goroutines after the
+	// ingest reply. ORDER: after the HTTP drain above (no request can start one any more, so the
+	// service's WaitGroup sees no new Add) and BEFORE the deferred pool.Close (they store through
+	// the pool). The service refuses new ones from here on (recorded generation_shutdown) and this
+	// waits for the running ones for 15 s; it then cancels their service-owned context, which ends
+	// the storage work they are blocked in (pool acquire, lock wait, queries), and waits 2 s more
+	// for them to return. So the worst case is 17 s, not the 60 s storage deadline: a generation
+	// holding a pooled connection does not make the deferred pool.Close wait that long. Budget: the
+	// HTTP drain above is up to 10 s, so 10 s + 17 s stays inside the default 30 s Kubernetes
+	// termination grace (the chart sets none). A generation that does not return even then (stuck
+	// outside a context-aware call) is left behind, and is not lost silently: SubmitJobResult
+	// committed a generation_pending refusal row for each generated file with the result, and only
+	// storing the file (or recording its failure) removes it, so an abandoned one (this bound, a
+	// SIGKILL, a crash) stays visible as generation_pending.
+	if !wsvc.DrainGeneratedOutputs() {
+		slog.Warn("shutdown: generated job outputs still in flight at the drain deadline")
+	}
 	stop() // cancel ctx so the poller + sweeper + reconciler Run return (covers the server-error path too)
 	bgWG.Wait()
 	// The HTTP server has drained, so no new inline Notify can be fired; wait for

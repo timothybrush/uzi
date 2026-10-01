@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/toolprofile"
 )
@@ -18,6 +19,22 @@ type ClaimJob struct {
 	Title  string          `json:"title"`
 	Prompt string          `json:"prompt"`
 	Inputs []ClaimJobInput `json:"inputs"`
+	// Files is the manifest of the job's attached binary/text input files (PRD #1909 D8), always
+	// present ([] when none), in (created_at, id) order. The worker downloads each through
+	// GET /api/worker/runs/{id}/files/{fileID} and verifies its sha256.
+	Files []ClaimJobFile `json:"files"`
+}
+
+// ClaimJobFile is one attached input file of a job. Name is the storage name
+// (`<sha256>.<ext>`, the on-disk name under inputs/); DisplayName is the uploader's label and is
+// UNTRUSTED text.
+type ClaimJobFile struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name"`
+	Size        int64  `json:"size"`
+	SHA256      string `json:"sha256"`
+	ContentType string `json:"content_type"`
 }
 
 // ClaimJobInput is one named input document of a job.
@@ -40,7 +57,8 @@ func jobCredentialErr(err error) error {
 }
 
 // assembleJobClaim builds the claim payload for an already-claimed kind='job' run (PRD #1908).
-// A job has no repo, no forge connection, no memory and no skills, so it forks in assembleClaim
+// A job has no repo, no forge connection and no memory, and carries no skill but its product's
+// approved ones (none for a uzc_ job), so it forks in assembleClaim
 // BEFORE GetRunClaimContext (which INNER-JOINs repos) and before any PAT decrypt: the payload
 // carries the model credential, the job block and the wall budget, and nothing else. The
 // credential resolves through the SAME ladder the ordinary Claude run lane uses (a per-run
@@ -61,6 +79,14 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 	// bumped the claim generation, so an older flight cannot write one back after this.
 	if err := s.q.ClearJobResultForRun(ctx, run.ID); err != nil {
 		return nil, fmt.Errorf("clear earlier job result: %w", err)
+	}
+	// The same for the earlier flight's OUTPUT files and refusal rows (PRD #1909 M4): they belong
+	// to the flight that uploaded them, and the new flight uploads its own. The generation bump
+	// fences a late upload of the old flight (StoreJobOutput re-checks it after its write).
+	if s.jobFiles != nil {
+		if err := s.jobFiles.ClearRunOutputs(ctx, run.ID); err != nil {
+			return nil, fmt.Errorf("clear earlier job outputs: %w", err)
+		}
 	}
 	choice, err := s.claimSecretID(ctx, wkr, run)
 	if err != nil {
@@ -85,10 +111,39 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 		Title:  run.IssueTitle,
 		Prompt: run.IssueDescription,
 		Inputs: make([]ClaimJobInput, 0, len(inputs)),
+		Files:  make([]ClaimJobFile, 0),
 	}
 	for _, in := range inputs {
 		job.Inputs = append(job.Inputs, ClaimJobInput{Name: in.Name, Content: in.ContentMd})
 	}
+	files, err := s.q.ListJobInputFilesForClaim(ctx, pgconv.UUID(run.ID))
+	if err != nil {
+		return nil, fmt.Errorf("list job input files: %w", err)
+	}
+	for _, f := range files {
+		job.Files = append(job.Files, ClaimJobFile{
+			ID:          f.ID.String(),
+			Name:        f.StorageName.String,
+			DisplayName: f.DisplayName,
+			Size:        f.ByteSize,
+			SHA256:      f.Sha256.String,
+			ContentType: f.ContentType.String,
+		})
+	}
+
+	// Product skills (PRD #1909 D9): a job started through a registered product gets exactly that
+	// product's approved skills and no other skill; a uzc_ job has no origin product and gets none.
+	// Re-read on every claim, so a reapply or a disabled product takes effect on the next claim.
+	// An empty UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS turns the feature off: applied skills stay in
+	// the database but none is delivered (and the read is skipped).
+	var productRows []store.ListProductSkillsForRunRow
+	if s.p.ProductSkillsEnabled {
+		productRows, err = s.q.ListProductSkillsForRun(ctx, run.ID)
+		if err != nil {
+			return nil, fmt.Errorf("list product skills: %w", err)
+		}
+	}
+	skills, skillDrops := assembleProductSkills(productRows, s.p.SkillMaxBytes, s.p.SkillsMaxPerRun)
 
 	// The owner's Claude model lane, then a frozen per-run model when it is compatible. Best
 	// effort: a lookup error logs and the runner uses its own default, it never fails the claim.
@@ -108,6 +163,27 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 
 	wall := coalesceInt(run.BudgetWallSeconds, int(s.p.RunTimeout.Seconds()))
 	wall32 := int32(wall) //nolint:gosec // G115: a clamped wall budget, at most budgetWallCeilingSeconds
+	cfg := ClaimConfig{
+		RunTimeoutSeconds:      wall,
+		IdleTimeoutSeconds:     int(s.p.RunIdleTimeout.Seconds()),
+		MaxIterations:          s.p.RunMaxIterations,
+		PlanMaxRevisions:       s.p.PlanMaxRevisions,
+		QuestionMax:            s.p.QuestionMax,
+		QuestionTimeoutSeconds: s.p.QuestionTimeoutSeconds,
+		DefaultModel:           defaultModel,
+		DefaultEffort:          resolveEffortPtr(defaultEffort),
+		ToolPackages:           []string{},
+		DeniedToolPackages:     toolprofile.DenylistNames(),
+		// The skill caps the worker re-enforces over the product skills this claim carries.
+		SkillMaxBytes:   s.p.SkillMaxBytes,
+		SkillsMaxPerRun: s.p.SkillsMaxPerRun,
+	}
+	if s.jobFiles != nil {
+		l := s.jobFiles.Limits()
+		cfg.JobInputFileMaxBytes = l.InputFileMaxBytes
+		cfg.JobInputsMaxFiles = l.InputsMaxFiles
+		cfg.JobInputsMaxBytes = l.InputsMaxBytes
+	}
 	return &ClaimPayload{
 		RunID:             run.ID.String(),
 		Kind:              run.Kind,
@@ -122,19 +198,8 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 		RequeueCount:      run.RequeueCount,
 		Secrets:           ClaimSecrets{AnthropicOAuthToken: string(cred.Token)},
 		Agents:            []ClaimAgent{},
-		Skills:            []ClaimSkill{},
-		SkillsDropped:     []ClaimSkillDrop{},
-		Config: ClaimConfig{
-			RunTimeoutSeconds:      wall,
-			IdleTimeoutSeconds:     int(s.p.RunIdleTimeout.Seconds()),
-			MaxIterations:          s.p.RunMaxIterations,
-			PlanMaxRevisions:       s.p.PlanMaxRevisions,
-			QuestionMax:            s.p.QuestionMax,
-			QuestionTimeoutSeconds: s.p.QuestionTimeoutSeconds,
-			DefaultModel:           defaultModel,
-			DefaultEffort:          resolveEffortPtr(defaultEffort),
-			ToolPackages:           []string{},
-			DeniedToolPackages:     toolprofile.DenylistNames(),
-		},
+		Skills:            skills,
+		SkillsDropped:     skillDrops,
+		Config:            cfg,
 	}, nil
 }

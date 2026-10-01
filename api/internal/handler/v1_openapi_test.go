@@ -60,8 +60,9 @@ type oaMedia struct {
 }
 
 type oaResponse struct {
-	Ref     string             `yaml:"$ref"`
-	Content map[string]oaMedia `yaml:"content"`
+	Ref     string               `yaml:"$ref"`
+	Content map[string]oaMedia   `yaml:"content"`
+	Headers map[string]yaml.Node `yaml:"headers"`
 }
 
 type oaRequestBody struct {
@@ -233,10 +234,18 @@ func TestV1OpenAPIRouteParity(t *testing.T) {
 // v1OpShape names, per operation, the success status, the Go DTO its response serializes and,
 // for a body-carrying operation, the Go request type. Every spec operation must be listed: a new
 // endpoint states its DTOs here and the schema check below binds the two.
+//
+// A multipart operation (POST /files) names no Go request type: its requestBody must be a required
+// multipart/form-data object with a binary `file` property, and its response DTO is matched like
+// any other.
 type v1OpShape struct {
-	status  string
-	dto     reflect.Type
-	request reflect.Type
+	status    string
+	dto       reflect.Type
+	request   reflect.Type
+	multipart bool
+	// binary: the success response is a raw byte stream (application/octet-stream, format binary),
+	// not JSON, and dto is nil. GET /files/{id}.
+	binary bool
 }
 
 var v1OperationShapes = map[string]v1OpShape{
@@ -247,6 +256,9 @@ var v1OperationShapes = map[string]v1OpShape{
 	"GET /api/v1/jobs/{id}/result":   {status: "200", dto: reflect.TypeFor[apitypes.V1JobResultDTO]()},
 	"GET /api/v1/jobs/{id}/messages": {status: "200", dto: reflect.TypeFor[apitypes.V1JobMessagesDTO]()},
 	"POST /api/v1/jobs/{id}/cancel":  {status: "200", dto: reflect.TypeFor[apitypes.V1JobDTO]()},
+	"POST /api/v1/files":             {status: "201", dto: reflect.TypeFor[apitypes.V1FileDTO](), multipart: true},
+	"GET /api/v1/jobs/{id}/files":    {status: "200", dto: reflect.TypeFor[apitypes.V1JobFilesDTO]()},
+	"GET /api/v1/files/{id}":         {status: "200", binary: true},
 }
 
 // TestV1OpenAPISchemasMatchDTOs (PRD #1907 M3, extended by PRD #1908 M5): each operation's
@@ -270,6 +282,13 @@ func TestV1OpenAPISchemasMatchDTOs(t *testing.T) {
 			t.Errorf("%s documents no %s response", key, shape.status)
 			continue
 		}
+		if shape.binary {
+			v1CheckBinaryResponse(t, spec, key, shape.status, resp)
+			if op.RequestBody != nil {
+				t.Errorf("%s documents a requestBody but is a plain download", key)
+			}
+			continue
+		}
 		media, ok := resp.Content["application/json"]
 		if !ok || media.Schema == nil {
 			t.Errorf("%s: %s has no application/json schema", key, shape.status)
@@ -277,6 +296,10 @@ func TestV1OpenAPISchemasMatchDTOs(t *testing.T) {
 		}
 		(&oaChecker{t: t, spec: spec}).match(key+" "+shape.status, media.Schema, shape.dto)
 
+		if shape.multipart {
+			v1CheckMultipartBody(t, spec, key, op)
+			continue
+		}
 		if shape.request == nil {
 			if op.RequestBody != nil {
 				t.Errorf("%s documents a requestBody but v1OperationShapes names no request type", key)
@@ -302,6 +325,53 @@ func TestV1OpenAPISchemasMatchDTOs(t *testing.T) {
 	}
 	if got := whoami.Properties["scopes"].Items.Enum; !slices.Equal(got, producttoken.Scopes) {
 		t.Errorf("Whoami scopes enum = %v, want producttoken.Scopes %v", got, producttoken.Scopes)
+	}
+}
+
+// v1CheckBinaryResponse: a download's success response offers ONLY application/octet-stream with a
+// binary string schema, and declares the headers that keep it from being rendered.
+func v1CheckBinaryResponse(t *testing.T, spec oaSpec, key, status string, resp oaResponse) {
+	t.Helper()
+	if len(resp.Content) != 1 {
+		t.Errorf("%s %s offers %d media types, want only application/octet-stream", key, status, len(resp.Content))
+	}
+	media, ok := resp.Content["application/octet-stream"]
+	if !ok || media.Schema == nil {
+		t.Errorf("%s %s has no application/octet-stream schema", key, status)
+		return
+	}
+	body := (&oaChecker{t: t, spec: spec}).resolve(key+" "+status, media.Schema)
+	if body.Type.Value != "string" || body.Format != "binary" {
+		t.Errorf("%s %s: the schema must be a string of format binary, got type %q format %q", key, status, body.Type.Value, body.Format)
+	}
+	for _, h := range []string{"Content-Disposition", "X-Content-Type-Options"} {
+		if _, ok := resp.Headers[h]; !ok {
+			t.Errorf("%s %s does not document the %s header", key, status, h)
+		}
+	}
+}
+
+// v1CheckMultipartBody: a multipart operation's requestBody is required, offers ONLY
+// multipart/form-data, and describes a `file` property that is a required binary string.
+func v1CheckMultipartBody(t *testing.T, spec oaSpec, key string, op oaOperation) {
+	t.Helper()
+	if op.RequestBody == nil || !op.RequestBody.Required {
+		t.Errorf("%s: a multipart operation needs a required requestBody", key)
+		return
+	}
+	if len(op.RequestBody.Content) != 1 {
+		t.Errorf("%s: requestBody offers %d media types, want only multipart/form-data", key, len(op.RequestBody.Content))
+	}
+	media, ok := op.RequestBody.Content["multipart/form-data"]
+	if !ok || media.Schema == nil {
+		t.Errorf("%s: requestBody has no multipart/form-data schema", key)
+		return
+	}
+	c := &oaChecker{t: t, spec: spec}
+	body := c.resolve(key+" request", media.Schema)
+	file := body.Properties["file"]
+	if file == nil || file.Format != "binary" || !slices.Contains(body.Required, "file") {
+		t.Errorf("%s: the multipart schema must require a `file` property of format binary", key)
 	}
 }
 
@@ -332,6 +402,13 @@ func TestV1OpenAPIEnumsMatchGo(t *testing.T) {
 		{"JobFinding", "severity", sevs},
 		// The kinds ListJobMessagesForCaller selects (queries/jobs.sql).
 		{"JobMessage", "type", []string{"text", "status", "error"}},
+		// The file states a caller can observe; 'reserved' is internal (never returned).
+		{"File", "state", []string{workersvc.JobFileUnattached, workersvc.JobFileAttached, workersvc.JobFileAvailable, workersvc.JobFileExpired}},
+		// A job's file is committed and run-bound: attached, available or expired (never
+		// unattached or reserved), an input or an output.
+		{"JobFile", "state", []string{workersvc.JobFileAttached, workersvc.JobFileAvailable, workersvc.JobFileExpired}},
+		{"JobFile", "direction", []string{"input", "output"}},
+		{"JobSource", "verdict", []string{"allowed", "refused"}},
 	} {
 		got := enumOf(c.schema, c.prop)
 		if c.prop == "severity" {

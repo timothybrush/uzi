@@ -46,7 +46,13 @@ type v1JobsEnv struct {
 
 func newV1JobsEnv(t *testing.T, jobCap int) *v1JobsEnv {
 	t.Helper()
-	h, pool := v1LiveDB(t)
+	return newV1JobsEnvMax(t, jobCap, 0)
+}
+
+// newV1JobsEnvMax is newV1JobsEnv over a pool capped at maxConns (0 = pgx's default).
+func newV1JobsEnvMax(t *testing.T, jobCap int, maxConns int32) *v1JobsEnv {
+	t.Helper()
+	h, pool := v1LiveDBMax(t, maxConns)
 	if jobCap > 0 {
 		h.wsvc.SetHealthSettings(v1JobCapFake{cap: jobCap})
 	}
@@ -175,7 +181,12 @@ func TestV1JobsAuthAndScopeLiveDB(t *testing.T) {
 		{"GET", "/api/v1/jobs/" + id, "", producttoken.ScopeJobsRead},
 		{"GET", "/api/v1/jobs/" + id + "/result", "", producttoken.ScopeJobsRead},
 		{"GET", "/api/v1/jobs/" + id + "/messages", "", producttoken.ScopeJobsRead},
+		// PRD #1909 M5: the job-file reads need jobs:read.
+		{"GET", "/api/v1/jobs/" + id + "/files", "", producttoken.ScopeJobsRead},
+		{"GET", "/api/v1/files/" + uuid.NewString(), "", producttoken.ScopeJobsRead},
 		{"POST", "/api/v1/jobs/" + id + "/cancel", "", producttoken.ScopeJobsRun},
+		// PRD #1909 M2: the upload needs jobs:run. Its scope check runs before the body is read.
+		{"POST", "/api/v1/files", "", producttoken.ScopeJobsRun},
 	}
 	const unauthorized = "{\"error\":\"invalid token\"}\n"
 	for _, rt := range routes {

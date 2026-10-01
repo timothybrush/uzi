@@ -81,6 +81,8 @@ paths:
           $ref: "#/components/responses/Unprocessable"
         "429":
           $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     get:
       operationId: listJobs
       summary: List jobs
@@ -228,6 +230,170 @@ paths:
           $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
+  /jobs/{id}/files:
+    get:
+      operationId: listJobFiles
+      summary: List a job's files
+      description: >-
+        The files of one job: the input files attached to it and the output files it
+        produced, with their metadata, and refused_files, the outputs that were not stored
+        (over a quota or not an allowed type) while the job still completed. Download the
+        bytes of a file with GET /files/{id}. An output carries source_url only when its
+        SHA-256 equals the SHA-256 of a fetch the fetch service recorded as allowed in this
+        same job; nothing the agent claims about a file's origin is used. Needs the
+        jobs:read scope. A job the caller cannot see is 404.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: The job's files and refused outputs.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobFiles"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+  /files:
+    post:
+      operationId: uploadFile
+      summary: Upload an input file
+      description: >-
+        Stores one file for use as a job input. Send multipart/form-data with the
+        file in a part named file, and declare its exact size in the X-Uzi-File-Size
+        header (required: the server reserves exactly that many bytes before it reads
+        the body, and refuses an upload whose bytes differ). A sha256 in
+        X-Uzi-File-Sha256 is verified against the bytes when given. Needs the jobs:run
+        scope. The type is detected from the bytes and must agree with the part's
+        Content-Type and the file name's extension: PDF, PNG, JPEG, DOCX and XLSX
+        (the ZIP-based Office formats need their type or extension declared), and
+        UTF-8 text (text/plain, text/markdown, text/csv, application/json; JSON must
+        parse). Anything else is refused with reason unsupported_file_type. The file
+        is stored under a name derived from its content, never from the uploader's;
+        display_name is the uploader's file name reduced to its last path component
+        and stripped of control and invisible characters. The file starts unattached
+        and expires after UZI_JOB_UPLOAD_TTL (default 1 hour) unless a job create
+        references it in input_file_ids. Only the user, and for a product token only
+        the product, that uploaded a file can attach it, to one job.
+      parameters:
+        - name: X-Uzi-File-Size
+          in: header
+          required: true
+          description: The file's exact size in bytes.
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - name: X-Uzi-File-Sha256
+          in: header
+          required: false
+          description: The file's SHA-256 as 64 lowercase hexadecimal characters.
+          schema:
+            type: string
+            pattern: "^[0-9a-f]{64}$"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: The file. Only the first part with this name is read.
+      responses:
+        "201":
+          description: The stored file, in state unattached.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/File"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "507":
+          $ref: "#/components/responses/InsufficientStorage"
+  /files/{id}:
+    get:
+      operationId: downloadFile
+      summary: Download a file
+      description: >-
+        The file's bytes. Every response is sent as an attachment with
+        Content-Type: application/octet-stream and X-Content-Type-Options: nosniff,
+        whatever the file's type, so it is never rendered in a browser; the filename in
+        Content-Disposition is the content-derived storage name (the SHA-256 and an
+        extension), never the uploader's name. The file's own type is in the metadata
+        (content_type). Treat the bytes as untrusted data. Needs the jobs:read scope. Only
+        the user that owns the file can read it, and a product token only files of its own
+        product's jobs (or its own unattached uploads): a file the caller cannot see is 404,
+        the same as an unknown one. An expired file is 410.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The file id.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The file's bytes.
+          headers:
+            Content-Disposition:
+              description: attachment; filename="<sha256>.<ext>".
+              schema:
+                type: string
+            X-Content-Type-Options:
+              description: Always nosniff.
+              schema:
+                type: string
+                enum:
+                  - nosniff
+            Content-Length:
+              description: The file's size in bytes.
+              schema:
+                type: integer
+                format: int64
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "410":
+          $ref: "#/components/responses/Gone"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 components:
   securitySchemes:
     bearerAuth:
@@ -257,8 +423,8 @@ components:
             $ref: "#/components/schemas/Error"
     NotFound:
       description: >-
-        No such job, or a job the caller cannot see: another user's job, another
-        product's job and a malformed id all answer the same (reason not_found).
+        No such job or file, or one the caller cannot see: another user's, another
+        product's and a malformed id all answer the same (reason not_found).
       content:
         application/json:
           schema:
@@ -269,8 +435,73 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    Gone:
+      description: The file has expired and its bytes are gone (reason file_expired).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     PayloadTooLarge:
-      description: The request body is over the size limit (reason payload_too_large).
+      description: >-
+        The request is over a size limit. Reason payload_too_large: the request body is
+        over the size limit. On POST /files, reason file_too_large: the declared file
+        size is over the per-file cap (UZI_JOB_INPUT_FILE_MAX_BYTES). On POST /jobs,
+        reason too_many_files (more input_file_ids than UZI_JOB_INPUTS_MAX_FILES) or
+        job_bytes_exceeded (the attached files total more than
+        UZI_JOB_INPUTS_MAX_BYTES).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    UnsupportedMediaType:
+      description: >-
+        The file's bytes are not a supported type, or disagree with the type its
+        Content-Type or file name declares (reason unsupported_file_type). The message
+        names the specific refusal, and for an unrecognised extension lists the allowed
+        ones.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    BadRequest:
+      description: >-
+        POST /files: the request body ended or broke before the file was read, for
+        example the client disconnected (reason invalid_request).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RequestTimeout:
+      description: >-
+        POST /files: the body was not fully received within the upload deadline, so a
+        stalled upload is cut off (reason request_timeout). The deadline is at least
+        UZI_RECOVERY_REQUEST_DEADLINE (120 seconds by default) and grows with the declared
+        file size at 100 KiB/s (256 seconds for a 25 MiB file), and it never exceeds 10
+        minutes (or UZI_RECOVERY_REQUEST_DEADLINE itself when that is set higher).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ServiceUnavailable:
+      description: >-
+        This deployment has no file store configured (reason files_unavailable, on
+        POST /files and on POST /jobs with input_file_ids), or, on POST /files, too many
+        uploads are streaming at once, process-wide or for this user (reason
+        uploads_busy; retry after the number of seconds in the Retry-After header).
+      headers:
+        Retry-After:
+          description: "Present with reason uploads_busy: the seconds to wait before retrying."
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    InsufficientStorage:
+      description: >-
+        The stored-file quota is full: the user's own, the instance's, or the budget
+        shared with recovery archives (reason storage_quota_exceeded). Retry after
+        stored files expire.
       content:
         application/json:
           schema:
@@ -281,7 +512,10 @@ components:
         malformed or invalid body or query parameter; the message names the field),
         unknown_job_type, not_supported (egress_profile is reserved and refused for
         now) or no_model_credential (the user has no usable Anthropic credential in
-        uzi).
+        uzi). On POST /files, also empty_file, size_mismatch (the streamed size is not
+        X-Uzi-File-Size) and sha256_mismatch. On POST /jobs, also file_unavailable (an
+        input_file_ids entry is unknown, belongs to another user or product, is already
+        attached, has expired, or is listed twice).
       content:
         application/json:
           schema:
@@ -404,6 +638,18 @@ components:
             starting with a letter or digit, unique within the job.
           items:
             $ref: "#/components/schemas/JobInput"
+        input_file_ids:
+          type:
+            - array
+            - "null"
+          description: >-
+            Ids of files uploaded with POST /files, attached to the job as input files.
+            At most 10 (UZI_JOB_INPUTS_MAX_FILES), each listed once, together at most
+            50 MiB (UZI_JOB_INPUTS_MAX_BYTES). Each must be unattached, unexpired and
+            uploaded by the same user and, for a product token, the same product.
+          items:
+            type: string
+            format: uuid
         requested_by_label:
           type:
             - string
@@ -539,6 +785,9 @@ components:
         - status
         - report_md
         - findings
+        - sources
+        - files
+        - refused_files
       properties:
         status:
           type: string
@@ -550,6 +799,163 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/JobFinding"
+        sources:
+          type: array
+          description: >-
+            The job's source log: every fetch the fetch service recorded for this job,
+            allowed or refused, oldest first (at most the first 500). Empty for a job that
+            fetched nothing.
+          items:
+            $ref: "#/components/schemas/JobSource"
+        files:
+          type: array
+          description: The job's input and output files, as GET /jobs/{id}/files lists them.
+          items:
+            $ref: "#/components/schemas/JobFile"
+        refused_files:
+          type: array
+          description: The outputs that were not stored, and why.
+          items:
+            $ref: "#/components/schemas/JobRefusedFile"
+    JobFiles:
+      type: object
+      required:
+        - files
+        - refused_files
+      properties:
+        files:
+          type: array
+          items:
+            $ref: "#/components/schemas/JobFile"
+        refused_files:
+          type: array
+          items:
+            $ref: "#/components/schemas/JobRefusedFile"
+    JobFile:
+      type: object
+      required:
+        - id
+        - display_name
+        - content_type
+        - byte_size
+        - sha256
+        - direction
+        - state
+        - expires_at
+        - source_url
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Download the bytes with GET /files/{id}.
+        display_name:
+          type: string
+          description: >-
+            A file name, reduced to its last path component with control and invisible
+            characters removed. Untrusted text: render it inert.
+        content_type:
+          type: string
+          description: >-
+            The type detected from the bytes. May be an empty string for an expired file, whose
+            bytes are gone: the stored row does not guarantee a retained identity once expired.
+        byte_size:
+          type: integer
+          format: int64
+        sha256:
+          type: string
+          description: >-
+            The SHA-256 of the file's bytes, lowercase hexadecimal. May be an empty string for an
+            expired file, whose bytes are gone: the stored row does not guarantee a retained
+            identity once expired.
+        direction:
+          type: string
+          enum:
+            - input
+            - output
+        state:
+          type: string
+          description: attached (the job has not finished), available or expired.
+          enum:
+            - attached
+            - available
+            - expired
+        expires_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+          description: >-
+            When the file expires. Null while it is attached to a job that has not
+            finished.
+        source_url:
+          type:
+            - string
+            - "null"
+          description: >-
+            For an output, the URL it was fetched from, when its SHA-256 equals that of a
+            fetch the fetch service recorded as allowed in this same job. Null otherwise,
+            always for an input. Untrusted text taken from the site's redirects; render it
+            inert.
+    JobRefusedFile:
+      type: object
+      required:
+        - display_name
+        - byte_size
+        - reason
+      properties:
+        display_name:
+          type: string
+          description: Untrusted text, render it inert.
+        byte_size:
+          type: integer
+          format: int64
+        reason:
+          type: string
+          description: >-
+            Why the output was not stored, for example a quota or an unsupported type. A
+            reason of generation_pending means a generated file (report.md or
+            findings.json) is still being stored.
+    JobSource:
+      type: object
+      required:
+        - url
+        - final_url
+        - verdict
+        - reason
+        - http_status
+        - content_type
+        - byte_size
+        - sha256
+        - fetched_at
+      properties:
+        url:
+          type: string
+          description: The URL the agent asked to fetch. Untrusted text.
+        final_url:
+          type: string
+          description: The URL after redirects; empty when the fetch did not get that far.
+        verdict:
+          type: string
+          enum:
+            - allowed
+            - refused
+        reason:
+          type: string
+          description: Why a fetch was refused; empty when it was allowed.
+        http_status:
+          type: integer
+          description: The HTTP status the site answered with; 0 when there was none.
+        content_type:
+          type: string
+        byte_size:
+          type: integer
+          format: int64
+        sha256:
+          type: string
+          description: The SHA-256 of the fetched bytes, lowercase hexadecimal; empty for a refused fetch.
+        fetched_at:
+          type: string
+          format: date-time
     JobFinding:
       type: object
       required:
@@ -611,3 +1017,51 @@ components:
             - error
         text:
           type: string
+    File:
+      type: object
+      required:
+        - id
+        - display_name
+        - storage_name
+        - content_type
+        - byte_size
+        - sha256
+        - state
+        - expires_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        display_name:
+          type: string
+          description: >-
+            The uploader's file name reduced to its last path component, with control
+            and invisible characters removed. Untrusted text: render it inert.
+        storage_name:
+          type: string
+          description: The content-derived name, the file's sha256 and a type extension.
+        content_type:
+          type: string
+          description: The type detected from the bytes.
+        byte_size:
+          type: integer
+          format: int64
+        sha256:
+          type: string
+          description: The SHA-256 of the file's bytes, lowercase hexadecimal.
+        state:
+          type: string
+          description: unattached, attached, available or expired.
+          enum:
+            - unattached
+            - attached
+            - available
+            - expired
+        expires_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+          description: >-
+            When the file expires. Null while it is attached to a job that has not
+            finished.

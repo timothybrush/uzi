@@ -1,4 +1,4 @@
-import type { Readable } from "node:stream";
+import { Readable } from "node:stream";
 import type { Logger } from "./log.js";
 import {
   WORKER_API_PREFIX,
@@ -67,6 +67,8 @@ import {
   type RecoveryReserveRequest,
   type RecoveryReserveResponse,
   type RecoveryUploadManifest,
+  type JobFileUploadMeta,
+  type JobFileUploadResponse,
   type RecoveryCaptureStatusResponse,
   type RecoveryReleaseResponse,
   type RecoveryReleaseRequest,
@@ -76,7 +78,15 @@ import {
   type RecoverySettleResponse,
 } from "./protocol.js";
 
-/** Error carrying the server's HTTP status + (truncated) body for retry logic. */
+/** A job input file download hit its per-file timeout (WorkerClient#downloadJobFile), before or
+ *  after the response headers. Distinct from a torn stream so the job reports a timeout. */
+export class JobFileTimeoutError extends Error {
+  constructor(timeoutMs: number, options?: { cause?: unknown }) {
+    super(`download timed out after ${timeoutMs} ms`, options);
+    this.name = "JobFileTimeoutError";
+  }
+}
+
 /** Issue #1673: an /inputs/ack or /inputs/applied reply. `reason` says why an inactive claim is
  *  inactive: switch_pending (keep polling), released or stale (end the old flight). */
 export interface InputReceipt {
@@ -85,12 +95,15 @@ export interface InputReceipt {
   reason?: string;
 }
 
+/** Error carrying the server's HTTP status + (truncated) body for retry logic. */
 export class RequestError extends Error {
   constructor(
     readonly method: string,
     readonly path: string,
     readonly status: number,
     readonly body: string,
+    /** The response's `Retry-After` in milliseconds, when it carried whole seconds. */
+    readonly retryAfterHeaderMs?: number,
   ) {
     super(`${method} ${path} returned ${status}: ${body}`);
     this.name = "RequestError";
@@ -149,6 +162,11 @@ export class PrDescriptionConflict extends RequestError {
 /** Upper bound on {@link PrDescriptionRateLimited.retryAfterMs}: a caller that sleeps on it
  *  must not be parked for hours (or on Infinity) by a hostile or broken `Retry-After`. */
 const PR_DESC_MAX_RETRY_AFTER_MS = 60_000;
+
+/** Bound on one whole job-input download (PRD #1909): the api caps a file at 25 MiB by default. */
+const JOB_FILE_DOWNLOAD_TIMEOUT_MS = 300_000;
+/** Default per-request timeout of an output-file upload (the runner passes a size-scaled one). */
+const JOB_FILE_UPLOAD_TIMEOUT_MS = 300_000;
 
 /** HTTP 429 from a pr-description route. Only the stage route carries its own limiter (the
  *  per-worker bucket it shares with proposals and findings), but a 429 on any of the four routes
@@ -1618,6 +1636,94 @@ export class WorkerClient {
     await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/job-result`, body);
   }
 
+  /** Download one attached input file of a job (GET /worker/runs/{id}/files/{fileID}, PRD #1909
+   *  D8), streaming the body to `sink` without buffering the file. `claimGeneration` is the job
+   *  flight's generation (the api fences on it). `sink` must consume the stream to its end (the
+   *  writer verifies the bytes itself against the claim manifest); a body cut short by a server
+   *  abort rejects the stream, so a truncated 200 never reads as complete. If `sink` throws, the
+   *  response body is destroyed so the socket is released at once. `signal` aborts the request or
+   *  the body in flight; `timeoutMs` bounds the whole download (default JOB_FILE_DOWNLOAD_TIMEOUT_MS).
+   *  Throws RequestError on non-2xx. */
+  async downloadJobFile(
+    runId: string,
+    fileId: string,
+    claimGeneration: number,
+    sink: (body: Readable) => Promise<void>,
+    signal?: AbortSignal,
+    timeoutMs: number = JOB_FILE_DOWNLOAD_TIMEOUT_MS,
+  ): Promise<void> {
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/files/${encodeURIComponent(fileId)}?claim_generation=${encodeURIComponent(String(claimGeneration))}`;
+    const timeout = AbortSignal.timeout(timeoutMs);
+    let res: Response;
+    try {
+      res = await fetch(this.baseUrl + path, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${this.token}`, "X-Client-Version": this.version },
+        signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+      });
+    } catch (err) {
+      if (timeout.aborted && !signal?.aborted) throw new JobFileTimeoutError(timeoutMs, { cause: err });
+      throw err;
+    }
+    if (res.status !== 200) throw await this.toError("GET", path, res);
+    if (!res.body) throw new Error("job file download returned no body");
+    const body = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream<Uint8Array>);
+    try {
+      await sink(body);
+    } catch (err) {
+      // The per-file timeout errors the body mid-stream, which a sink reports as a torn stream;
+      // name the timeout instead. (Not when the caller's own signal fired: that is its own reason.)
+      if (timeout.aborted && !signal?.aborted) throw new JobFileTimeoutError(timeoutMs, { cause: err });
+      throw err;
+    } finally {
+      // Release the socket whether the sink finished or threw (a no-op on a fully read body).
+      body.destroy();
+    }
+  }
+
+  /** Upload one output file of a job (POST /worker/runs/{id}/files, PRD #1909 M4): the raw bytes
+   *  are the body and the metadata rides the `X-Uzi-Job-File` header as compact JSON (the
+   *  X-Uzi-Recovery-Manifest pattern; non-ASCII is escaped as a JSON unicode sequence so the header stays a valid header
+   *  value). `body` is a Buffer (the report and findings, already in memory) or a FACTORY for a
+   *  Readable, called once per attempt so a retry re-reads the file instead of reusing a spent
+   *  stream: a file is never buffered whole. ONE attempt per call (the caller retries, see
+   *  job-outputs.ts); `timeoutMs` bounds the whole request and `signal` aborts it. Resolves with
+   *  the api's status (201 stored, 200 the retry of an already stored file) and the file. Throws
+   *  RequestError on non-2xx (its body is a bounded read): 409 stale claim or finished run, 413
+   *  limit, 415 type, 422 integrity, 503 busy or unavailable, 507 quota. */
+  async uploadJobFile(
+    runId: string,
+    meta: JobFileUploadMeta,
+    body: Buffer | (() => Readable | Promise<Readable>),
+    signal?: AbortSignal,
+    timeoutMs: number = JOB_FILE_UPLOAD_TIMEOUT_MS,
+  ): Promise<{ status: number; file: JobFileUploadResponse }> {
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/files`;
+    // JSON.stringify leaves non-ASCII as is, which fetch refuses in a header value: escape every
+    // character outside printable ASCII (the JSON unicode escape decodes to the same string).
+    const header = JSON.stringify(meta).replace(/[^\x20-\x7e]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+    const init: RequestInit & { duplex?: "half" } = {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.token}`,
+        "X-Client-Version": this.version,
+        "Content-Type": "application/octet-stream",
+        "X-Uzi-Job-File": header,
+      },
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
+    };
+    if (typeof body === "function") {
+      init.body = Readable.toWeb(await body()) as unknown as ReadableStream;
+      init.duplex = "half";
+    } else {
+      init.body = new Uint8Array(body);
+    }
+    const res = await fetch(this.baseUrl + path, init);
+    if (res.status !== 200 && res.status !== 201) throw await this.toError("POST", path, res);
+    const text = await res.text();
+    return { status: res.status, file: JSON.parse(text) as JobFileUploadResponse };
+  }
+
   /** Create a PENDING issue proposal on a chat run (POST /worker/runs/:id/proposals).
    *  NEVER writes the forge — the browser confirm does. Returns the created proposal. */
   async createProposal(runId: string, body: CreateProposalRequest): Promise<WorkerProposal> {
@@ -2226,12 +2332,44 @@ export class WorkerClient {
   private async toError(method: string, path: string, res: Response): Promise<RequestError> {
     let text = "";
     try {
-      text = (await res.text()).slice(0, 4096).trim();
+      text = (await readBoundedText(res, ERROR_BODY_MAX_BYTES)).slice(0, 4096).trim();
     } catch {
       // ignore body read failures — the status is the signal that matters.
     }
-    return new RequestError(method, path, res.status, text);
+    return new RequestError(method, path, res.status, text, retryAfterMsOf(res.headers.get("Retry-After")));
   }
+}
+
+/** A `Retry-After` header of whole seconds as milliseconds (capped at one hour); anything else
+ *  (an HTTP date, junk, absent) is undefined, and the caller keeps its own backoff. */
+function retryAfterMsOf(h: string | null): number | undefined {
+  if (h === null || !/^\d{1,6}$/.test(h.trim())) return undefined;
+  return Math.min(Number(h.trim()), 3600) * 1000;
+}
+
+/** Most bytes of an error response body toError reads. */
+const ERROR_BODY_MAX_BYTES = 4096;
+
+/** Read at most `maxBytes` of `res`'s body as UTF-8 text, then cancel the stream so a hostile or
+ *  unending body neither fills memory nor holds the connection. A body that ends sooner is read
+ *  whole, so a small body yields exactly what Response#text() would. A read failure rejects. */
+async function readBoundedText(res: Response, maxBytes: number): Promise<string> {
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      parts.push(value.length > maxBytes - total ? value.subarray(0, maxBytes - total) : value);
+      total += parts[parts.length - 1]!.length;
+    }
+  } finally {
+    // Release the connection whether the body ended, hit the cap, or failed (a no-op once ended).
+    await reader.cancel().catch(() => undefined);
+  }
+  return new TextDecoder().decode(Buffer.concat(parts));
 }
 
 /**

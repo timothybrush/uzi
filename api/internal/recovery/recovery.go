@@ -63,6 +63,7 @@ type Store interface {
 	ListCapturesForRunOwner(ctx context.Context, arg store.ListCapturesForRunOwnerParams) ([]store.RecoveryCapture, error)
 	GetRecoverySummaryForRun(ctx context.Context, arg store.GetRecoverySummaryForRunParams) (store.GetRecoverySummaryForRunRow, error)
 	MarkCaptureState(ctx context.Context, arg store.MarkCaptureStateParams) (store.RecoveryCapture, error)
+	MarkCaptureFailed(ctx context.Context, arg store.MarkCaptureFailedParams) (store.RecoveryCapture, error)
 	DiscardCaptureForOwner(ctx context.Context, arg store.DiscardCaptureForOwnerParams) (int64, error)
 	// PRD #1349 M1 (D3): the worker-facing post-clone hold inventory read.
 	ListCustodyHoldsForWorkerRun(ctx context.Context, arg store.ListCustodyHoldsForWorkerRunParams) ([]store.ListCustodyHoldsForWorkerRunRow, error)
@@ -103,6 +104,11 @@ type Limits struct {
 	// onto the store param (GetCustodyAggregateForOwnerParams.CustodyHoldLimit) with no lossy
 	// conversion; the owner DTO widens it to int.
 	CustodyHoldLimit int32
+	// StoredFilesBudgetBytes is the shared stored-file budget (UZI_STORED_FILES_BUDGET_BYTES, PRD
+	// #1909 D2): job-file bytes plus recovery-archive bytes, reservations included. Upload admission
+	// counts job files against it (reclaiming them when that alone frees enough) and refuses the
+	// capture only when it still would not fit. A non-positive value disables the shared check.
+	StoredFilesBudgetBytes int64
 	// UploadRetryWindow is the durable-archive upload-retry window (UZI_RECOVERY_UPLOAD_RETRY_WINDOW).
 	// The upload handler itself is single-request (it never loops on this bound); the window
 	// governs the PERIODIC stalled→needs_action transition run by the workersvc sweep

@@ -30,6 +30,12 @@ through `[0.52.0]`.)
   Only non-Docker workers advertising the new `job_runner_v1` capability claim jobs, and, for users who opted in to ephemeral workers, an ephemeral worker is provisioned for a queued job; otherwise the job waits queued for a capable worker and counts toward the active-job cap. If a job's bound ephemeral worker registers without the capability, or never registers, the job fails with `no_job_capable_worker` or `ephemeral_worker_never_registered` instead of waiting. Deploy the api and the chart's worker image tag together: an older worker image never claims jobs. Hosted Kubernetes acceptance of jobs is not yet done.
 - **`uzi job create|get|result|cancel|list` and job rows in the web app ([#1908](https://github.com/vtmocanu/uzi/issues/1908)).**
   The CLI drives the jobs API with your CLI token (`--prompt` or `--prompt-file`, repeatable `--input name=@file`, `--budget-seconds`), and `uzi admin products` gains a `JOB_TYPES` column. Job runs appear in the runs lists, the run page shows a job result panel (report and findings), and Admin > Products has a checkbox per allowed job type. See [CLI](docs/cli.md#uzi-job-repo-less-jobs).
+- **Jobs take input files and return output files, with sources ([#1909](https://github.com/vtmocanu/uzi/issues/1909)).**
+  `POST /api/v1/files` uploads an input (PDF, PNG, JPEG, DOCX, XLSX, text, Markdown, CSV or JSON, checked by content; the client declares the size in `X-Uzi-File-Size`), and `input_file_ids` on `POST /api/v1/jobs` attaches up to 10 files (50 MiB). The worker verifies each file's sha256 before the job runs. A job's outputs (its report, findings and files it chose to keep) are stored with it; an output over a cap or quota is refused and listed, and the job still completes. `GET /api/v1/jobs/{id}/files` lists them, `GET /api/v1/files/{id}` downloads one as an attachment, and the job result gains `files`, `refused_files` and `sources`, where an output's `source_url` is set only when its hash matches a page the same job fetched. `sources` stays empty until jobs run on the official-sources lane (#1906). Files are kept 7 days after the job ends (`UZI_JOB_FILES_RETENTION`). New CLI verbs: `uzi job files`, `uzi job file get`, `uzi job create --file`. See [Jobs](docs/jobs.md).
+- **Product skill sets ([#1909](https://github.com/vtmocanu/uzi/issues/1909)).**
+  An admin can point a product at a skills repo (under `UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS`, https only; empty keeps the feature off) with an optional write-only clone token, sync it, review the staged diff and approve it under Admin > Products. Only that product's jobs receive its approved skills; they get no user, global or builtin skills, and no other run ever sees a product skill. `uzi admin products skills <product>` shows the state. See [Skills](docs/skills.md#product-skills).
+- **New jobs need workers advertising `job_files_v1`: roll the api and the worker image together ([#1909](https://github.com/vtmocanu/uzi/issues/1909)).**
+  A job created after this upgrade is claimed only by a worker that advertises `job_files_v1`, so an older worker never runs it without its files and skills; jobs created before the upgrade are still claimable by older workers.
 
 ### Changed
 
@@ -38,8 +44,23 @@ through `[0.52.0]`.)
   Default 120 requests per minute per user across all of `/api/v1`. It replaces the sign-in budget (`RATE_LIMIT_MAX`, 10 per minute) that #1907 mounted there, which a product polling job status would exhaust at once. `POST /api/v1/jobs` still also counts against `RATE_LIMIT_MAX`, since a create is the spend action. See [Configuration](docs/configuration.md).
 - **A `check:api-v1-compat` gate refuses breaking changes to `api/openapi/v1.yaml` ([#1908](https://github.com/vtmocanu/uzi/issues/1908)).**
   It runs an oasdiff comparison against the base in `gate:repo`, enforcing the additive-only promise in [Product tokens](docs/product-tokens.md).
+- **Run recovery archives and job files share one stored-file budget ([#1909](https://github.com/vtmocanu/uzi/issues/1909)).**
+  `UZI_STORED_FILES_BUDGET_BYTES` (default 4 GiB) caps job files plus recovery archives together; keep it below the database volume (job files are sealed chunks in Postgres: `database.simple.storage.size`, or `postgres.cluster.storage.size` with the CNPG cluster; compose `pgdata`). A recovery capture counts job-file bytes and, if needed, reclaims expired and then the oldest finished-job files (never files of a live job) before refusing with 507. See [Run recovery](docs/run-recovery.md).
+- **Agent-source sync refuses a repo whose tip is too large once unpacked ([#1909](https://github.com/vtmocanu/uzi/issues/1909)).**
+  The clone now checks the pack's unpacked size before decoding it: a single file over 64 MiB or a tip over 512 MiB fails the sync with an error naming the limit, where before only the 48 MiB download cap applied. See [Agent source](docs/agent-source.md).
 
 ### Fixed
+
+- **Large job inputs keep their download allowance ([#1909](https://github.com/vtmocanu/uzi/issues/1909)).**
+  Worker downloads use the same bounded size-based write deadline as caller downloads, instead of the server's 15-second default.
+- **An empty re-posted job report removes the earlier report file ([#1909](https://github.com/vtmocanu/uzi/issues/1909)).**
+  The current result controls report.md; cleanup is fenced by its post and claim generation, including an earlier writer that finishes late.
+
+- **Job output uploads cannot follow swapped directory links ([#1909](https://github.com/vtmocanu/uzi/issues/1909)).**
+  The worker pins each directory and reads one file handle for hashing and upload; unsafe paths are refused and listed.
+
+- **Queue generated job files while write slots are busy ([#1909](https://github.com/vtmocanu/uzi/issues/1909)).**
+  Report and findings files wait in a bounded queue; shutdown cancels the first admitted write and marks waiting files explicitly.
 
 - **A run's finished outcome whose report failed no longer waits for a worker restart when the run left no messages behind ([#1512](https://github.com/vtmocanu/uzi/issues/1512)).**
   A worker now re-sends every journaled terminal outcome (completed or failed) on each successful heartbeat, not only after a run's spilled messages drain, so a run that finished or hit a fatal 401 during an outage, with nothing spilled, is reported once the api is reachable instead of stranding until boot or re-claim. Sends are single-flight per outcome, skip a run still live on the worker and an outcome the failing-run hook is holding, and a terminal-only run (including a blocked one) now appears in the worker's fleet outbox depth.
