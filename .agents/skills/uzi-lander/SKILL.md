@@ -361,9 +361,23 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    (`git worktree list`, then `git worktree remove` / `git branch -D`), purge the completed
    trail with `S/claims.sh release '#PR' --purge`, then run
    `S/claims.sh reap --repo OWNER/REPO` (drops merged/closed claims and orphans of dead
-   sessions), and hand any still-open item on. A run's off-task findings ("a finding was
-   filed" in its plan or log) are uzi incidental findings, not forge issues: list them with
-   `uzi findings list --run RUN --bucket all` before reporting them anywhere.
+   sessions), and hand any still-open item on.
+
+   **The run's follow-up issue.** A run's findings (off-task bugs, and review notes the lead
+   deferred) are uzi incidental findings, not forge issues. After the merge, list the ones
+   still to triage: `uzi findings list --run RUN --bucket to_file`. None: nothing to do.
+   - Verify each against the merged code. `uzi findings resolve ID` what the merge fixed;
+     `uzi findings dismiss ID --reason not-an-issue` a false positive, `--reason wont-do`
+     valid work deliberately declined.
+   - The rest becomes one issue. Get the buddy's `APPROVE` of its membership and its exact
+     title and body. `uzi findings file ID ID...` files the server-generated text (one id
+     files alone): preview it in the Findings page's file dialog (select the run's rows),
+     which is also where to edit it before filing.
+   - Filing is the human gate: file only with the user's go-ahead, given now or earlier in
+     the session for this follow-up. The buddy's approval never substitutes for it.
+   - A set over the grouped-filing limit (50) goes to the user for a decision; never split or
+     truncate it silently.
+   - Label the issue `reviewed` and name it in the trail.
 
 ## Always yours, whichever review lane applies
 
