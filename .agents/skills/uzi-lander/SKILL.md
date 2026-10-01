@@ -315,7 +315,10 @@ changes it); trust it over a handover's claim.
    A conflict on `CHANGELOG.md` alone is auto-resolved as a union (`changelog-union.sh`),
    unless a bullet appears on both sides of a hunk (a shared `### X` under `[Unreleased]` is
    fine), a hunk holds a `## ` heading, or a side rewords a line: then it refuses and the
-   stop is exit 5. Duplicate `###` headings under `[Unreleased]` get their own collapse commit.
+   stop is exit 5. When the base cut a release that folded `[Unreleased]` (the fold is proven from the
+   three index stages), it instead keeps the base and inserts only the branch's new bullet blocks under
+   their `###` headings; an edited or deleted ancestor bullet, an unproven fold or a duplicate refuses.
+   Duplicate `###` headings under `[Unreleased]` get their own collapse commit.
    Union and collapse keep every existing blank line; only their own joins follow `[Unreleased]`'s convention.
    Exit 5 = any other conflict, worktree left mid-rebase: resolve (a union of both sides is
    usual for a shared list), `git -c merge.conflictStyle=diff3 rebase --continue` (a later
@@ -337,6 +340,8 @@ changes it); trust it over a handover's claim.
    them; `--allow-changelog-removals` only for a deliberate reword. Exit 10 = a uzi-owned
    branch changes workflow files: split the edit out (*Always yours*);
    `--allow-workflow-edit` only when no uzi push to the branch can follow.
+   Exit 11 = the branch's new `CHANGELOG.md` bullets are misplaced (a conflict-free rebase filed them
+   under a released section after a fold) or missing after the rebase: restore under `[Unreleased]`, `--skip-rebase`.
    A push re-enters the chosen review lane in step 2. Trail `rebase+renumber → pushed`.
    Say what you resolved in the merge note; do not ask first.
 6. **Merge.** When the readiness poll says ready and the *Always yours* checks below have
