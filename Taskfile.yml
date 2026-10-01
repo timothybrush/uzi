@@ -316,6 +316,7 @@ tasks:
       # Hermetic extraction and ordered package-rule regression for the three
       # golangci aliases and the outer Go-toolchain group. No registry lookup.
       - task: test:renovate-go-toolchain
+      - task: test:renovate-codex-runtime
       # Hermetic bot-provisioning regressions (issues #2010 and #2016): fake glab,
       # no network, covering host selection, JSON, PAT headers and safe diagnostics.
       - task: test:create-gitlab-bot
@@ -959,6 +960,11 @@ tasks:
     desc: hermetic extraction and grouping contract for Go-toolchain Renovate updates
     cmds:
       - node ./scripts/renovate-go-toolchain.test.mjs
+
+  test:renovate-codex-runtime:
+    desc: hermetic Codex pin extraction, grouping and partial-update rejection
+    cmds:
+      - node ./scripts/renovate-codex-runtime.test.mjs
 
   test:create-gitlab-bot:
     desc: hermetic bot-provisioning contract for create-gitlab-bot.sh (fake glab, no network), tally-guarded
