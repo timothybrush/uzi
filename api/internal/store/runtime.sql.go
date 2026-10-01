@@ -8001,7 +8001,7 @@ func (q *Queries) ListRunCredentialEpochs(ctx context.Context, arg ListRunCreden
 }
 
 const listRunLeadToolWindow = `-- name: ListRunLeadToolWindow :many
-SELECT seq, kind, payload
+SELECT seq, kind, payload, created_at
 FROM run_messages
 WHERE run_id = $1 AND agent_instance IS NULL
   AND (kind IN ('tool_use', 'tool_result')
@@ -8016,9 +8016,10 @@ type ListRunLeadToolWindowParams struct {
 }
 
 type ListRunLeadToolWindowRow struct {
-	Seq     int32  `json:"seq"`
-	Kind    string `json:"kind"`
-	Payload []byte `json:"payload"`
+	Seq       int32              `json:"seq"`
+	Kind      string             `json:"kind"`
+	Payload   []byte             `json:"payload"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
 // The tail of a running run's LEAD lane for in-flight detection only (Decision 9,
@@ -8031,7 +8032,8 @@ type ListRunLeadToolWindowRow struct {
 // stop its scan at the start of the current claim/query leg and never count an
 // orphaned call from an earlier leg as in flight. Loop detection keeps reading
 // ListRunToolWindow unchanged. The Go side re-checks kind and payload event
-// itself rather than trusting this filter alone.
+// itself rather than trusting this filter alone. created_at is the server receive
+// time, used to age the oldest open call (issue #2046).
 func (q *Queries) ListRunLeadToolWindow(ctx context.Context, arg ListRunLeadToolWindowParams) ([]ListRunLeadToolWindowRow, error) {
 	rows, err := q.db.Query(ctx, listRunLeadToolWindow, arg.RunID, arg.Lim)
 	if err != nil {
@@ -8041,7 +8043,12 @@ func (q *Queries) ListRunLeadToolWindow(ctx context.Context, arg ListRunLeadTool
 	items := []ListRunLeadToolWindowRow{}
 	for rows.Next() {
 		var i ListRunLeadToolWindowRow
-		if err := rows.Scan(&i.Seq, &i.Kind, &i.Payload); err != nil {
+		if err := rows.Scan(
+			&i.Seq,
+			&i.Kind,
+			&i.Payload,
+			&i.CreatedAt,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
