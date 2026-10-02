@@ -42,12 +42,19 @@ func TestEphemeralLeasePlacementProtocolMirrorLiveDB(t *testing.T) {
 		placed bool
 	}{
 		{"without codex_harness_v1 is not a placement", []string{}, false},
-		{"with codex_harness_v1 is a placement", []string{"codex_harness_v1"}, true},
+		{"without codex_runtime_v2 is not a placement", []string{"codex_harness_v1"}, false},
+		{"with codex_harness_v1 is a placement", []string{"codex_harness_v1", "codex_runtime_v2"}, true},
 	} {
 		t.Run("a leased worker "+tc.name+" for a Codex run", func(t *testing.T) {
 			fx, run := seed(t, 190, tc.protos, false)
 			if got := listedUnplaceable(fx, 1000, iv); got[run] == tc.placed {
 				t.Fatalf("gap trigger: listed %v; run %s provisioned-for = %v, want %v", got, run, got[run], !tc.placed)
+			}
+			// With no persistent worker, the leased worker alone decides the saturation trigger's
+			// "a capable worker exists" arm: one that cannot claim the run must not make it read as
+			// capable-but-full (that run is the gap trigger's), and one that can has a free slot.
+			if got := listedSaturation(fx, 1000, iv); got[run] {
+				t.Fatalf("saturation trigger without a persistent worker: listed %v; run %s must not be listed", got, run)
 			}
 			want := int64(0)
 			if tc.placed {
@@ -94,8 +101,8 @@ func TestEphemeralLeasePlacementProtocolMirrorLiveDB(t *testing.T) {
 		protos []string
 		placed bool
 	}{
-		{"without codex_custom_model_v1", []string{"codex_harness_v1"}, false},
-		{"with codex_custom_model_v1", []string{"codex_harness_v1", "codex_custom_model_v1"}, true},
+		{"without codex_custom_model_v1", []string{"codex_harness_v1", "codex_runtime_v2"}, false},
+		{"with codex_custom_model_v1", []string{"codex_harness_v1", "codex_runtime_v2", "codex_custom_model_v1"}, true},
 	} {
 		t.Run("a leased worker "+tc.name+" and a Codex run on a custom-model lane", func(t *testing.T) {
 			fx, run := seed(t, 192, tc.protos, false)

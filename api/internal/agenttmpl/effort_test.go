@@ -2,6 +2,17 @@ package agenttmpl
 
 import "testing"
 
+func TestResolveDefaultCodexEffort(t *testing.T) {
+	if got := ResolveDefaultCodexEffort(nil); got != "medium" {
+		t.Fatalf("NULL Codex effort = %q, want medium", got)
+	}
+	for input, want := range map[string]string{"": "medium", " \t ": "medium", "low": "low", " xhigh ": "xhigh", "max": "max"} {
+		if got := ResolveDefaultCodexEffort(&input); got != want {
+			t.Errorf("ResolveDefaultCodexEffort(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
 func TestValidateEffort(t *testing.T) {
 	// Blank / whitespace-only means inherit: no error, empty result.
 	for _, in := range []string{"", "   ", "\t"} {
@@ -48,10 +59,10 @@ func TestValidateEffort(t *testing.T) {
 }
 
 // TestUziDefaultEffort pins uzi's effective default reasoning effort (issue #1157)
-// to xhigh — the level an inheriting owner rides in place of the SDK's own `high`.
+// to medium for an inheriting owner.
 func TestUziDefaultEffort(t *testing.T) {
-	if UziDefaultEffort != "xhigh" {
-		t.Errorf("UziDefaultEffort = %q, want \"xhigh\"", UziDefaultEffort)
+	if got := ResolveDefaultEffort(nil); got != "medium" {
+		t.Errorf("ResolveDefaultEffort(nil) = %q, want \"medium\"", got)
 	}
 }
 

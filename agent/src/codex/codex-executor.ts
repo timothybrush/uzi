@@ -173,7 +173,7 @@ import {
  * here. The `wireApi` is pinned to `"responses"` downstream in `launcher.ts`
  * (buildCodexConfigToml), and the binary/supervisor/PATH are already fixed there too.
  *
- * `model:"gpt-6-astra"` is the FALLBACK DEFAULT model, used only when a claim carries no
+ * `model:"gpt-6.1-sol"` is the FALLBACK DEFAULT model, used only when a claim carries no
  * server-resolved `default_model`. The effective per-run model is the api-resolved,
  * harness-validated `ctx.config.default_model` (owner default or PRD #300 schedule freeze) when
  * present — see `buildRunRequest`. The fake localhost provider stays ONLY in the non-exported
@@ -183,13 +183,13 @@ export const CODEX_PRODUCTION_PROVIDER: CodexProviderConfig = {
   name: "openai",
   baseUrl: "https://api.openai.com/v1",
   envKey: "OPENAI_API_KEY",
-  model: "gpt-6-astra",
+  model: "gpt-6.1-sol",
 };
 
 // PRD #1551 (M2, D5): the built-in Codex task-review model, re-exported here beside the
 // production provider for locality. It lives in the leaf module `task-review-model.ts` so
 // `review-runner.ts` reads it without a runtime import of this heavy module (it references
-// this module type-only). The shared provider default above stays `gpt-6-astra`; only
+// this module type-only). The shared provider default above stays `gpt-6.1-sol`; only
 // Codex task review uses `CODEX_TASK_REVIEW_MODEL`.
 export { CODEX_TASK_REVIEW_MODEL } from "./task-review-model.js";
 
@@ -3378,7 +3378,7 @@ export class CodexExecutor implements Executor {
           input: [{ type: "text", text: spec.taskInput }],
         };
         if (spec.model !== undefined) turnParams.model = spec.model;
-        if (spec.effort !== undefined) turnParams.modelReasoningEffort = spec.effort;
+        if (spec.effort !== undefined) turnParams.effort = spec.effort;
         const turnRes = await harness.requestOnTransport<{ turn?: { id?: string } }>("turn/start", turnParams, { signal: spec.signal });
         const id = turnRes?.turn?.id;
         if (typeof id !== "string" || id.length === 0) throw new Error("codex child turn/start returned no turn id");
@@ -4220,9 +4220,7 @@ async function defaultLaunchProviderRoot(
   return { root, transport, supervisorPid: handle.supervisorPid ?? -1 };
 }
 
-/** The uzi effort contract value (subset), or undefined. Codex m3 carries none on the claim
- *  config yet, so this is undefined today; the seam exists so m5 can resolve a per-run
- *  effort without reshaping the request builder. */
-function codexEffort(_ctx: RunContext): HarnessEffort | undefined {
-  return undefined;
+/** The server-resolved per-harness effort travels on the existing claim field. */
+function codexEffort(ctx: RunContext): HarnessEffort | undefined {
+  return ctx.config?.default_effort;
 }

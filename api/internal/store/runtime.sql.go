@@ -802,7 +802,7 @@ WITH target AS (
       -- @worker_protocol_caps param the completion clause reads (the claimant's stored
       -- workers.protocol_capabilities, passed by the Go caller).
       AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
-           OR 'codex_harness_v1' = ANY($11::text[]))
+           OR ('codex_harness_v1' = ANY($11::text[]) AND 'codex_runtime_v2' = ANY($11::text[])))
       -- Interlocked Codex turns require the newer completion loop, independently of overrides.
       AND (r.completion_contract_version IS NULL
            OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
@@ -1021,7 +1021,7 @@ WITH target AS (
                 -- the peer's OWN workers.protocol_capabilities column directly (no Go param, unlike the
                 -- claimant's @worker_protocol_caps).
                 AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
-                     OR 'codex_harness_v1' = ANY(p.protocol_capabilities))
+                     OR ('codex_harness_v1' = ANY(p.protocol_capabilities) AND 'codex_runtime_v2' = ANY(p.protocol_capabilities)))
                 AND (r.completion_contract_version IS NULL
                      OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                      OR 'codex_completion_interlock_v1' = ANY(p.protocol_capabilities))
@@ -1910,7 +1910,7 @@ WHERE run.id = $1
   AND (run.completion_contract_version IS NULL
        OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
   AND (NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
-       OR 'codex_harness_v1' = ANY(w.protocol_capabilities))
+       OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
   AND (run.completion_contract_version IS NULL
        OR NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
        OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
@@ -2076,6 +2076,7 @@ WHERE w.user_id = $1
   AND NOT w.isolated_lane
   AND 'completion_interlock_v1' = ANY(w.protocol_capabilities)
   AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
+  AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)
   AND 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities)
   AND (NOT $2::boolean OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities))
 `
@@ -2131,6 +2132,28 @@ func (q *Queries) CountOnlineWorkersSatisfyingCodexHarness(ctx context.Context, 
 	return count, err
 }
 
+const countOnlineWorkersSatisfyingCodexRuntime = `-- name: CountOnlineWorkersSatisfyingCodexRuntime :one
+SELECT count(*) FROM workers w
+WHERE w.user_id = $1
+  AND w.status = 'online'
+  AND w.draining_since IS NULL
+  AND NOT w.ephemeral
+  -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
+  -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
+  -- claims an unbound run, so it is never a satisfier here.
+  AND NOT w.isolated_lane
+  AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
+  AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)
+`
+
+// Current Codex baseline for the worker-roll queued reason.
+func (q *Queries) CountOnlineWorkersSatisfyingCodexRuntime(ctx context.Context, userID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingCodexRuntime, userID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countOnlineWorkersSatisfyingCustomCodex = `-- name: CountOnlineWorkersSatisfyingCustomCodex :one
 SELECT count(*) FROM workers w
 WHERE w.user_id = $1
@@ -2142,11 +2165,12 @@ WHERE w.user_id = $1
   -- claims an unbound run, so it is never a satisfier here.
   AND NOT w.isolated_lane
   AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
+  AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)
   AND 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
 `
 
 // PRD #1551 M4 (D6): how many of a user's ONLINE, non-draining, non-ephemeral workers self-report
-// BOTH the 'codex_harness_v1' AND 'codex_custom_model_v1' PROTOCOL capabilities. This is the
+// the harness, current runtime and custom-model PROTOCOL capabilities. This is the
 // custom-Codex-model analogue of CountOnlineWorkersSatisfyingCodexHarness: it answers "does the
 // fleet have ANY worker that can execute a CUSTOM Codex root model?", NOT "can THIS run be claimed
 // right now?". It drives the queued-reason resolver's custom-Codex rung (reasonNoCustomCodexCapable
@@ -9007,7 +9031,7 @@ WHERE r.status = 'queued'
                  AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
-                      OR 'codex_harness_v1' = ANY(w.protocol_capabilities))
+                      OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
                  AND (r.completion_contract_version IS NULL
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
@@ -9052,7 +9076,7 @@ WHERE r.status = 'queued'
                  AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
-                      OR 'codex_harness_v1' = ANY(w.protocol_capabilities))
+                      OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
                  AND (r.completion_contract_version IS NULL
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
@@ -9249,7 +9273,7 @@ WHERE r.status = 'queued'
                  AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
-                      OR 'codex_harness_v1' = ANY(w.protocol_capabilities))
+                      OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
                  AND (r.completion_contract_version IS NULL
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))

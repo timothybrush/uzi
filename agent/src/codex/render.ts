@@ -83,7 +83,7 @@ const FORGE_TOOL_NAMES = forgeToolNames();
 /** The initial product model picker (ADR :266). Deliberately narrower than the
  *  server catalog; an out-of-picker model is dropped with a diagnostic — EXCEPT the
  *  run root sourced from the server worker default (PRD #1551), see {@link resolveModel}. */
-const CONTRACT_MODELS: ReadonlySet<string> = new Set(["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol"]);
+const CONTRACT_MODELS: ReadonlySet<string> = new Set(["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol"]);
 
 /** The byte ceiling on a custom worker-root model ID. MIRRORS the API validator's
  *  `MaxModelLen` (api/internal/agenttmpl/model.go) so a value the API accepted on the
@@ -127,7 +127,7 @@ function isValidCustomModelId(model: string): boolean {
   return !UNSAFE_MODEL_CHAR_RE.test(model);
 }
 
-/** uzi's effort contract, mapped 1:1 to Codex `modelReasoningEffort` (ADR :267).
+/** uzi's effort contract, sent as Codex turn/start `effort` (ADR :267).
  *  Provider-only values (`ultra`, `persistent`) are NOT in the uzi contract. */
 const CONTRACT_EFFORTS: ReadonlySet<string> = new Set(["low", "medium", "high", "xhigh", "max"]);
 
@@ -157,8 +157,8 @@ export interface CodexRenderDiagnostic {
   readonly name: string;
 }
 
-/** A resolved model + reasoning effort. `modelReasoningEffort` is the uzi effort
- *  mapped 1:1 to the Codex field name; both are absent when dropped/unset. */
+/** A resolved model + reasoning effort. `modelReasoningEffort` is an internal
+ *  uzi field, sent as turn/start `effort`; both are absent when dropped/unset. */
 export interface ResolvedCodexModel {
   readonly model?: string;
   readonly modelReasoningEffort?: HarnessEffort;
@@ -331,7 +331,7 @@ function resolveModel(
   return undefined;
 }
 
-/** Validate an effort against the uzi contract (1:1 to Codex modelReasoningEffort);
+/** Validate an effort against the uzi contract (sent as Codex turn/start effort);
  *  an out-of-contract value is dropped (undefined) with an `unknown_effort`
  *  diagnostic. Absent ⇒ absent, no diagnostic. */
 function resolveEffort(

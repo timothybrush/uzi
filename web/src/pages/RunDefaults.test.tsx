@@ -333,6 +333,52 @@ describe("Run defaults — per-user summary model (PRD #362 M2)", () => {
 });
 
 describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
+  it("retains a stored Codex effort but hides its control when Codex is unavailable", async () => {
+    mockApi.getMySettings.mockResolvedValue({ settings: {
+      default_harness: null, default_model: null, default_effort: null, default_codex_effort: "max",
+      judge_model: null, summary_model: null, appearance_mode: null, light_theme: null,
+      dark_theme: null, typeface: null, theme: null,
+    } });
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    await screen.findByLabelText("Claude effort");
+    expect(screen.queryByLabelText("Codex effort")).toBeNull();
+    expect(screen.queryByText("Save Codex effort")).toBeNull();
+    expect(mockApi.putMySettings).not.toHaveBeenCalled();
+  });
+  it("saves and clears Codex effort without sending or resetting the Claude choice", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [{
+      id: "codex-effort-fixture", kind: "openai_api_key", label: "Codex fixture",
+      is_default: true, enabled: true, disabled_at: null, auto_eligible: false,
+      created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+    }] });
+    mockApi.getMySettings.mockResolvedValue({ settings: {
+      default_harness: null, default_model: null, default_effort: "high", default_codex_effort: "low",
+      judge_model: null, summary_model: null, appearance_mode: null, light_theme: null,
+      dark_theme: null, typeface: null, theme: null,
+    } });
+    mockApi.putMySettings.mockResolvedValue({ settings: {
+      default_harness: null, default_model: null, default_effort: "high", default_codex_effort: "medium",
+      judge_model: null, summary_model: null, appearance_mode: null, light_theme: null,
+      dark_theme: null, typeface: null, theme: null,
+    } });
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    const codex = await screen.findByLabelText("Codex effort") as HTMLSelectElement;
+    const claude = screen.getByLabelText("Claude effort") as HTMLSelectElement;
+    fireEvent.change(claude, { target: { value: "max" } });
+    fireEvent.change(codex, { target: { value: "medium" } });
+    fireEvent.click(screen.getByText("Save Codex effort"));
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_codex_effort: "medium" }));
+    expect(claude.value).toBe("max");
+    mockApi.putMySettings.mockResolvedValue({ settings: {
+      default_harness: null, default_model: null, default_effort: "high", default_codex_effort: null,
+      judge_model: null, summary_model: null, appearance_mode: null, light_theme: null,
+      dark_theme: null, typeface: null, theme: null,
+    } });
+    fireEvent.change(codex, { target: { value: "" } });
+    fireEvent.click(screen.getByText("Save Codex effort"));
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_codex_effort: null }));
+    expect(claude.value).toBe("max");
+  });
   it("loads and shows the saved effort", async () => {
     mockApi.getMySettings.mockResolvedValue({
       settings: { default_harness: null, default_model: null, default_effort: "low", judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
@@ -343,7 +389,7 @@ describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
       </MemoryRouter>,
     );
     await screen.findByText("Reasoning effort");
-    const select = (await screen.findByLabelText("Effort")) as HTMLSelectElement;
+    const select = (await screen.findByLabelText("Claude effort")) as HTMLSelectElement;
     expect(select.value).toBe("low");
   });
 
@@ -360,8 +406,8 @@ describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
       </MemoryRouter>,
     );
     await screen.findByText("Reasoning effort");
-    const select = (await screen.findByLabelText("Effort")) as HTMLSelectElement;
-    const save = screen.getByText("Save effort") as HTMLButtonElement;
+    const select = (await screen.findByLabelText("Claude effort")) as HTMLSelectElement;
+    const save = screen.getByText("Save Claude effort") as HTMLButtonElement;
     // Inherit is the saved value, so Save starts disabled (not dirty).
     expect(save.disabled).toBe(true);
     fireEvent.change(select, { target: { value: "low" } });
@@ -383,9 +429,9 @@ describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
       </MemoryRouter>,
     );
     await screen.findByText("Reasoning effort");
-    const select = (await screen.findByLabelText("Effort")) as HTMLSelectElement;
+    const select = (await screen.findByLabelText("Claude effort")) as HTMLSelectElement;
     fireEvent.change(select, { target: { value: "" } });
-    fireEvent.click(screen.getByText("Save effort"));
+    fireEvent.click(screen.getByText("Save Claude effort"));
     await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_effort: null }));
   });
 });
@@ -961,6 +1007,8 @@ describe("Run defaults — harness and worker models card (PRD #1551 M3)", () =>
     // Both lanes present.
     expect(screen.getByLabelText("Claude model")).toBeTruthy();
     expect(screen.getByLabelText("Codex model")).toBeTruthy();
+    expect(within(laneOf("Codex")).getByText("gpt-6.1-sol", { selector: "code" })).toBeTruthy();
+    expect(screen.getByLabelText("Codex effort")).toBeTruthy();
     // Inherit with both usable resolves to Claude (D11), so the badge is on the
     // Anthropic lane and NOT on the Codex lane (paired positive/negative).
     expect(within(laneOf("Anthropic")).getByText("Default harness")).toBeTruthy();

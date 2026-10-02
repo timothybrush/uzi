@@ -7,10 +7,12 @@ import { Input, Select } from "./ui";
 // Claude keeps today's aliases (this is the single shared source for that set, PRD
 // #17 risk: alias drift — reused by the agent-template editor and the per-user
 // default-model setting) plus a free-text "Other…" custom escape hatch. Codex's
-// picker is EXACTLY `gpt-6-astra`/`gpt-5.6-sol`/`gpt-6-sol` — no custom option, no catalog
+// picker is EXACTLY `gpt-6-astra`/`gpt-5.6-sol`/`gpt-6-sol`/`gpt-6.1-sol` — no custom option, no catalog
 // discovery — matching D6's "the product-owned Codex picker remains exactly" rule.
 const CLAUDE_MODEL_ALIASES = ["opus", "sonnet", "haiku", "fable"] as const;
-const CODEX_MODEL_ALIASES = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol"] as const;
+// Mirror agent/src/codex/codex-executor.ts CODEX_PRODUCTION_PROVIDER.model.
+export const DEFAULT_CODEX_MODEL = "gpt-6.1-sol";
+const CODEX_MODEL_ALIASES = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", DEFAULT_CODEX_MODEL] as const;
 
 // aliasesForHarness is the single place this component resolves which curated list
 // applies. Defaults to Claude for an omitted/unrecognised harness — the safe,
