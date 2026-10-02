@@ -125,6 +125,7 @@ import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
 import { CodexSessionStore } from "./codex/session-state.js";
+import { selectCodexBinding } from "./codex/select.js";
 import { errMessage, RUN_ID_RE, sleep } from "./util.js";
 import {
   AttemptReleaseError,
@@ -166,6 +167,12 @@ import { REASON_PROVISION_FAILED } from "./provision-run.js";
 import { REASON_NO_TOKEN, TransientRecoveryError } from "./sdk-executor.js";
 import { PLAN_MISSING_QUESTION, PLAN_MISSING_QUESTION_HEADER, REASON_PLAN_MISSING } from "./plan-missing.js";
 import { REASON_SKILLS_PLUGIN_LOAD_FAILED } from "./plugin-errors.js";
+import {
+  clampUtf8Bytes,
+  DECISIONS_MEMO_MAX_BYTES,
+  isDecisionsMemoKind,
+  parseDecisionsMemoResponse,
+} from "./decisions-memo.js";
 
 /** Cap on a reported failure_reason, matching the forge error-body cap
  *  (forge.ts) so a runaway SDK error can't bloat the run row or the stream. */
@@ -1535,6 +1542,9 @@ interface RunFlight {
   kickMidTurnTick?: () => void;
   runnerClone: RunnerClone | undefined;
   ciFixHumanApproved: boolean;
+  /** Issue #2083: the server enabled the private decisions memo for this run (set at claim
+   *  time from a validated read; false on any failure). Gates the end-of-run memo save. */
+  decisionsMemoEnabled: boolean;
   result: ExecutorResult | undefined;
   /** PRD #1416 M1: the branch's published forge tip P at claim (fact 2) — the floor at/below
    *  which the branch must never be rewritten, since uzi lands work with a plain fast-forward
@@ -6822,6 +6832,13 @@ export class RunRunner {
     // lead declared none) — same absent-vs-present discipline as prd_done_path, so the
     // server UNIONs them into milestones_completed only when actually declared and a
     // no-declaration completion is byte-identical to before.
+    // Issue #2083: best-effort save of the lead's private decisions memo, MR-path completions
+    // only (every other exit returned earlier). Never throws, never alters the completion
+    // payload, and is bounded by saveDecisionsMemo's short timeout. The body is redacted (it
+    // is model-authored) FIRST and only then clamped to the storage cap, so a secret straddling
+    // the cap is redacted whole instead of cut and leaked as a prefix. It is never logged or
+    // emitted: only byte counts.
+    await this.saveDecisionsMemoBestEffort(flight, runKind, result.decisionsMemo);
     await finishCommittedPublish({
       status: "completed",
       branch: result.branch,
@@ -6839,6 +6856,33 @@ export class RunRunner {
       // completed report is byte-for-byte unchanged on the wire.
       head: completionHead,
     }, "run completed", { branch: result.branch, mr_iid: mr.iid });
+  }
+
+  /** Issue #2083: persist the decisions memo for the next rework run. Best-effort by design:
+   *  any failure (409 disabled/claim moved, transport, timeout) is logged with the error class
+   *  only and the run completes normally. */
+  private async saveDecisionsMemoBestEffort(
+    flight: RunFlight,
+    runKind: RunKind,
+    memo: string | undefined,
+  ): Promise<void> {
+    if (!isDecisionsMemoKind(runKind) || !flight.decisionsMemoEnabled) return;
+    if (typeof memo !== "string" || memo.trim() === "") return;
+    try {
+      const body = clampUtf8Bytes(flight.redactText(memo), DECISIONS_MEMO_MAX_BYTES);
+      if (body.trim() === "") return;
+      await this.client.saveDecisionsMemo(flight.runId, flight.claimGeneration, body);
+      flight.batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: { text: `decisions memo saved (${Buffer.byteLength(body, "utf8")} bytes)` },
+      });
+    } catch (err) {
+      flight.runLog.warn("decisions memo not saved", {
+        run_id: flight.runId,
+        error_class: err instanceof Error ? err.constructor.name : typeof err,
+      });
+    }
   }
 
   private buildFlight(
@@ -7153,6 +7197,7 @@ export class RunRunner {
       predecessorCapture: false,
       predecessorCaptureVerified: false,
       ciFixHumanApproved: false,
+      decisionsMemoEnabled: false,
       runnerClone: undefined,
       result: undefined,
     };
@@ -7929,6 +7974,43 @@ export class RunRunner {
       });
     }
 
+    // Issue #2083: the private decisions memo. Read for memo kinds only, guarded HARD like
+    // memory above: any error/404/409/malformed record means "no memo" and never fails the
+    // run. Only an mr_rework run injects the memo; the others just learn `enabled` (which
+    // exposes the signal_done param). The body is never logged: only a fixed message plus
+    // the error class and HTTP status.
+    let decisionsMemoEnabled = false;
+    let decisionsMemo: string | undefined;
+    const claimKind = resolveRunKind(claim.kind);
+    // A Codex-bound claim never reads, writes or shows the memo (Codex has no seam for it), so
+    // skip the GET entirely. Same discriminator makeExecutor's seam uses; a malformed Codex
+    // block throws there (fail-closed executor), so it counts as Codex-bound here too.
+    let codexBound = false;
+    try {
+      codexBound = selectCodexBinding({ codex: claim.secrets.codex }).kind === "codex";
+    } catch {
+      codexBound = true;
+    }
+    if (isDecisionsMemoKind(claimKind) && !codexBound) {
+      try {
+        const parsed = parseDecisionsMemoResponse(
+          await this.client.getDecisionsMemo(runId, flight.claimGeneration),
+        );
+        decisionsMemoEnabled = parsed.enabled;
+        if (claimKind === "mr_rework" && parsed.memo !== undefined) {
+          // The "injected" status line is emitted by the executor where the block is
+          // actually placed into a prompt (a pre-approved resume skips the plan prompt).
+          decisionsMemo = parsed.memo;
+        }
+      } catch (err) {
+        runLog.warn("could not fetch decisions memo; continuing without it", {
+          error_class: err instanceof Error ? err.constructor.name : typeof err,
+          status: (err as { status?: unknown } | null)?.status,
+        });
+      }
+    }
+    flight.decisionsMemoEnabled = decisionsMemoEnabled;
+
     // PRD #71 M5: did a HUMAN approve this ci_fix plan? On a PRE-APPROVED RESUME the gate
     // does not run this execution, so derive from durable claim state. The server CLEARS
     // auto_approve the moment a run PARKS at the plan gate (SetRunAwaitingApproval,
@@ -8526,6 +8608,9 @@ export class RunRunner {
       repoSkillsEnabled: claim.repo.skills_enabled ?? false,
       repoClaudemdEnabled: claim.repo.claudemd_enabled ?? false,
       memory,
+      // Issue #2083: see the claim-time read above.
+      decisionsMemoEnabled,
+      decisionsMemo,
       // Issue #297: the self_improve in-flight avoid-set (best-effort; absent ⇒ empty).
       inflightTargets: claim.inflight_targets,
       // PRD #686 D11: the open self-improve MRs' "what was proposed" text (best-effort;

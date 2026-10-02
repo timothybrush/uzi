@@ -23,6 +23,7 @@ import type {
   MilestoneProgress,
   Proposal,
 } from "./protocol.js";
+import { clampUtf8Bytes, DECISIONS_MEMO_TRANSPORT_MAX_BYTES } from "./decisions-memo.js";
 
 /** The in-process MCP server name; tools surface as `mcp__uzi__<tool>`. */
 export const SIGNAL_SERVER_NAME = "uzi";
@@ -87,6 +88,13 @@ export interface ScannedSignals {
    *  parsed, so a plain signal_done still scans to exactly `{ done: true }`. The scan never sets
    *  `verifiedAtSha`: the executor stamps it from the worktree HEAD when it latches done. */
   prSummary?: PrSummaryClaim;
+  /** Issue #2083: the private decisions memo a signal_done call carried, verbatim. A memo over
+   *  the loose DECISIONS_MEMO_TRANSPORT_MAX_BYTES is dropped whole, never cut, so accepted text
+   *  stays intact until the runner redacts it and only then applies the storage cap
+   *  DECISIONS_MEMO_MAX_BYTES. MAIN-THREAD-ONLY, behind the same isSubagentFrame guard as
+   *  `summary`. Set ONLY for a string with non-whitespace content, so a plain signal_done still
+   *  scans to exactly `{ done: true }`; never affects `done`. The body is never logged. */
+  decisionsMemo?: string;
   /** PRD #88: the questions an ask_user call carried, if the message made one.
    *  Present and non-empty ⇒ the executor parks the run. */
   questions?: AskUserQuestion[];
@@ -199,6 +207,9 @@ export interface SignalServerOptions {
    *  `not_code` no-MR terminal path and a `self_improve`/`prompt` run is never report-only,
    *  so the parameter is invisible to the model there rather than present-and-inert. */
   reportOnly?: boolean;
+  /** Issue #2083: expose `decisions_memo` on signal_done. Set only for a memo-kind run whose
+   *  memo is enabled server-side, so the param is invisible to the model otherwise. */
+  decisionsMemo?: boolean;
 }
 
 /** The terse ack object each signalling tool returns to the model. The AUTHORITATIVE
@@ -406,6 +417,19 @@ export function buildSignalMcpServer(
         "Set true ONLY when the run's deliverable is a report, command output, or a " +
           "verification result with NO code change to land, so the worker records the findings " +
           "and opens no merge request. Omit it (or set false) when a code change was committed.",
+      );
+  }
+  // Issue #2083: the private decisions memo for the next rework run. Same conditional-shape
+  // pattern as report_only: invisible to the model unless the runner enabled it.
+  if (opts.decisionsMemo) {
+    doneShape["decisions_memo"] = z
+      .string()
+      .optional()
+      .describe(
+        "A private note (at most 8 KiB, never published, never shown in the pull request) for " +
+          "the NEXT uzi run that reworks this pull request: decisions and rejected alternatives, " +
+          "relevant files, validation commands actually run and their results, open risks. " +
+          "Never include secrets.",
       );
   }
   // PRD #122 M1. Built the same way as doneShape: a Record mutated only when the
@@ -791,16 +815,6 @@ function parseProposal(raw: unknown): Proposal | undefined {
   return { title, body };
 }
 
-/** Truncate `s` to at most `maxBytes` UTF-8 bytes, cutting only at a code point boundary. */
-function clampUtf8Bytes(s: string, maxBytes: number): string {
-  const buf = Buffer.from(s, "utf8");
-  if (buf.length <= maxBytes) return s;
-  let cut = maxBytes;
-  // Back off past continuation bytes (10xxxxxx) so the cut never splits a code point.
-  while (cut > 0 && ((buf[cut] ?? 0) & 0xc0) === 0x80) cut--;
-  return buf.subarray(0, cut).toString("utf8");
-}
-
 /** A trimmed, byte-clamped non-empty string, or undefined for anything else. */
 function claimText(raw: unknown, maxBytes: number): string | undefined {
   if (typeof raw !== "string") return undefined;
@@ -1003,6 +1017,19 @@ export function scanSignals(message: unknown): ScannedSignals {
       // declaration never affects `done`.
       const prSummary = parsePrSummary(input?.["pr_summary"]);
       if (prSummary !== undefined) out.prSummary = prSummary;
+      // Issue #2083. Same signal_done branch, so the same main-thread guard: a subagent frame
+      // must never plant the note the next rework run reads. Only non-whitespace strings count.
+      // A memo over the transport bound (DECISIONS_MEMO_TRANSPORT_MAX_BYTES) is DROPPED, never
+      // cut: the runner redacts before applying the storage cap, and a cut here would come before
+      // that redaction, so a secret straddling it could survive as an unmatchable prefix.
+      const decisionsMemo = input?.["decisions_memo"];
+      if (
+        typeof decisionsMemo === "string" &&
+        decisionsMemo.trim() !== "" &&
+        Buffer.byteLength(decisionsMemo, "utf8") <= DECISIONS_MEMO_TRANSPORT_MAX_BYTES
+      ) {
+        out.decisionsMemo = decisionsMemo;
+      }
     } else if (name === ASK_USER_QUALIFIED) {
       // PRD #88. Extracted HERE, inside the content loop that isSubagentFrame already
       // guards, for the same reason prd_done_path is nested inside signal_done's

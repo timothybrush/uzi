@@ -128,6 +128,36 @@ like any other run, including one triggered on an unattended nightly sweep
 MR. If you'd rather review findings by hand before uzi acts on them, opt
 out in Settings.
 
+## Decisions memo (experiment)
+
+This is an experiment (issue #2083) to decide the next step of PRD #1214. It is **off by default**, and nothing here claims it makes reworks faster or cheaper: that measurement has not been done.
+
+An admin turns it on with the `decisions_memo_enabled` instance setting (text `true` or `false`, default `false`), set through `PUT /api/admin/settings` the same way as `mr_rework_enabled`. There is no Admin Settings control for it.
+
+When it is on, a Claude run that produces a PR (issue, prompt, self-improvement or MR rework) can leave a private **decisions memo**, at most 8 KiB, as it finishes: decisions and rejected alternatives, relevant files, validation commands and results, and open risks.
+
+- **Private.** The memo is stored with the run and scoped to its owner. It is never put in the PR description, and the stored memo and the tool call that saves it never appear in the run logs or the run transcript. The lead can still quote an injected memo in its own messages or subagent briefs, which are part of the transcript like any of its text.
+- **Saved only on a published round.** A memo is saved only on the path where the run successfully published its merge request. A failed, held or unpublished round never replaces the prior memo, and only a memo from the claim attempt that actually completed counts.
+- **Used by the next rework on the same PR.** An MR rework on the same PR (same owner, repo, branch and MR) receives the latest such memo in its planning prompt, framed as untrusted, advisory and possibly stale context: current review comments and the code win. The rework writes an updated memo when it publishes.
+- **No memo is a normal rework.** With no memo, or any problem fetching it, the rework starts fresh as it always did.
+- **Visible in the activity.** The run's activity shows `decisions memo injected (N bytes)` when the memo was actually put into the lead's prompt (the planning prompt, which a revision re-sends when a run resumes at the plan gate without its earlier conversation, or, for a run that resumes past an approved plan without its earlier conversation, its first implementation prompt; a resume past the plan gate that keeps its conversation does not repeat it, while a resume that re-plans re-sends the whole planning prompt, memo included, so the line can then appear again), and `decisions memo saved (N bytes)` when the run saved its memo. N is the size sent; the stored size can be smaller after control and invisible formatting characters are stripped. The lines carry byte counts only, never the memo text.
+- **Turning it off.** Switching the setting off stops new writes and injection; stored memos are kept.
+- **Codex.** Codex runs neither write nor receive a memo: a Codex-bound run never fetches one and never shows the status lines.
+
+### Measurement runbook
+
+The experiment is only worth recording if the comparison is clean. Paired live measurements:
+
+- Use an **isolated test instance with no unrelated active runs.** Never flip the setting while runs are active on a shared live instance: the setting is instance-wide and would change what those runs write and receive.
+- Generate the source run's memo with the setting enabled.
+- Complete each paired arm before flipping the setting. Turning the setting off retains the stored memo. A memo-on rework saves an updated memo on the same PR, and the next rework always reads the newest one, so with several trials on one PR the later memo-on trials read an earlier trial's memo rather than the source run's. Start each memo-on trial from its own source run and PR (same branch snapshot), or record the chaining as part of the design. There is no way to delete an intermediate memo.
+- Record each arm's effective injection state: whether the `decisions memo injected` line appeared in that arm (it appears only when the memo reached the prompt).
+- Design: the same branch snapshot, findings, model and effort, and budgets in both arms; at least one small, one multi-file and one multi-round case; two trials per arm, in alternating order.
+- Report per arm: claim-to-first-edit (n/a for a no-op round), active execution time, discovery tool calls, input and cache tokens, charged cost including memo generation (the memo is written in the lead's final tool call, so it is inside the run's metered cost), and the correctness of the final rework.
+- Record the result on #1214.
+
+Codex is not covered.
+
 ## The per-MR cap
 
 A merge request can't be reworked forever. uzi tracks, per MR, how many

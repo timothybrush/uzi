@@ -72,6 +72,7 @@ import {
   isNotCodePlan,
 } from "./prompt.js";
 import { resolveRunKind } from "./run-kind.js";
+import { isDecisionsMemoKind } from "./decisions-memo.js";
 import { dropRunCaches, type RunCacheDropResult } from "./run-caches.js";
 import { defaultEnvProbeSpawner, environmentFactsSummary, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "./env-probe.js";
 import { readRepoInstructions } from "./repo-instructions.js";
@@ -493,6 +494,25 @@ const defaultRunProcesses: RunProcessOps = {
  * (steering's sticky pause mode). Called at every implement boundary and on every path that clears
  * a trip and continues, because the stop's own turn drop is first-wins and can be swallowed there.
  */
+/** Issue #2083: the worker status line saying the earlier run's decisions memo was placed into
+ *  a prompt (byte count only, never the body). No-op for an absent or blank memo. */
+function announceDecisionsMemo(ctx: RunContext): boolean {
+  const memo = ctx.decisionsMemo;
+  if (!hasDecisionsMemo(memo)) return false;
+  ctx.emit({
+    kind: "status",
+    agent: "worker",
+    payload: { text: `decisions memo injected (${Buffer.byteLength(memo, "utf8")} bytes)` },
+  });
+  return true;
+}
+
+/** Issue #2083: whether a memo is non-blank (the same predicate buildDecisionsMemoContext uses
+ *  to render a block), without building the fenced block just to test non-emptiness. */
+function hasDecisionsMemo(memo: string | undefined | null): memo is string {
+  return typeof memo === "string" && memo.trim() !== "";
+}
+
 function throwIfDiskStop(ctx: RunContext): void {
   if (ctx.pauseModeRequested?.() === "disk") throw new DiskParkSignal(false);
 }
@@ -548,6 +568,8 @@ interface TurnResult {
    *  any. Last-wins within the turn (like summary); stamped with the worktree HEAD by the loop
    *  when it latches the claims and forwarded as ExecutorResult.prSummary. */
   prSummary?: PrSummaryClaim;
+  /** Issue #2083: forwarded as ExecutorResult.decisionsMemo (last-wins). */
+  decisionsMemo?: string;
   /** Issue #281: the lead's own text emitted this turn, concatenated in order — the
    *  input to the repeated-refusal check. Absent when the lead emitted no text. */
   finalText?: string;
@@ -701,6 +723,9 @@ interface DriveState {
   approvedPlan?: string;
   approvedSelection?: AgentSelectionParse;
   preApproved?: boolean;
+  /** Issue #2083: the decisions memo block was already placed in this execution's plan or
+   *  session-less revise prompt (so the first implement prompt must not carry it again). */
+  decisionsMemoPlaced?: boolean;
   budget?: { asked: number };
 }
 
@@ -1333,6 +1358,9 @@ export class SdkExecutor implements Executor {
     // a stricter fail-closed default here would silently break every test that omits
     // kind, and the AUTHORITATIVE gate is the api's, where runs.kind is NOT NULL.
     const isIssueRun = resolveRunKind(ctx.kind) === "issue";
+    // Issue #2083: the decisions memo is a memo-kind run with the server-side feature on.
+    const decisionsMemoOn =
+      ctx.decisionsMemoEnabled === true && isDecisionsMemoKind(resolveRunKind(ctx.kind));
     const mcpServers: Record<string, McpSdkServerConfigWithInstance> = {
       [SIGNAL_SERVER_NAME]: buildSignalMcpServer({
         prdDonePath: isIssueRun,
@@ -1348,6 +1376,8 @@ export class SdkExecutor implements Executor {
         // issue #279: report_only on signal_done, gated on the same isIssueRun discriminator —
         // a non-issue run (ci_fix/self_improve/prompt) has its own terminal paths.
         reportOnly: isIssueRun,
+        // Issue #2083: decisions_memo on signal_done, only when the memo is enabled.
+        decisionsMemo: decisionsMemoOn,
       }),
     };
     if (this.client) {
@@ -1643,6 +1673,10 @@ export class SdkExecutor implements Executor {
       // planning label) reads the same values on both paths.
       const isCIFix = ctx.kind === "ci_fix" && ctx.pipeline != null;
       const isSelfImprove = ctx.kind === "self_improve";
+      // Issue #2083: latched when the decisions memo block rides a plan or session-less revise
+      // prompt of THIS execution; read by the implement phase so the memo reaches the lead's
+      // conversation once.
+      let decisionsMemoPlaced = false;
       // Assigned by the gate below, or seeded directly on the pre-approved path.
       let approvedPlan: string;
       // The agent selection the approve verdict carried (PRD #37).
@@ -1856,6 +1890,9 @@ export class SdkExecutor implements Executor {
             // PRD #90: inert, nonce-fenced, untrusted-advisory cross-run memory (the
             // runner fetched it at claim time; empty/absent injects nothing).
             memory: ctx.memory,
+            // Issue #2083: the earlier run's private decisions memo (mr_rework only; the
+            // runner sets it only then), fenced as UNTRUSTED. Absent injects nothing.
+            decisionsMemo: ctx.decisionsMemo,
             // Issue #105: see above — prior pushed work on this issue's branch.
             priorWork: ctx.priorWork,
             // See above.
@@ -1954,6 +1991,10 @@ export class SdkExecutor implements Executor {
           // runThroughSwitch: "released" → reclaim re-plans on the new token (surface switchReleased
           // and end), "gave_up" → restart the planning turn on the OLD token (re-run drivePlanningTurn,
           // like the pause_failed turn restart).
+          // Issue #2083: the memo block is in planPrompt only on the plain issue/prompt/rework
+          // path (the ci_fix and self_improve builders take none). Announced here, where the
+          // prompt is actually sent, not when the runner fetched it.
+          if (!isCIFix && !isSelfImprove && announceDecisionsMemo(ctx)) decisionsMemoPlaced = true;
           const planStep = await this.runThroughSwitch(ctx, state, () =>
             this.drivePlanningTurn(ctx, baseConfig, resumeId, planPrompt, state, idleMs, budget),
           );
@@ -2081,6 +2122,10 @@ export class SdkExecutor implements Executor {
             resumeId === undefined
               ? `${planPrompt}\n\n${buildRevisePlanPrompt(feedback, approvedPlan)}`
               : buildRevisePlanPrompt(feedback);
+          // Issue #2083: a session-less revise re-sends the full planPrompt, which carries the
+          // memo block on the plain issue/rework path: announce where it is actually placed.
+          if (resumeId === undefined && !isCIFix && !isSelfImprove && announceDecisionsMemo(ctx))
+            decisionsMemoPlaced = true;
           const runRevisionTurn = () =>
             this.drivePlanningTurn(ctx, baseConfig, resumeId, revisePrompt, state, idleMs, budget);
           const turn = ctx.deferCredentialSwitch
@@ -2142,6 +2187,7 @@ export class SdkExecutor implements Executor {
       drive.approvedPlan = approvedPlan;
       drive.approvedSelection = approvedSelection;
       drive.preApproved = preApproved;
+      drive.decisionsMemoPlaced = decisionsMemoPlaced;
       drive.budget = budget;
       return undefined;
   }
@@ -2175,6 +2221,7 @@ export class SdkExecutor implements Executor {
       environmentFacts,
     } = drive;
     const preApproved = drive.preApproved!;
+    const decisionsMemoPlaced = drive.decisionsMemoPlaced === true;
     const approvedPlan = drive.approvedPlan!;
     const approvedSelection = drive.approvedSelection!;
     const budget = drive.budget!;
@@ -2388,6 +2435,11 @@ export class SdkExecutor implements Executor {
       // PRD #1798 M2 (D4): hoisted for the same reason as declaredProposal. Stamped with the
       // worktree HEAD on the done turn that declared it.
       let declaredPrSummary: PrSummaryClaim | undefined;
+      // Issue #2083: hoisted for the same reason; last-wins across signal_done turns.
+      let declaredDecisionsMemo: string | undefined;
+      // Issue #2083: latched once the memo block rode an implement prompt (an ask_user turn
+      // re-enters the first-turn branch, so the first-turn test alone would re-send it).
+      let decisionsMemoImplementInjected = false;
       // PRD #634 M3: latched when the operator's scope ceiling truncates the run at the loop
       // top (the honor gate below). Hoisted like the other loop-latched locals so it survives
       // the `break` into the ExecutorResult assembly. Issue runs only.
@@ -2604,6 +2656,23 @@ export class SdkExecutor implements Executor {
         // (0 turns, no activity) is retried in-process and, if still empty, escalated to
         // the recovery_wait park (TransientRecoveryError) instead of terminal-failing —
         // covering the RC2 resume-empty-turn incident on the implement path too.
+        // Issue #2083: the memo rides the FIRST implement prompt only when this conversation has
+        // not seen it: no session resumed (a resumed session already saw it in its plan prompt,
+        // like embedSeededPlan's hasSession guard) and no plan/revise prompt of this execution
+        // carried it. The "injected" line is emitted only when the block is placed.
+        const firstImplementTurn = iteration === 1 && !hasParked;
+        const priorDecisionsMemo =
+          firstImplementTurn &&
+          !ctx.sessionId &&
+          !decisionsMemoPlaced &&
+          !decisionsMemoImplementInjected &&
+          hasDecisionsMemo(ctx.decisionsMemo)
+            ? ctx.decisionsMemo
+            : undefined;
+        if (priorDecisionsMemo !== undefined) {
+          decisionsMemoImplementInjected = true;
+          announceDecisionsMemo(ctx);
+        }
         const turnPromise = this.driveTurnWithEmptyRecovery(
           ctx,
           implementConfig,
@@ -2621,7 +2690,8 @@ export class SdkExecutor implements Executor {
             // WHOLE run only, not the first turn of each follow-up. hasParked latches true
             // once the run has parked, so a resumed follow-up turn (iteration back at 1) is
             // NOT treated as first. Non-interactive runs never park → identical to before.
-            first: iteration === 1 && !hasParked,
+            first: firstImplementTurn,
+            priorDecisionsMemo,
             // issue #222: warn the lead on the first implement turn that this resume's
             // reseed destroyed any local-only prior-attempt work, so a queued follow-up
             // written against the old tree is not acted on as if that work survived. The
@@ -2682,6 +2752,9 @@ export class SdkExecutor implements Executor {
             // issue #279: teach the lead the report-only evidence path, ISSUE RUNS ONLY —
             // gated on the same isIssueRun discriminator the signal_done schema uses.
             reportOnly: isIssueRun,
+            // Issue #2083: ask the lead for decisions_memo (same gate as the signal param).
+            decisionsMemo:
+              ctx.decisionsMemoEnabled === true && isDecisionsMemoKind(resolveRunKind(ctx.kind)),
           }),
           state,
           idleMs,
@@ -2859,6 +2932,7 @@ export class SdkExecutor implements Executor {
         if (turn.prSummary !== undefined) {
           declaredPrSummary = await stampPrSummaryHead(turn.prSummary, ctx.worktreePath);
         }
+        if (turn.decisionsMemo !== undefined) declaredDecisionsMemo = turn.decisionsMemo;
         // PRD #122 M2: carry this turn's reported progress into the NEXT iteration's
         // `running` report. Only overwrite when the turn reported something, so a quiet
         // turn keeps the last known progress rather than blanking it.
@@ -3463,6 +3537,7 @@ export class SdkExecutor implements Executor {
       // pushes a branch opens a PR; the runner reads it only where it renders a description).
       // OMITTED-not-undefined like the siblings above.
       if (declaredPrSummary !== undefined) result.prSummary = declaredPrSummary;
+      if (declaredDecisionsMemo !== undefined) result.decisionsMemo = declaredDecisionsMemo;
       // PRD #1798 M2: the last plan summary + deltas the api accepted this run, if any. Absent
       // on a resume past the gate or when the advisory pass never succeeded.
       if (this.latestPlanSummary !== undefined) {
