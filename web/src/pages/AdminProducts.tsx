@@ -16,7 +16,7 @@
 // (user-written) are untrusted text: React text nodes only, never HTML.
 
 import { useEffect, useId, useRef, useState, type FormEvent } from "react";
-import { api, type AdminProductToken, type Product } from "../lib/api";
+import { api, type AdminProductToken, type Product, type User } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { useDemoMode } from "../lib/demoMode";
@@ -66,36 +66,74 @@ function stoppedWhat(tokens: number, connections: number): string {
 }
 
 export function AdminProducts() {
-  const { data, loading, error: loadError, reload } = useAsyncData<{
-    products: Product[];
+  const demo = useDemoMode();
+  // Inventory filters (issue #1935): sent to the server so the 1000-row cap applies per filter.
+  const [ownerFilter, setOwnerFilter] = useState("");
+  const [productFilter, setProductFilter] = useState("");
+  const filtered = ownerFilter !== "" || productFilter !== "";
+  // Owners come from the user list, not from token rows, so an owner with no token in the
+  // current (possibly truncated) inventory is still selectable. A failed load empties the select and
+  // shows its error beside the filters.
+  const { data: usersData, error: usersError } = useAsyncData<User[]>(async () => (await api.listUsers()).users, [], {
+    fallback: "Failed to load users",
+  });
+  // Products load once, apart from the tokens: a filter change refetches only the tokens, so the
+  // cards stay mounted and keep their local state (an unsaved redirect-URI draft, a one-time
+  // client secret that cannot be shown again).
+  const {
+    data: productsData,
+    loading,
+    error: productsError,
+    reload: reloadProducts,
+  } = useAsyncData<Product[]>(async () => (await api.adminListProducts()).products, [], {
+    fallback: "Failed to load products",
+  });
+  const {
+    data,
+    error: tokensError,
+    reload: reloadTokens,
+  } = useAsyncData<{
     tokens: AdminProductToken[];
     truncated: boolean;
+    // The filters this result was fetched with, so rows are only shown under the same filters.
+    ownerId: string;
+    productId: string;
   }>(
     async () => {
-      const [{ products }, { tokens, truncated }] = await Promise.all([
-        api.adminListProducts(),
-        api.adminListProductTokens(),
-      ]);
-      return { products, tokens, truncated: truncated === true };
+      const { tokens, truncated } = await api.adminListProductTokens({
+        ownerId: ownerFilter,
+        productId: productFilter,
+      });
+      return { tokens, truncated: truncated === true, ownerId: ownerFilter, productId: productFilter };
     },
-    [],
-    { fallback: "Failed to load products" },
+    [ownerFilter, productFilter],
+    // "deps": a filter change clears the previous filter's error, so a failed fetch under one
+    // filter neither keeps its banner nor hides "Loading tokens…" while the next one loads.
+    // (Its `loading` is unused: the cards stay mounted and read `shown` instead.)
+    { fallback: "Failed to load tokens", skeleton: "deps" },
   );
+  const reload = () => Promise.all([reloadProducts(), reloadTokens()]);
+  // The hook keeps the last data when a refetch fails, and while a new filter's fetch is pending
+  // `data` is still the previous filter's result. `shown` is that result only while it matches
+  // the displayed filters; otherwise nothing from it (rows, revoke actions, narrowing, notices)
+  // is rendered, and the cards say their tokens are loading (or, on a failure, only the banner).
+  const shown = data && data.ownerId === ownerFilter && data.productId === productFilter ? data : null;
+  const tokensFailed = shown === null && tokensError !== "";
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   // When the server cut the inventory, how many tokens it did list (the notices name
   // this number rather than a hard-coded cap that could drift from the server's).
-  const truncatedAt = data?.truncated ? data.tokens.length : null;
-  // The first load failed: show only the error, never a "No products registered"
+  const truncatedAt = shown?.truncated ? shown.tokens.length : null;
+  // The first products load failed: show only the error, never a "No products registered"
   // empty state the page cannot know to be true.
-  const loadFailed = data === null && loadError !== "";
+  const loadFailed = productsData === null && productsError !== "";
 
   // Live products first, soft-deleted ones last (the audit trail), server order within.
-  const products = [...(data?.products ?? [])].sort(
+  const allProducts = [...(productsData ?? [])].sort(
     (a, b) => Number(a.deleted_at !== null) - Number(b.deleted_at !== null),
   );
   const tokensByProduct = new Map<string, AdminProductToken[]>();
-  for (const t of data?.tokens ?? []) {
+  for (const t of shown?.tokens ?? []) {
     const list = tokensByProduct.get(t.product_id) ?? [];
     list.push(t);
     tokensByProduct.set(t.product_id, list);
@@ -119,7 +157,7 @@ export function AdminProducts() {
 
   return (
     <AdminShell description="External products your users can connect to uzi’s /api/v1. Disabling or deleting a product stops every token and connection for it on its next request.">
-      {(error || loadError) && <Alert message={error || loadError} />}
+      {(error || productsError || tokensError) && <Alert message={error || productsError || tokensError} />}
       {notice && <Alert tone="success" message={notice} />}
 
       <CreateProduct
@@ -133,13 +171,50 @@ export function AdminProducts() {
 
       {truncatedAt !== null && (
         <p className="rounded-lg border border-info/40 bg-info/10 px-3 py-2 text-sm text-info">
-          Showing the first {truncatedAt} tokens, active first; older tokens are not listed.
+          Showing the first {truncatedAt} tokens{filtered ? " matching the current filters" : ""}, active first; older
+          tokens are not listed.
         </p>
+      )}
+
+      {allProducts.length > 0 && (
+        <div className="flex flex-wrap items-center gap-3">
+          <label className="flex items-center gap-2 text-sm text-muted">
+            Owner
+            <select
+              value={ownerFilter}
+              onChange={(e) => setOwnerFilter(e.target.value)}
+              className="rounded-md border border-edge bg-surface px-2 py-1 text-sm text-fg"
+            >
+              <option value="">All owners</option>
+              {(usersData ?? []).map((u) => (
+                <option key={u.id} value={u.id}>
+                  {maskEmail(u.email, demo)}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex items-center gap-2 text-sm text-muted">
+            Product
+            <select
+              value={productFilter}
+              onChange={(e) => setProductFilter(e.target.value)}
+              className="rounded-md border border-edge bg-surface px-2 py-1 text-sm text-fg"
+            >
+              <option value="">All products</option>
+              {allProducts.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {stripUnsafeChars(p.name)}
+                </option>
+              ))}
+            </select>
+          </label>
+          {usersError && <Alert message={usersError} />}
+        </div>
       )}
 
       {loading ? (
         <ListSkeleton rows={3} />
-      ) : loadFailed ? null : products.length === 0 ? (
+      ) : loadFailed || productsData === null ? null : allProducts.length === 0 ? (
         <EmptyState
           icon={<PackageIcon />}
           title="No products registered"
@@ -147,12 +222,18 @@ export function AdminProducts() {
         />
       ) : (
         <div className="space-y-4">
-          {products.map((p) => (
+          {allProducts.map((p) => (
             <ProductCard
               key={p.id}
+              // A product filter shows only that product's card; the rest are hidden, not unmounted,
+              // so their local state survives a change of filter.
+              hidden={productFilter !== "" && p.id !== productFilter}
               product={p}
+              tokensReady={shown !== null}
+              tokensFailed={tokensFailed}
               tokens={tokensByProduct.get(p.id) ?? []}
               truncatedAt={truncatedAt}
+              filtered={filtered}
               onToggle={(enabled) =>
                 run(async () => {
                   await api.adminUpdateProduct(p.id, { enabled });
@@ -405,20 +486,32 @@ function DeletedBadge({ deletedAt }: { deletedAt: string }) {
 }
 
 function ProductCard({
+  hidden,
   product,
+  tokensReady,
+  tokensFailed,
   tokens,
   truncatedAt,
+  filtered,
   onToggle,
   onJobTypes,
   onDelete,
   onRevoke,
   onOAuthChanged,
 }: {
+  // A product filter excludes this card: kept mounted (so its state survives) but not shown.
+  hidden: boolean;
   product: Product;
+  // The tokens for the current filters have arrived; until then (or after a failed fetch) the
+  // token section shows neither rows nor an empty-list message.
+  tokensReady: boolean;
+  tokensFailed: boolean;
   tokens: AdminProductToken[];
   // Non-null when the inventory was cut server-side (the number listed), so an empty
   // `tokens` does not mean none exist.
   truncatedAt: number | null;
+  // An owner or product filter is active: an empty list then means no match, not no tokens.
+  filtered: boolean;
   onToggle: (enabled: boolean) => Promise<boolean>;
   // Sends the product's whole new allow-list (PATCH allowed_job_types; [] clears it) and
   // resolves to the error text on failure, or the list the server stored once saved (the
@@ -484,7 +577,7 @@ function ProductCard({
   const headingId = `product-${product.id}`;
 
   return (
-    <section aria-labelledby={headingId}>
+    <section aria-labelledby={headingId} hidden={hidden}>
       <Card className={deleted ? "space-y-4 opacity-75" : "space-y-4"}>
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 space-y-1">
@@ -583,11 +676,15 @@ function ProductCard({
           />
         )}
 
-        {tokens.length === 0 ? (
+        {!tokensReady ? (
+          tokensFailed ? null : <p className="text-sm text-faint">Loading tokens…</p>
+        ) : tokens.length === 0 ? (
           <p className="text-sm text-faint">
             {truncatedAt !== null
-              ? `None of this product’s tokens are among the first ${truncatedAt} listed; its tokens may be beyond the list.`
-              : "No tokens minted for this product."}
+              ? `None of this product’s tokens${filtered ? " matching the current filters" : ""} are among the first ${truncatedAt} listed; its tokens may be beyond the list.`
+              : filtered
+                ? "No tokens match the current filters."
+                : "No tokens minted for this product."}
           </p>
         ) : (
           <ProductTokenTable tokens={tokens} onRevoke={onRevoke} />

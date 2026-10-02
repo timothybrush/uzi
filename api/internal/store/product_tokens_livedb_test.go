@@ -820,4 +820,60 @@ func TestProductTokenListsActiveFirstLiveDB(t *testing.T) {
 			}
 		}
 	})
+
+	// #1935: owner/product filters narrow in SQL, so they hold on a table shared with
+	// other tests: this test's owner and product are unique to it.
+	t.Run("admin list filters", func(t *testing.T) {
+		setAges("now() + interval '100 years'")
+		otherProduct := newProduct(ctx, t, q, owner)
+		const max = 1_000_000
+		ids := func(rows []store.ListProductTokensForAdminByOwnerRow, err error) []uuid.UUID {
+			t.Helper()
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := make([]uuid.UUID, 0, len(rows))
+			for _, r := range rows {
+				out = append(out, r.ID)
+			}
+			return out
+		}
+		byOwner := func(o uuid.UUID) []uuid.UUID {
+			t.Helper()
+			return ids(q.ListProductTokensForAdminByOwner(ctx, store.ListProductTokensForAdminByOwnerParams{OwnerID: o, MaxRows: max}))
+		}
+		byProduct := func(pr uuid.UUID) []uuid.UUID {
+			t.Helper()
+			rows, err := q.ListProductTokensForAdminByProduct(ctx, store.ListProductTokensForAdminByProductParams{ProductID: pr, MaxRows: max})
+			conv := make([]store.ListProductTokensForAdminByOwnerRow, 0, len(rows))
+			for _, r := range rows {
+				conv = append(conv, store.ListProductTokensForAdminByOwnerRow(r))
+			}
+			return ids(conv, err)
+		}
+		byBoth := func(o, pr uuid.UUID) []uuid.UUID {
+			t.Helper()
+			rows, err := q.ListProductTokensForAdminByOwnerAndProduct(ctx, store.ListProductTokensForAdminByOwnerAndProductParams{OwnerID: o, ProductID: pr, MaxRows: max})
+			conv := make([]store.ListProductTokensForAdminByOwnerRow, 0, len(rows))
+			for _, r := range rows {
+				conv = append(conv, store.ListProductTokensForAdminByOwnerRow(r))
+			}
+			return ids(conv, err)
+		}
+		if got := byOwner(owner); !slices.Equal(got, wantAll) {
+			t.Fatalf("owner filter = %v, want %v", got, wantAll)
+		}
+		if got := byProduct(p.ID); !slices.Equal(got, wantAll) {
+			t.Fatalf("product filter = %v, want %v", got, wantAll)
+		}
+		if got := byBoth(owner, p.ID); !slices.Equal(got, wantAll) {
+			t.Fatalf("owner+product filter = %v, want %v", got, wantAll)
+		}
+		if got := byBoth(owner, otherProduct.ID); len(got) != 0 {
+			t.Fatalf("owner + a product they hold no tokens on = %v, want none", got)
+		}
+		if got := byOwner(uuid.New()); len(got) != 0 {
+			t.Fatalf("unknown owner = %v, want none", got)
+		}
+	})
 }

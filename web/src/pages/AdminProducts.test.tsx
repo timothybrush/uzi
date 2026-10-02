@@ -13,11 +13,13 @@ vi.mock("../lib/api", async (importOriginal) => {
     ...actual,
     api: {
       adminListProducts: vi.fn(),
+      listUsers: vi.fn(),
       adminListProductTokens: vi.fn(),
       adminCreateProduct: vi.fn(),
       adminUpdateProduct: vi.fn(),
       adminDeleteProduct: vi.fn(),
       adminRevokeProductToken: vi.fn(),
+      adminRotateProductClientSecret: vi.fn(),
       adminListProductConnections: vi.fn(),
       adminRevokeOAuthConnection: vi.fn(),
       // AdminShell's health pip self-fetches; it never settles here, so the pip stays off.
@@ -81,6 +83,7 @@ beforeEach(() => {
     user: { id: "u-admin", is_admin: true } as User,
   } as unknown as ReturnType<typeof useAuth>);
   mockApi.adminListProducts.mockResolvedValue({ products: [aProduct()] });
+  mockApi.listUsers.mockResolvedValue({ users: [] });
   mockApi.adminListProductTokens.mockResolvedValue({ truncated: false, tokens: [aToken()] });
 });
 
@@ -549,5 +552,168 @@ describe("AdminProducts truncated inventory", () => {
     ).toBeTruthy();
     // Paired with the positive in "AdminProducts list", where the same card shape says it.
     expect(within(metrics).queryByText("No tokens minted for this product.")).toBeNull();
+  });
+});
+
+describe("AdminProducts owner and product filters (issue #1935)", () => {
+  const user = (id: string, email: string) => ({ id, email, display_name: null }) as unknown as User;
+
+  async function pickFilters(filtered: AdminProductToken[] = []) {
+    mockApi.adminListProducts.mockResolvedValue({
+      products: [aProduct(), aProduct({ id: "prod-b", name: "Metrics export" })],
+    });
+    // The owner exists only in the users list, never in the initial inventory.
+    mockApi.listUsers.mockResolvedValue({ users: [user("u-dan", "dan@uzi.local"), user("u-mira", "mira@uzi.local")] });
+    mockApi.adminListProductTokens.mockImplementation(async (f) => ({
+      truncated: false,
+      tokens: f?.ownerId || f?.productId ? filtered : [aToken()],
+    }));
+    renderPage();
+    await productCard("Helpdesk assistant");
+    const owner = (await screen.findByRole("combobox", { name: "Owner" })) as HTMLSelectElement;
+    await waitFor(() => expect(within(owner).getByRole("option", { name: "dan@uzi.local" })).toBeTruthy());
+    fireEvent.change(owner, { target: { value: "u-dan" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Product" }), { target: { value: "prod-b" } });
+  }
+
+  it("sends both filters, shows the revealed token, and keeps them when a revoke reloads", async () => {
+    const hidden = aToken({ id: "old-1", product_id: "prod-b", name: "ancient", user_id: "u-dan", owner_email: "dan@uzi.local" });
+    mockApi.adminRevokeProductToken.mockResolvedValue(null);
+    await pickFilters([hidden]);
+    await waitFor(() =>
+      expect(mockApi.adminListProductTokens).toHaveBeenLastCalledWith({ ownerId: "u-dan", productId: "prod-b" }),
+    );
+    const metrics = await productCard("Metrics export");
+    expect(await within(metrics).findByText("ancient")).toBeTruthy();
+    // Only the chosen product's card remains.
+    expect(screen.queryByRole("region", { name: "Helpdesk assistant" })).toBeNull();
+
+    mockApi.adminListProductTokens.mockClear();
+    fireEvent.click(within(metrics).getByRole("button", { name: "Revoke ancient" }));
+    await waitFor(() => expect(mockApi.adminRevokeProductToken).toHaveBeenCalledWith("old-1"));
+    await waitFor(() =>
+      expect(mockApi.adminListProductTokens).toHaveBeenCalledWith({ ownerId: "u-dan", productId: "prod-b" }),
+    );
+  });
+
+  it("says no tokens match the current filters, not that none were minted", async () => {
+    await pickFilters();
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "u-mira" } });
+    const metrics = await productCard("Metrics export");
+    expect(await within(metrics).findByText("No tokens match the current filters.")).toBeTruthy();
+    expect(within(metrics).queryByText("No tokens minted for this product.")).toBeNull();
+  });
+
+  it("names the filters in the truncated notice", async () => {
+    await pickFilters();
+    mockApi.adminListProductTokens.mockResolvedValue({ truncated: true, tokens: [aToken({ product_id: "prod-b" })] });
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "u-mira" } });
+    expect(
+      await screen.findByText("Showing the first 1 tokens matching the current filters, active first; older tokens are not listed."),
+    ).toBeTruthy();
+  });
+
+  it("does not keep the previous filter's rows while the new request is pending", async () => {
+    await pickFilters();
+    await waitFor(() => expect(mockApi.adminListProductTokens).toHaveBeenLastCalledWith({ ownerId: "u-dan", productId: "prod-b" }));
+    // Back to no filters: the unfiltered inventory shows the default token.
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Product" }), { target: { value: "" } });
+    const helpdesk = await productCard("Helpdesk assistant");
+    expect(await within(helpdesk).findByText("support-prod")).toBeTruthy();
+
+    let release!: (v: { truncated: boolean; tokens: AdminProductToken[] }) => void;
+    mockApi.adminListProductTokens.mockImplementation(
+      () => new Promise((resolve) => { release = resolve; }),
+    );
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "u-mira" } });
+    await waitFor(() => expect(screen.queryByText("support-prod")).toBeNull());
+    expect(screen.queryByRole("button", { name: /^Revoke/ })).toBeNull();
+    release({ truncated: false, tokens: [] });
+    expect(await screen.findAllByText("No tokens match the current filters.")).toBeTruthy();
+  });
+
+  it("does not show the previous filter's rows when the refetch fails", async () => {
+    await pickFilters([aToken({ id: "old-1", product_id: "prod-b", name: "ancient", user_id: "u-dan" })]);
+    // The previous filter's result has a revocable row, so the assertions below can fail.
+    expect(await within(await productCard("Metrics export")).findByRole("button", { name: "Revoke ancient" })).toBeTruthy();
+    mockApi.adminListProductTokens.mockRejectedValue(new ApiError(500, "boom"));
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "u-mira" } });
+    expect(await screen.findByText("boom")).toBeTruthy();
+    // The card stays, but with neither the old rows nor a claim about the new filter.
+    const metrics = await productCard("Metrics export");
+    expect(within(metrics).queryByText("ancient")).toBeNull();
+    expect(within(metrics).queryByText("No tokens match the current filters.")).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Revoke/ })).toBeNull();
+  });
+
+  it("drops a failed filter's error and shows Loading tokens while the next filter loads", async () => {
+    await pickFilters();
+    await within(await productCard("Metrics export")).findByText("No tokens match the current filters.");
+    mockApi.adminListProductTokens.mockRejectedValue(new ApiError(500, "boom"));
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "u-mira" } });
+    expect(await screen.findByText("boom")).toBeTruthy();
+    mockApi.adminListProductTokens.mockImplementation(() => new Promise(() => {}));
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "" } });
+    await waitFor(() => expect(screen.queryByText("boom")).toBeNull());
+    expect(within(await productCard("Metrics export")).getByText("Loading tokens…")).toBeTruthy();
+  });
+
+  // Opens a card's OAuth disclosure the way ProductOAuthClient's own tests do.
+  function openOAuth(card: HTMLElement) {
+    const details = Array.from(card.querySelectorAll("details")).find((d) =>
+      d.textContent?.includes("OAuth client"),
+    ) as HTMLDetailsElement;
+    details.open = true;
+    fireEvent(details, new Event("toggle"));
+  }
+
+  it("keeps a card's unsaved redirect-URI draft across an owner filter change", async () => {
+    await pickFilters();
+    fireEvent.change(screen.getByRole("combobox", { name: "Product" }), { target: { value: "" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "" } });
+    const helpdesk = await productCard("Helpdesk assistant");
+    await within(helpdesk).findByText("support-prod");
+    openOAuth(helpdesk);
+    const uris = within(helpdesk).getByLabelText(/Redirect URIs/) as HTMLTextAreaElement;
+    fireEvent.change(uris, { target: { value: "https://draft.example.com/cb" } });
+
+    mockApi.adminListProductTokens.mockClear();
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "u-mira" } });
+    await waitFor(() => expect(mockApi.adminListProductTokens).toHaveBeenCalledWith({ ownerId: "u-mira", productId: "" }));
+    expect(await within(helpdesk).findByText("No tokens match the current filters.")).toBeTruthy();
+    expect((within(helpdesk).getByLabelText(/Redirect URIs/) as HTMLTextAreaElement).value).toBe(
+      "https://draft.example.com/cb",
+    );
+  });
+
+  it("keeps a one-time client secret on screen across owner and product filter changes", async () => {
+    const secret = "uzs_" + "A".repeat(43);
+    mockApi.adminRotateProductClientSecret.mockResolvedValue({ client_secret: secret, product: aProduct() });
+    await pickFilters();
+    fireEvent.change(screen.getByRole("combobox", { name: "Product" }), { target: { value: "" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "" } });
+    const helpdesk = await productCard("Helpdesk assistant");
+    await within(helpdesk).findByText("support-prod");
+    openOAuth(helpdesk);
+    fireEvent.click(within(helpdesk).getByRole("button", { name: "Create client secret" }));
+    expect(await within(helpdesk).findByText(secret)).toBeTruthy();
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "u-mira" } });
+    await waitFor(() => expect(mockApi.adminListProductTokens).toHaveBeenLastCalledWith({ ownerId: "u-mira", productId: "" }));
+    // Another product's filter hides this card without unmounting it ...
+    fireEvent.change(screen.getByRole("combobox", { name: "Product" }), { target: { value: "prod-b" } });
+    expect(screen.queryByRole("region", { name: "Helpdesk assistant" })).toBeNull();
+    // ... and clearing it brings the card back with the secret still shown.
+    fireEvent.change(screen.getByRole("combobox", { name: "Product" }), { target: { value: "" } });
+    expect(await screen.findByText(secret)).toBeTruthy();
+  });
+
+  it("shows an error beside the filters when the users list fails to load", async () => {
+    mockApi.listUsers.mockRejectedValue(new ApiError(500, "users down"));
+    renderPage();
+    await productCard("Helpdesk assistant");
+    expect(await screen.findByText("users down")).toBeTruthy();
+    expect(screen.getByRole("combobox", { name: "Owner" })).toBeTruthy();
   });
 });

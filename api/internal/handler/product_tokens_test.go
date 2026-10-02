@@ -201,6 +201,55 @@ func TestProductTokenListsAskForBoundPlusOne(t *testing.T) {
 	}
 }
 
+// TestAdminListProductTokensFilterBinding pins, without a database, which of the four
+// admin inventory queries each owner_id / product_id combination runs (the sqlc "-- name:"
+// header is embedded in the query text) and how the params bind into its args: distinct
+// UUIDs catch a swapped binding, and a malformed one is a 400 that never reaches the store.
+func TestAdminListProductTokensFilterBinding(t *testing.T) {
+	ownerID, productID := uuid.New(), uuid.New()
+	bound := int32(maxAdminProductTokenRows + 1)
+	for _, c := range []struct {
+		name, query string
+		wantCode    int
+		wantQuery   string
+		wantArgs    []any
+	}{
+		{"unfiltered", "", http.StatusOK, "ListAllProductTokensForAdmin",
+			[]any{bound}},
+		{"both", "owner_id=" + ownerID.String() + "&product_id=" + productID.String(), http.StatusOK,
+			"ListProductTokensForAdminByOwnerAndProduct", []any{ownerID, productID, bound}},
+		{"owner only", "owner_id=" + ownerID.String(), http.StatusOK,
+			"ListProductTokensForAdminByOwner", []any{ownerID, bound}},
+		{"product only", "product_id=" + productID.String(), http.StatusOK,
+			"ListProductTokensForAdminByProduct", []any{productID, bound}},
+		{"malformed owner_id", "owner_id=not-a-uuid&product_id=" + productID.String(), http.StatusBadRequest, "", nil},
+		{"malformed product_id", "owner_id=" + ownerID.String() + "&product_id=not-a-uuid", http.StatusBadRequest, "", nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			db := &fakeViewerListDB{}
+			h := &Handler{q: store.New(db)}
+			req := httptest.NewRequest(http.MethodGet, "/?"+c.query, nil)
+			rec := httptest.NewRecorder()
+			h.AdminListProductTokens(rec, req)
+			if rec.Code != c.wantCode {
+				t.Fatalf("status = %d %q, want %d", rec.Code, rec.Body.String(), c.wantCode)
+			}
+			if c.wantCode != http.StatusOK {
+				if db.called {
+					t.Errorf("store was queried with %#v despite the 400", db.gotArgs)
+				}
+				return
+			}
+			if !db.called || !slices.Equal(db.gotArgs, c.wantArgs) {
+				t.Errorf("store query args = %#v, want %#v", db.gotArgs, c.wantArgs)
+			}
+			if want := "-- name: " + c.wantQuery + " "; !strings.Contains(db.gotSQL, want) {
+				t.Errorf("ran the wrong query, want header %q in:\n%s", want, db.gotSQL)
+			}
+		})
+	}
+}
+
 // TestCutProductTokenList: the bound+1 fetch is cut to bound and flagged only when the
 // extra row came back; a result at or under the bound is served whole.
 func TestCutProductTokenList(t *testing.T) {

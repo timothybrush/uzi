@@ -177,9 +177,62 @@ const maxAdminProductTokenRows = 1000
 // says whether anything was cut: {"tokens": [...], "truncated": bool}. The per-user mint
 // limiter (authLimiter on POST /api/me/product-tokens) bounds how fast any one user can
 // add rows.
+//
+// FILTERS (#1935): optional ?owner_id=<uuid> and ?product_id=<uuid>; absent or empty
+// means no filter, both together mean AND, and a non-empty value that is not a UUID is a
+// 400 before any store call. Each filter shape runs its own static query (no optional
+// predicates, which a generic plan cannot index), and the filter narrows in SQL before
+// the ORDER BY ... LIMIT cut, so an active token that the unfiltered list cuts past the
+// bound stays reachable (and revocable) by narrowing to its owner and/or product. The
+// bound and "truncated" apply to the filtered result.
 func (h *Handler) AdminListProductTokens(w http.ResponseWriter, r *http.Request) {
+	var owner, product uuid.UUID
+	var hasOwner, hasProduct bool
+	for _, f := range []struct {
+		param, msg string
+		dst        *uuid.UUID
+		set        *bool
+	}{
+		{"owner_id", "invalid owner_id", &owner, &hasOwner},
+		{"product_id", "invalid product_id", &product, &hasProduct},
+	} {
+		if raw := r.URL.Query().Get(f.param); raw != "" {
+			parsed, err := uuid.Parse(raw)
+			if err != nil {
+				httpx.Error(w, http.StatusBadRequest, f.msg)
+				return
+			}
+			*f.dst, *f.set = parsed, true
+		}
+	}
 	bound := productTokenListBound(h.adminProductTokenRowsOverride, maxAdminProductTokenRows)
-	rows, err := h.q.ListAllProductTokensForAdmin(r.Context(), bound+1)
+	maxRows := bound + 1
+	// The four row types have identical fields, so each filtered result converts to the
+	// unfiltered one with a struct conversion (the compiler rejects drift between them).
+	var rows []store.ListAllProductTokensForAdminRow
+	var err error
+	switch {
+	case hasOwner && hasProduct:
+		var got []store.ListProductTokensForAdminByOwnerAndProductRow
+		got, err = h.q.ListProductTokensForAdminByOwnerAndProduct(r.Context(), store.ListProductTokensForAdminByOwnerAndProductParams{OwnerID: owner, ProductID: product, MaxRows: maxRows})
+		for _, g := range got {
+			rows = append(rows, store.ListAllProductTokensForAdminRow(g))
+		}
+	case hasOwner:
+		var got []store.ListProductTokensForAdminByOwnerRow
+		got, err = h.q.ListProductTokensForAdminByOwner(r.Context(), store.ListProductTokensForAdminByOwnerParams{OwnerID: owner, MaxRows: maxRows})
+		for _, g := range got {
+			rows = append(rows, store.ListAllProductTokensForAdminRow(g))
+		}
+	case hasProduct:
+		var got []store.ListProductTokensForAdminByProductRow
+		got, err = h.q.ListProductTokensForAdminByProduct(r.Context(), store.ListProductTokensForAdminByProductParams{ProductID: product, MaxRows: maxRows})
+		for _, g := range got {
+			rows = append(rows, store.ListAllProductTokensForAdminRow(g))
+		}
+	default:
+		rows, err = h.q.ListAllProductTokensForAdmin(r.Context(), maxRows)
+	}
 	if err != nil {
 		slog.Error("admin list product tokens", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")

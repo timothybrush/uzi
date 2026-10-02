@@ -197,6 +197,10 @@ UPDATE product_tokens SET revoked = true WHERE id = $1 AND NOT revoked;
 -- first) before any active token; once the ACTIVE tokens alone exceed the bound, the
 -- oldest active tokens are cut too, and "truncated" is what tells the admin. The
 -- per-user mint limiter bounds how fast rows can be added.
+--
+-- The owner/product-filtered inventory (#1935) uses the three static sibling queries
+-- below, not optional predicates here: a generic plan cannot use an index under
+-- "$1 IS NULL OR col = $1".
 SELECT t.id,
        t.user_id,
        u.email AS owner_email,
@@ -214,6 +218,94 @@ SELECT t.id,
   JOIN users u ON u.id = t.user_id
   JOIN products p ON p.id = t.product_id
  WHERE t.grant_id IS NULL
+ ORDER BY (t.revoked OR (t.expires_at IS NOT NULL AND t.expires_at <= now())) ASC,
+          t.created_at DESC,
+          t.id ASC
+ LIMIT sqlc.arg(max_rows)::int;
+
+-- name: ListProductTokensForAdminByOwner :many
+-- Filtered variant of ListAllProductTokensForAdmin (#1935): same projection (token_hash is
+-- deliberately absent, the security boundary documented on that query), joins, ordering and
+-- bound. The filter narrows in the WHERE BEFORE the LIMIT, so a token the unfiltered list cuts
+-- stays reachable, and "truncated" is judged per filtered result. Served by idx_product_tokens_user
+-- (user_id, revoked) (migrations/00270_product_tokens.sql).
+SELECT t.id,
+       t.user_id,
+       u.email AS owner_email,
+       t.product_id,
+       p.name AS product_name,
+       t.name,
+       t.token_prefix,
+       t.scopes,
+       t.revoked,
+       t.created_at,
+       t.last_used_at,
+       t.last_used_ip,
+       t.expires_at
+  FROM product_tokens t
+  JOIN users u ON u.id = t.user_id
+  JOIN products p ON p.id = t.product_id
+ WHERE t.grant_id IS NULL
+   AND t.user_id = sqlc.arg(owner_id)
+ ORDER BY (t.revoked OR (t.expires_at IS NOT NULL AND t.expires_at <= now())) ASC,
+          t.created_at DESC,
+          t.id ASC
+ LIMIT sqlc.arg(max_rows)::int;
+
+-- name: ListProductTokensForAdminByProduct :many
+-- Filtered variant of ListAllProductTokensForAdmin (#1935): same projection (token_hash is
+-- deliberately absent, the security boundary documented on that query), joins, ordering and
+-- bound. The filter narrows in the WHERE BEFORE the LIMIT, so a token the unfiltered list cuts
+-- stays reachable, and "truncated" is judged per filtered result. Served by
+-- idx_product_tokens_product (product_id) (migrations/00270_product_tokens.sql).
+SELECT t.id,
+       t.user_id,
+       u.email AS owner_email,
+       t.product_id,
+       p.name AS product_name,
+       t.name,
+       t.token_prefix,
+       t.scopes,
+       t.revoked,
+       t.created_at,
+       t.last_used_at,
+       t.last_used_ip,
+       t.expires_at
+  FROM product_tokens t
+  JOIN users u ON u.id = t.user_id
+  JOIN products p ON p.id = t.product_id
+ WHERE t.grant_id IS NULL
+   AND t.product_id = sqlc.arg(product_id)
+ ORDER BY (t.revoked OR (t.expires_at IS NOT NULL AND t.expires_at <= now())) ASC,
+          t.created_at DESC,
+          t.id ASC
+ LIMIT sqlc.arg(max_rows)::int;
+
+-- name: ListProductTokensForAdminByOwnerAndProduct :many
+-- Filtered variant of ListAllProductTokensForAdmin (#1935): same projection (token_hash is
+-- deliberately absent, the security boundary documented on that query), joins, ordering and
+-- bound. The filter narrows in the WHERE BEFORE the LIMIT, so a token the unfiltered list cuts
+-- stays reachable, and "truncated" is judged per filtered result. Served by idx_product_tokens_user
+-- (user_id, revoked) or idx_product_tokens_product (product_id) (migrations/00270_product_tokens.sql).
+SELECT t.id,
+       t.user_id,
+       u.email AS owner_email,
+       t.product_id,
+       p.name AS product_name,
+       t.name,
+       t.token_prefix,
+       t.scopes,
+       t.revoked,
+       t.created_at,
+       t.last_used_at,
+       t.last_used_ip,
+       t.expires_at
+  FROM product_tokens t
+  JOIN users u ON u.id = t.user_id
+  JOIN products p ON p.id = t.product_id
+ WHERE t.grant_id IS NULL
+   AND t.user_id = sqlc.arg(owner_id)
+   AND t.product_id = sqlc.arg(product_id)
  ORDER BY (t.revoked OR (t.expires_at IS NOT NULL AND t.expires_at <= now())) ASC,
           t.created_at DESC,
           t.id ASC
