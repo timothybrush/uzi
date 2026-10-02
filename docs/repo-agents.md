@@ -36,6 +36,24 @@ roster is detected the message shows two approve buttons — **Approve · repo a
 and **Approve · my templates** — so you pick the source without leaving Slack.
 Per-agent exclusions are a web-only refinement; use "Open in uzi" for those.
 
+## Repo agents on Codex runs
+
+On a Codex run the agent selection applies the same way: implementation
+delegates to the roster you chose at the plan gate (by default the detected
+repo roster), honours your exclusions, and falls back to your own templates when
+the selection is invalid. Planning keeps your own templates. Two Codex-specific
+rules apply to each repo agent's frontmatter:
+
+- **`model:`** is honored only when it names a supported Codex model; otherwise
+  the run's model is used.
+- **`tools:`** entries Codex does not recognise are dropped, never widened
+  into something broader, so a repo
+  agent can only end up with less authority than it declared.
+
+The [trust trade-off](#the-trust-trade-off--read-before-you-pick-repo-agents)
+below applies unchanged: the lead is told repo-defined subagents' output is
+unverified.
+
 ## What is loaded, and what is never
 
 uzi parses the agent files itself; it never points Claude Code at the repo's
@@ -43,8 +61,9 @@ uzi parses the agent files itself; it never points Claude Code at the repo's
 frontmatter is honored — including a `tools:` entry naming one of the
 [forge read tools](./forge-read-tools.md) (`mcp__forge__*`), which a repo
 agent can grant itself the same way a template does. That surface is
-read-only and scoped to the run's own project regardless of which agent
-calls it. A repo agent's own hooks, settings, and slash commands
+scoped to the run's own project regardless of which agent calls it. The
+read tools inspect forge data; the reply and resolve tools can modify review
+threads present in the run's MR review snapshot. A repo agent's own hooks, settings, and slash commands
 are **never** loaded, and the primary-directive guardrails always apply: no repo
 agent can push to `main`, rewrite history, spawn nested agents, or schedule
 deferred work, whatever its file says.
