@@ -22,33 +22,6 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
-### Changed
-
-- **Feature bingo and refactor scout inherit the owner's default model ([#2095](https://github.com/vtmocanu/uzi/issues/2095)).**
-  Newly enabled schedules use the owner's per-harness default instead of pinning `fable`. Existing schedules keep their saved model; reset the schedule to catalog defaults or clear its model in the editor to inherit.
-- **Built-in agents synced to skills v0.44.0** ([#2086](https://github.com/vtmocanu/uzi/pull/2086)). The architect (v12) consults a `dba` database specialist on schema, index, transaction and migration decisions when the team has one, and the reviewer (v19) asks for it when correctness depends on database behaviour instead of certifying that behaviour without evidence.
-- **Routine dependency bumps: `gitlab.com/gitlab-org/api/client-go/v3` to v3.14.0 ([#2000](https://github.com/vtmocanu/uzi/pull/2000)) and the Kubernetes client libraries (`k8s.io/api`, `apimachinery`, `client-go`) to v0.37.1 in the controller ([#1996](https://github.com/vtmocanu/uzi/pull/1996)).**
-  No uzi code change required.
-
-### Fixed
-
-- **A Codex run no longer fails on one overloaded or unavailable response from the provider ([#2099](https://github.com/vtmocanu/uzi/issues/2099)).**
-  A Codex turn that ends with a transient provider failure (server overloaded, internal server error, flex capacity unavailable, or an HTTP transport failure with a 408, 429, 5xx or no status) is now retried on the same thread up to 2 times per turn after a short wait (2s, then 4s). If it persists, the run saves a verified recovery checkpoint and parks in `recovery_wait` instead of failing as an agent failure and losing uncommitted work. The retries come on top of Codex's own request and stream retries, and cancel, pause and the wall-clock budget during the wait behave as before. Permanent transport statuses (400, 401, 403 and similar), Codex's own rate-limit and usage-limit errors, and authentication or model failures keep their existing handling.
-
-- **TUI finished runs now match the web Past runs order ([#2098](https://github.com/vtmocanu/uzi/issues/2098)).**
-  The DONE band shows the most recently finished runs first, falling back to the last update for runs without a finish time. Equal finish times put failed runs before cancelled runs before completed runs, retaining the server order for remaining ties.
-
-- **Sign-in rate limits now count an IPv6 client per /64, not per address ([#2075](https://github.com/vtmocanu/uzi/issues/2075)).**
-  The per-IP limiter on register, login, the auth config endpoint, OIDC, CLI sign-in start and poll, and the OAuth authorize, token and revoke endpoints keyed on the full client address, so an IPv6 client could rotate addresses inside its /64 and get a fresh budget for each one. IPv6 clients now share one budget per /64, and IPv4-mapped, 6to4 and NAT64 well-known-prefix (`64:ff9b::/96`) addresses share the budget of the IPv4 address they embed. IPv6 users behind one /64 (a home or office) now share the budget, as users behind one IPv4 NAT already did. A holder of a larger delegation (/56, /48) still gets one budget per /64 inside it.
-- **`/api/v1` now answers 503 `auth_unavailable` instead of 401 when the token store cannot be read ([#1992](https://github.com/vtmocanu/uzi/issues/1992)).**
-  A token lookup that failed with anything other than "no such row" (a database outage or timeout) was reported as 401, which a client reads as a revoked token. It is now a fail-closed 503 with no `Retry-After` header (no honest outage estimate); every credential refusal stays the identical 401, and every `/api/v1` operation lists 503 in the OpenAPI document. `uzi job` therefore exits 6 (transient, back off and retry) instead of 3 (auth) during an outage. The operator warning is now logged for a database pool or dial timeout and skipped only when the client has gone away. Known limit: if the first lookup succeeds and a later one fails, the holder of that exact token can tell it from an unknown one; external consumers' handling of an auth 503 on every operation is unverified.
-- **Codex agent commands that read stdin no longer hang until the 60-minute command deadline ([#2087](https://github.com/vtmocanu/uzi/issues/2087)).**
-  The command sandbox passed its own stdin, an open pipe that nothing writes to or closes, through to every command, so `rg PATTERN` with no path or a bare `cat` could block until the command deadline unless interrupted. Model-authorized commands now get an empty stdin (`/dev/null`) and see end-of-file at once; pipes and heredocs written inside the command itself work as before. The worker's own internal processes that stream data (file operations, git pack import) keep their stdin.
-- **CI and worker semgrep versions stay in sync ([#2093](https://github.com/vtmocanu/uzi/issues/2093)).**
-  CI now uses semgrep 1.172.0, matching the worker toolchain lock. The repository gate rejects version drift and fails closed when either pin cannot be resolved, so an independent CI update cannot silently change the SAST engine.
-- **A CI auto-fix or MR rework halt DM that Slack failed to take is now retried until it reaches you, instead of being lost ([#1675](https://github.com/vtmocanu/uzi/issues/1675)).**
-  The "CI auto-fix stopped" and "MR rework stopped" DMs were sent once, best-effort, so a full Slack queue or a Slack error dropped them silently; this mattered most for a scheduled prompt MR with no backing issue, where the DM is the only signal. The notification now stores its rendered DM and is marked delivered on a successful post (or when you have no confirmed Slack link); an undelivered one is re-queued every 5 minutes for up to about 24 hours, after which uzi gives up. The forge halt comment is still posted at most once. A rare duplicate DM is possible, and a DM delayed by a Slack outage can arrive after the halt no longer applies. Other notification kinds are unchanged.
-
 ## [0.85.0] - 2026-09-26
 
 ### Added
@@ -207,6 +180,12 @@ through `[0.52.0]`.)
 
 - **Codex leads and subagents are told how a long gate command behaves ([#1926](https://github.com/vtmocanu/uzi/issues/1926)).**
   A Codex command reaps its backgrounded descendants before it returns, so the agent is now told to run one long gate in the foreground to a log and read the recorded exit status, instead of backgrounding it and polling a result that no longer exists.
+
+- **Feature bingo and refactor scout inherit the owner's default model ([#2095](https://github.com/vtmocanu/uzi/issues/2095)).**
+  Newly enabled schedules use the owner's per-harness default instead of pinning `fable`. Existing schedules keep their saved model; reset the schedule to catalog defaults or clear its model in the editor to inherit.
+- **Built-in agents synced to skills v0.44.0** ([#2086](https://github.com/vtmocanu/uzi/pull/2086)). The architect (v12) consults a `dba` database specialist on schema, index, transaction and migration decisions when the team has one, and the reviewer (v19) asks for it when correctness depends on database behaviour instead of certifying that behaviour without evidence.
+- **Routine dependency bumps: `gitlab.com/gitlab-org/api/client-go/v3` to v3.14.0 ([#2000](https://github.com/vtmocanu/uzi/pull/2000)) and the Kubernetes client libraries (`k8s.io/api`, `apimachinery`, `client-go`) to v0.37.1 in the controller ([#1996](https://github.com/vtmocanu/uzi/pull/1996)).**
+  No uzi code change required.
 
 ### Fixed
 
@@ -376,6 +355,23 @@ through `[0.52.0]`.)
 
 - **Codex runs now include owner follow-ups in the agent's prompt, and the steer queue says whether a follow-up reached a prompt ([#1800](https://github.com/vtmocanu/uzi/issues/1800)).**
   A follow-up sent to a Codex run was accepted and shown as delivered but never reached the agent; it now rides the next ordinary implementation prompt on both Claude and Codex, one per turn, and one sent at the plan gate is included in the first prompt after approval (on Claude it used to wait a turn). After a resume, a follow-up handled by a worker that reports inclusion but never included is re-sent to the lead (at-least-once, so it can appear twice). `uzi run inputs`, the TUI and the web steer queue no longer say "delivered": they show queued, received, routed, included in a prompt, or not confirmed (run finished), and rows handled by older workers read "no inclusion report". The follow-up text is fenced as untrusted input with a per-prompt tag. The steer-queue API (`/api/runs/{id}/inputs`, `uzi run inputs --json`) gains `applied_at`, `included_at` and `inclusion_reported`. See [run activity](docs/run-activity.md).
+
+- **A Codex run no longer fails on one overloaded or unavailable response from the provider ([#2099](https://github.com/vtmocanu/uzi/issues/2099)).**
+  A Codex turn that ends with a transient provider failure (server overloaded, internal server error, flex capacity unavailable, or an HTTP transport failure with a 408, 429, 5xx or no status) is now retried on the same thread up to 2 times per turn after a short wait (2s, then 4s). If it persists, the run saves a verified recovery checkpoint and parks in `recovery_wait` instead of failing as an agent failure and losing uncommitted work. The retries come on top of Codex's own request and stream retries, and cancel, pause and the wall-clock budget during the wait behave as before. Permanent transport statuses (400, 401, 403 and similar), Codex's own rate-limit and usage-limit errors, and authentication or model failures keep their existing handling.
+
+- **TUI finished runs now match the web Past runs order ([#2098](https://github.com/vtmocanu/uzi/issues/2098)).**
+  The DONE band shows the most recently finished runs first, falling back to the last update for runs without a finish time. Equal finish times put failed runs before cancelled runs before completed runs, retaining the server order for remaining ties.
+
+- **Sign-in rate limits now count an IPv6 client per /64, not per address ([#2075](https://github.com/vtmocanu/uzi/issues/2075)).**
+  The per-IP limiter on register, login, the auth config endpoint, OIDC, CLI sign-in start and poll, and the OAuth authorize, token and revoke endpoints keyed on the full client address, so an IPv6 client could rotate addresses inside its /64 and get a fresh budget for each one. IPv6 clients now share one budget per /64, and IPv4-mapped, 6to4 and NAT64 well-known-prefix (`64:ff9b::/96`) addresses share the budget of the IPv4 address they embed. IPv6 users behind one /64 (a home or office) now share the budget, as users behind one IPv4 NAT already did. A holder of a larger delegation (/56, /48) still gets one budget per /64 inside it.
+- **`/api/v1` now answers 503 `auth_unavailable` instead of 401 when the token store cannot be read ([#1992](https://github.com/vtmocanu/uzi/issues/1992)).**
+  A token lookup that failed with anything other than "no such row" (a database outage or timeout) was reported as 401, which a client reads as a revoked token. It is now a fail-closed 503 with no `Retry-After` header (no honest outage estimate); every credential refusal stays the identical 401, and every `/api/v1` operation lists 503 in the OpenAPI document. `uzi job` therefore exits 6 (transient, back off and retry) instead of 3 (auth) during an outage. The operator warning is now logged for a database pool or dial timeout and skipped only when the client has gone away. Known limit: if the first lookup succeeds and a later one fails, the holder of that exact token can tell it from an unknown one; external consumers' handling of an auth 503 on every operation is unverified.
+- **Codex agent commands that read stdin no longer hang until the 60-minute command deadline ([#2087](https://github.com/vtmocanu/uzi/issues/2087)).**
+  The command sandbox passed its own stdin, an open pipe that nothing writes to or closes, through to every command, so `rg PATTERN` with no path or a bare `cat` could block until the command deadline unless interrupted. Model-authorized commands now get an empty stdin (`/dev/null`) and see end-of-file at once; pipes and heredocs written inside the command itself work as before. The worker's own internal processes that stream data (file operations, git pack import) keep their stdin.
+- **CI and worker semgrep versions stay in sync ([#2093](https://github.com/vtmocanu/uzi/issues/2093)).**
+  CI now uses semgrep 1.172.0, matching the worker toolchain lock. The repository gate rejects version drift and fails closed when either pin cannot be resolved, so an independent CI update cannot silently change the SAST engine.
+- **A CI auto-fix or MR rework halt DM that Slack failed to take is now retried until it reaches you, instead of being lost ([#1675](https://github.com/vtmocanu/uzi/issues/1675)).**
+  The "CI auto-fix stopped" and "MR rework stopped" DMs were sent once, best-effort, so a full Slack queue or a Slack error dropped them silently; this mattered most for a scheduled prompt MR with no backing issue, where the DM is the only signal. The notification now stores its rendered DM and is marked delivered on a successful post (or when you have no confirmed Slack link); an undelivered one is re-queued every 5 minutes for up to about 24 hours, after which uzi gives up. The forge halt comment is still posted at most once. A rare duplicate DM is possible, and a DM delayed by a Slack outage can arrive after the halt no longer applies. Other notification kinds are unchanged.
 
 ## [0.84.0] - 2026-09-26
 
