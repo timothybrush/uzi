@@ -336,6 +336,99 @@ describe("CodexDelegationRunner: root-only + nested denial (honest child origin)
 });
 
 describe("CodexDelegationRunner: terminal + cancellation", () => {
+  it("classifies a failed child terminal without exposing provider text", async () => {
+    const providerText = "provider secret diagnostic";
+    const controller = new FakeController({ threadId: "ct", turnId: "cu", notes: [] });
+    withNotes(controller, [{
+      kind: "turn_completed",
+      method: "turn/completed",
+      threadId: controller.threadId,
+      turnId: controller.turnId,
+      params: { turn: { status: "failed", error: { codexErrorInfo: "serverOverloaded", message: providerText } } },
+    }]);
+    const res = await makeRunner({ controller }).runner.run(delegReq());
+    assert.equal(res.ok, false);
+    assert.equal(res.code, "child_failed");
+    assert.equal(res.message, "the delegated child turn failed (transport)");
+    assert.equal(controller.closed, true);
+    assert.equal(JSON.stringify(res).includes(providerText), false);
+  });
+
+  it("ignores a retrying-only error when the child later fails without a classification", async () => {
+    const controller = new FakeController({ threadId: "ct", turnId: "cu", notes: [] });
+    withNotes(controller, [
+      { kind: "codex_error", method: "error", threadId: controller.threadId, turnId: controller.turnId, willRetry: true,
+        params: { error: { codexErrorInfo: "serverOverloaded" } } },
+      turnCompletedNote(controller, "failed"),
+    ]);
+    const res = await makeRunner({ controller }).runner.run(delegReq());
+    assert.equal(res.ok, false);
+    assert.equal(res.code, "child_failed");
+    assert.equal(res.message, "the delegated child turn failed");
+    assert.equal(controller.closed, true);
+  });
+
+  it("ignores foreign-thread and stale-turn errors without a later active error", async () => {
+    const controller = new FakeController({ threadId: "ct", turnId: "cu", notes: [] });
+    withNotes(controller, [
+      { kind: "codex_error", method: "error", threadId: "other", turnId: controller.turnId, willRetry: false,
+        params: { error: { codexErrorInfo: "serverOverloaded" } } },
+      { kind: "codex_error", method: "error", threadId: controller.threadId, turnId: "old-turn", willRetry: false,
+        params: { error: { codexErrorInfo: "unauthorized" } } },
+      turnCompletedNote(controller, "failed"),
+    ]);
+    const res = await makeRunner({ controller }).runner.run(delegReq());
+    assert.equal(res.ok, false);
+    assert.equal(res.code, "child_failed");
+    assert.equal(res.message, "the delegated child turn failed");
+    assert.equal(controller.closed, true);
+  });
+
+  it("prefers the active final non-retrying error over a conflicting terminal error", async () => {
+    const controller = new FakeController({ threadId: "ct", turnId: "cu", notes: [] });
+    withNotes(controller, [
+      { kind: "codex_error", method: "error", threadId: controller.threadId, turnId: controller.turnId, willRetry: false,
+        params: { error: { codexErrorInfo: "unauthorized" } } },
+      { kind: "codex_error", method: "error", threadId: controller.threadId, turnId: controller.turnId, willRetry: false,
+        params: { error: { codexErrorInfo: "serverOverloaded", message: "private provider detail" } } },
+      { kind: "turn_completed", method: "turn/completed", threadId: controller.threadId, turnId: controller.turnId,
+        params: { turn: { status: "failed", error: { codexErrorInfo: "unauthorized" } } } },
+    ]);
+    const res = await makeRunner({ controller }).runner.run(delegReq());
+    assert.equal(res.code, "child_failed");
+    assert.equal(res.message, "the delegated child turn failed (transport)");
+    assert.equal(JSON.stringify(res).includes("private provider detail"), false);
+    assert.equal(controller.closed, true);
+  });
+
+  it("returns success when a completed child terminal still carries error params", async () => {
+    const controller = new FakeController({ threadId: "ct", turnId: "cu", notes: [] });
+    withNotes(controller, [
+      { kind: "codex_error", method: "error", threadId: controller.threadId, turnId: controller.turnId, willRetry: false,
+        params: { error: { codexErrorInfo: "serverOverloaded" } } },
+      { kind: "turn_completed", method: "turn/completed", threadId: controller.threadId, turnId: controller.turnId,
+        params: { turn: { status: "completed", error: { codexErrorInfo: "unauthorized" } } } },
+    ]);
+    const res = await makeRunner({ controller }).runner.run(delegReq());
+    assert.deepEqual(res, { ok: true, output: { role: "coder", text: "" } });
+    assert.equal(controller.closed, true);
+  });
+
+  it("keeps a generic failure without info and bounds unknown info", async () => {
+    for (const [info, expected] of [
+      [undefined, "the delegated child turn failed"],
+      ["untrusted provider tag", "the delegated child turn failed (unknown)"],
+    ] as const) {
+      const controller = new FakeController({ notes: [] });
+      withNotes(controller, [{ kind: "turn_completed", method: "turn/completed",
+        threadId: controller.threadId, turnId: controller.turnId,
+        params: { turn: { status: "failed", error: { codexErrorInfo: info } } } }]);
+      const res = await makeRunner({ controller }).runner.run(delegReq());
+      assert.equal(res.message, expected);
+      assert.equal(controller.closed, true);
+    }
+  });
+
   it("returns child_failed on a non-completed terminal", async () => {
     const controller = new FakeController({ threadId: "ct", turnId: "cu", notes: [] });
     (controller as unknown as { notes: CodexNotification[] }).notes = [turnCompletedNote(controller, "error")];
@@ -354,9 +447,11 @@ describe("CodexDelegationRunner: terminal + cancellation", () => {
     assert.equal(res.code, "child_failed");
   });
 
-  it("returns child_aborted and interrupts+closes the child when the run signal aborts", async () => {
+  it("returns child_aborted after an error notification when the run signal aborts", async () => {
     const parent = new AbortController();
     const controller = new FakeController({ threadId: "ct", turnId: "cu", notes: [], hangAfter: true });
+    withNotes(controller, [{ kind: "codex_error", method: "error", threadId: controller.threadId,
+      turnId: controller.turnId, willRetry: false, params: { error: { codexErrorInfo: "serverOverloaded" } } }]);
     const b = makeRunner({ controller, signal: parent.signal });
     const p = b.runner.run(delegReq());
     await new Promise((r) => setTimeout(r, 15));
@@ -364,16 +459,20 @@ describe("CodexDelegationRunner: terminal + cancellation", () => {
     const res = await p;
     assert.equal(res.ok, false);
     assert.equal(res.code, "child_aborted");
+    assert.equal(res.message, "the delegated child was cancelled");
     assert.equal(controller.interrupted, true);
     assert.equal(controller.closed, true);
   });
 
-  it("returns child_timeout when the child never completes within the deadline", async () => {
+  it("returns child_timeout after an error notification when the child never completes", async () => {
     const controller = new FakeController({ threadId: "ct", turnId: "cu", notes: [], hangAfter: true });
+    withNotes(controller, [{ kind: "codex_error", method: "error", threadId: controller.threadId,
+      turnId: controller.turnId, willRetry: false, params: { error: { codexErrorInfo: "serverOverloaded" } } }]);
     const b = makeRunner({ controller, childTurnDeadlineMs: 30 });
     const res = await b.runner.run(delegReq());
     assert.equal(res.ok, false);
     assert.equal(res.code, "child_timeout");
+    assert.equal(res.message, "the delegated child was cancelled");
     assert.equal(controller.interrupted, true);
     assert.equal(controller.closed, true);
   });
