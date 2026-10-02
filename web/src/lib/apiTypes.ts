@@ -1545,7 +1545,9 @@ export type ProductTokenExpiry = "30d" | "90d" | "1y" | "never";
 
 // Product is one registered external product (apitypes.ProductDTO). deleted_at is
 // null for a live product; a soft-deleted product is always disabled and stays listed
-// for the audit trail. active_token_count counts tokens neither revoked nor expired.
+// for the audit trail. active_token_count counts MANUAL tokens neither revoked nor expired
+// (the access tokens of OAuth connections are not counted); live_connection_count counts the
+// product's live OAuth connections (PRD #1910 D5).
 export interface Product {
   id: string;
   name: string;
@@ -1554,12 +1556,42 @@ export interface Product {
   deleted_at: string | null;
   created_at: string;
   active_token_count: number;
+  /** Live OAuth connections of the product (apitypes.ProductDTO.LiveConnectionCount, PRD #1910).
+   *  OPTIONAL for the api/web rollout skew, like allowed_job_types: a mid-deploy api pod
+   *  predating it omits the key, so every read falls back (`?? 0`). */
+  live_connection_count?: number;
   /** Job types this product may create (apitypes.ProductDTO.AllowedJobTypes, PRD #1908);
    *  empty allows none (fail-closed). The mapper normalizes a nil slice to [], so it is
    *  never null on the wire. OPTIONAL for the api/web rollout skew (as Run.credential_override
    *  and outcome_pending): a mid-deploy api pod predating #1908 omits the key, so every read
    *  falls back (`?? []`, or hides the editor) instead of crashing the Products page. */
   allowed_job_types?: string[];
+  /** The product's OAuth client registration (apitypes.ProductDTO.OAuthClient, PRD #1910).
+   *  OPTIONAL for the api/web rollout skew, like allowed_job_types: a mid-deploy api pod
+   *  predating #1910 omits it, so every read treats a missing value as "not a client". */
+  oauth_client?: ProductOAuthClient;
+}
+
+// ProductOAuthClient is the OAuth-client half of a product (apitypes.ProductOAuthClientDTO,
+// PRD #1910 D2). The client secret and its hash are never fields: has_secret says one exists,
+// secret_prefix is its short display prefix ("" when none) and rotated_at when it last changed
+// (null when never). is_client is the server's derived "can run the consent flow": a redirect
+// URI, a scope list and a secret. redirect_uris and scopes are never null on the wire.
+export interface ProductOAuthClient {
+  redirect_uris: string[];
+  scopes: ProductTokenScope[];
+  has_secret: boolean;
+  secret_prefix: string;
+  rotated_at: string | null;
+  is_client: boolean;
+}
+
+// RotateProductClientSecretResponse is POST /api/admin/products/{id}/oauth/secret
+// (apitypes.RotateProductClientSecretResponse): the new plaintext client secret, shown exactly
+// once (only its sha256 is stored), plus the updated product.
+export interface RotateProductClientSecretResponse {
+  client_secret: string;
+  product: Product;
 }
 
 // ProductPatch is the PATCH /api/admin/products/{id} body: every field optional, an omitted
@@ -1632,11 +1664,13 @@ export interface ProductSkills {
 
 // AdminDeleteProductResponse is DELETE /api/admin/products/{id}
 // (apitypes.AdminDeleteProductResponse): the soft-deleted product plus how many of its
-// tokens the delete stopped (0 when the product was already disabled, since those
-// tokens were already refused).
+// manual tokens and live OAuth connections the delete stopped (0 for each when the product
+// was already disabled, since those were already refused).
 export interface AdminDeleteProductResponse {
   product: Product;
   stopped_token_count: number;
+  /** OPTIONAL for the api/web rollout skew, like Product.live_connection_count. */
+  stopped_connection_count?: number;
 }
 
 // MintableProduct is one entry of the user mint picker, GET
@@ -1702,6 +1736,64 @@ export interface CliAuthRequestMeta {
   client_desc: string;
   status: CliAuthStatus;
   expires_at: string;
+}
+
+// ── OAuth consent flow (PRD #1910 M2) ─────────────────────────────────────────
+// The `/connect` consent page reads a pending authorize request and approves or denies it.
+
+// OAuthRequestStatus mirrors oauth_authorize_requests.status; only "pending" can still be decided.
+export type OAuthRequestStatus = "pending" | "approved" | "redeemed" | "denied" | "superseded";
+
+// OAuthAuthorizeRequest is GET /api/oauth/requests/{id} (apitypes.OAuthAuthorizeRequestDTO).
+// product_name and product_description are admin-written plain strings the page renders as TEXT,
+// never Markdown or HTML. redirect_host is the host (and port) the browser is sent to afterwards.
+// The code challenge, the redirect URI list and every hash are deliberately absent.
+export interface OAuthAuthorizeRequest {
+  product_name: string;
+  product_description: string;
+  redirect_host: string;
+  scopes: ProductTokenScope[];
+  status: OAuthRequestStatus;
+  expires_at: string;
+}
+
+// OAuthRedirect is the approve / deny response (apitypes.OAuthRedirectResponse): the URL the page
+// navigates to, built by the server from the product's registered redirect URI. It is the ONLY
+// URL the consent page ever navigates to; nothing from the page's own query string is used.
+export interface OAuthRedirect {
+  redirect_url: string;
+}
+
+// OAuthConnection is one live OAuth connection (grant) of the caller, from GET
+// /api/me/oauth-connections (apitypes.OAuthConnectionDTO). connected_at is the latest consent,
+// created_at the first one; last_used_at is the later of the refresh token's last use and the
+// latest use of any access token (null if never used); refresh_issued_at is null until the
+// authorization code is exchanged. A connection is listed while it is live, whatever the state of
+// its access tokens. Never carries a token or a hash.
+export interface OAuthConnection {
+  id: string;
+  product_id: string;
+  product_name: string;
+  scopes: ProductTokenScope[];
+  connected_at: string;
+  created_at: string;
+  last_used_at: string | null;
+  refresh_issued_at: string | null;
+}
+
+// AdminOAuthConnection is one live OAuth connection of a product, from GET
+// /api/admin/products/{id}/connections (apitypes.AdminOAuthConnectionDTO): the connecting user
+// (id and email, as the admin token inventory shows an owner), the approved scopes and the
+// timestamps. connected_at is the latest consent, created_at the first one; last_used_at is null
+// if never used. Never carries a token or a hash.
+export interface AdminOAuthConnection {
+  id: string;
+  user_id: string;
+  owner_email: string;
+  scopes: ProductTokenScope[];
+  connected_at: string;
+  created_at: string;
+  last_used_at: string | null;
 }
 
 // ── Agent memory (PRD #90) ────────────────────────────────────────────────

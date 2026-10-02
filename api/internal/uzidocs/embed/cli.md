@@ -712,9 +712,10 @@ A few worth knowing:
   split as every other `admin` verb.
 - **`admin products` lists the external products registered for product
   tokens** (PRD #1907), soft-deleted ones included, with `NAME`, `STATE`
-  (`enabled`, `disabled` or `deleted`), `ACTIVE_TOKENS` (tokens neither
-  revoked nor expired) and `DESCRIPTION`. A disabled or deleted product's
-  tokens are refused on `/api/v1`, and a deleted product can never be
+  (`enabled`, `disabled` or `deleted`), `ACTIVE_TOKENS` (manual product
+  tokens neither revoked nor expired; the access tokens of OAuth connections
+  are not counted), `CONNECTIONS` (live OAuth connections) and `DESCRIPTION`.
+  A disabled or deleted product's tokens and connections are refused on `/api/v1`, and a deleted product can never be
   re-enabled. Read-only: registering, editing, deleting a product and
   revoking one of its tokens are browser-only admin actions.
   `admin products skills <product>` (a product's name or id) shows one
@@ -731,6 +732,14 @@ A few worth knowing:
   works with a `uza_` token; allowing and removing a list are browser-only
   admin actions on **Admin → Products**. See [Product
   tokens](product-tokens.md#site-lists-for-jobs).
+  `admin products connections <product>` lists, read-only, the users who have
+  connected that product through OAuth (PRD #1910): `USER`, `SCOPES`,
+  `CONNECTED`, `LAST USED` and the connection `ID`. A connection is listed while
+  it is live, whatever the state of its access tokens. `--json` prints
+  `{"connections": [...], "truncated": bool}`; `truncated` is true when the
+  server cut the list at its 1000-row cap. It works with a `uza_` token;
+  revoking a connection is a browser-only admin action on **Admin → Products**.
+  See [Connect a product](connect-a-product.md).
 - **`admin guardrail-impact` is a live pre-flight count** (PRD #66) — how many
   enabled repos, factory-wide, the push/merge guardrail would refuse right now
   (the bot can push or merge to the default branch). It **persists nothing**: it
@@ -2416,4 +2425,4 @@ error saying so. Like CLI tokens, product tokens are **not** revoked by a
 password change or logout; Revoke all, revoking one token, an admin, disabling
 or deleting the product, or deactivating the account does revoke them. Minting
 and admin product management are browser-only; the CLI has just the read-only
-`uzi admin products` (with a `JOB_TYPES` column showing the job types each product may start). See [Product tokens](./product-tokens.md).
+`uzi admin products` (with a `JOB_TYPES` column showing the job types each product may start, and `CLIENT` and `SCOPES` columns for its [OAuth client](./oauth-clients.md) registration). See [Product tokens](./product-tokens.md).

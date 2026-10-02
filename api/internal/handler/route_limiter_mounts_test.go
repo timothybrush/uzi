@@ -63,6 +63,7 @@ var limiterNames = [...]string{
 	limCLIPoll,
 	limBoardOrder,
 	limV1,
+	limOAuth,
 }
 
 // The limiter names, as constants so a typo in the 146-row table below is a compile
@@ -239,6 +240,9 @@ const (
 	// PRD #1908 D-B. The dedicated per-user budget of the whole /api/v1 subtree (job clients
 	// poll, which authLimiter's 10/min cannot carry), mounted by r.Use after RequireV1Caller.
 	limV1 = "v1Limiter"
+	// PRD #1910 D7. The OAuth token and revoke endpoints' budget: a PER-IP Middleware mount (so a
+	// noLimiter row here, like the authorize route) plus a per-client Allow inside the handler.
+	limOAuth = "oauthLimiter"
 	// POST /api/v1/jobs carries BOTH: the subtree's v1Limiter and, per route, authLimiter (a
 	// create is the spend action). A route with two per-user limiters is spelled with this
 	// constant; perUserLimiterOn joins the names in limiterNames order.
@@ -398,6 +402,18 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/agent-templates/{id}/rendered", noLimiter},
 	{"GET", "/api/agent-templates/{id}/skills", noLimiter},
 	{"GET", "/api/auth/cli/request/{id}", noLimiter},
+	// PRD #1910 M2: the consent half of the OAuth server. authorize is unauthenticated and
+	// fronted by authLimiter's PER-IP middleware (not guarded by this table → noLimiter); the
+	// request read is a cookie-session DB read.
+	{"GET", "/api/oauth/authorize", noLimiter},
+	{"GET", "/api/oauth/requests/{id}", noLimiter},
+	// PRD #1910 M3: the token endpoint is unauthenticated (client-authenticated inside the handler) and
+	// fronted by oauthLimiter's PER-IP middleware, not guarded by this per-user table → noLimiter;
+	// TestOAuthTokenIsBehindThePerIPOAuthLimiter pins the mount.
+	{"POST", "/api/oauth/token", noLimiter},
+	// PRD #1910 M4: the RFC 7009 revoke endpoint is mounted exactly like the token endpoint.
+	// TestOAuthRevokeIsBehindThePerIPOAuthLimiter pins the mount.
+	{"POST", "/api/oauth/revoke", noLimiter},
 	{"GET", "/api/auth/config", noLimiter},
 	{"GET", "/api/auth/me", noLimiter},
 	{"GET", "/api/auth/oidc/callback", noLimiter},
@@ -429,6 +445,14 @@ var wantRouteMounts = []routeMount{
 	// PRD #1907 M5: the caller's own product-token list and the mint picker, cookie-only
 	// metadata reads with no forge call → noLimiter, like the CLI-token list above.
 	{"GET", "/api/me/product-tokens/", noLimiter},
+	// PRD #1910 M3: the caller's live OAuth connections, a cookie-only plain read like the product-token list.
+	{"GET", "/api/me/oauth-connections/", noLimiter},
+	// PRD #1910 M5: the owner's revoke of one connection, a cookie-only local write → noLimiter.
+	{"POST", "/api/me/oauth-connections/{id}/revoke", noLimiter},
+	// PRD #1910 M5: a product's live connections, an admin read a uza_ token may make → limAuth.
+	{"GET", "/api/admin/products/{id}/connections", limAuth},
+	// PRD #1910 M5: the admin's revoke of one connection, a cookie-only admin DB write → noLimiter.
+	{"POST", "/api/admin/oauth-connections/{id}/revoke", noLimiter},
 	{"GET", "/api/me/product-tokens/products", noLimiter},
 	{"GET", "/api/me/judge/category-stats", noLimiter},
 	{"GET", "/api/me/judge/recommendations", noLimiter},
@@ -618,6 +642,8 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/admin/products/{id}/skills/apply", noLimiter},
 	{"POST", "/api/admin/products/{id}/skills/sync", noLimiter},
 	{"POST", "/api/admin/product-tokens/{id}/revoke", noLimiter},
+	// PRD #1910 M1: rotate a product's OAuth client secret — a cookie-only admin DB write → noLimiter.
+	{"POST", "/api/admin/products/{id}/oauth/secret", noLimiter},
 	// PRD #1184 M3: the admin "All users" FILE issue write — files a coordinate's newest open
 	// occurrence through the owner filer's forge path (claim-first → CreateIssue → settle). A
 	// forge WRITE, so it carries forgeLimiter.PerUserMiddleware like the owner
@@ -627,6 +653,9 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/agent-templates/", noLimiter},
 	{"POST", "/api/agent-templates/{id}/reset", noLimiter},
 	{"POST", "/api/auth/cli/approve", limAuth},
+	// PRD #1910 M2: approve rides the per-user auth limiter like /cli/approve; deny does not.
+	{"POST", "/api/oauth/requests/{id}/approve", limAuth},
+	{"POST", "/api/oauth/requests/{id}/deny", noLimiter},
 	{"POST", "/api/auth/cli/deny", noLimiter},
 	{"POST", "/api/auth/cli/poll", noLimiter},
 	{"POST", "/api/auth/cli/start", noLimiter},
@@ -873,6 +902,8 @@ var wantRouteMounts = []routeMount{
 	{"PUT", "/api/admin/users/{id}/ci-autofix", noLimiter},
 	// PRD #1976 M1: allow one site list for a product — a cookie-only admin DB write → noLimiter.
 	{"PUT", "/api/admin/products/{id}/egress-profiles/{name}", noLimiter},
+	// PRD #1910 M1: set a product's OAuth redirect URIs and scopes — a cookie-only admin DB write → noLimiter.
+	{"PUT", "/api/admin/products/{id}/oauth", noLimiter},
 	{"PUT", "/api/admin/users/{id}/judge", noLimiter},
 	{"PUT", "/api/agent-templates/allocations", noLimiter},
 	{"PUT", "/api/agent-templates/{id}", noLimiter},
@@ -1128,7 +1159,7 @@ func TestChatCreateRoutePatternMatchesMount(t *testing.T) {
 	limiters := newProbeLimiters()
 	h := &Handler{cfg: config.Config{WorkerHostingEnabled: true}}
 	router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
-		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9])
+		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9], limiters[10])
 	routes := router.(chi.Routes)
 
 	p := &prober{}
@@ -1162,7 +1193,7 @@ func TestEveryRouteCarriesItsExpectedPerUserLimiter(t *testing.T) {
 	// routes exist and the table is unconditional.
 	h := &Handler{cfg: config.Config{WorkerHostingEnabled: true, FetcherTokenSHA256: make([]byte, 32)}}
 	router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
-		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9])
+		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9], limiters[10])
 
 	routes, ok := router.(chi.Routes)
 	if !ok {
@@ -1216,6 +1247,130 @@ func TestEveryRouteCarriesItsExpectedPerUserLimiter(t *testing.T) {
 	for _, key := range missing {
 		t.Errorf("route %s is listed in wantRouteMounts but is not in the router — "+
 			"it was removed or renamed; update the table.", key)
+	}
+}
+
+// TestOAuthAuthorizeIsBehindThePerIPAuthLimiter pins PRD #1910 D1's rule that the unauthenticated
+// GET /api/oauth/authorize is fronted by authLimiter's per-IP Middleware. wantRouteMounts cannot
+// say it: it reads per-USER mounts only, so this route is a noLimiter row there. The request goes
+// through the real h.Routes with a budget of one (newProbeLimiters gives authLimiter exactly 1):
+// the first request from an address reaches the handler (no client_id, so it dies at the fixed
+// error page before touching a store, which this Handler does not have) and the second from the
+// same address is a 429. A different address has its own budget.
+func TestOAuthAuthorizeIsBehindThePerIPAuthLimiter(t *testing.T) {
+	limiters := newProbeLimiters()
+	h := &Handler{cfg: config.Config{}}
+	router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
+		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9], limiters[10])
+
+	get := func(remote string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/api/oauth/authorize", nil)
+		req.RemoteAddr = remote
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := get("192.0.2.10:4000"); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "Cannot connect") {
+		t.Fatalf("first request = %d %q, want the fixed 400 error page from the handler", rec.Code, rec.Body.String())
+	}
+	if rec := get("192.0.2.10:4001"); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request from the same address = %d, want 429 from authLimiter", rec.Code)
+	}
+	if rec := get("192.0.2.11:4000"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("first request from another address = %d, want 400: the budget is per IP", rec.Code)
+	}
+}
+
+// TestOAuthTokenIsBehindThePerIPOAuthLimiter pins PRD #1910 D7: the unauthenticated POST
+// /api/oauth/token is fronted by oauthLimiter's per-IP Middleware (wantRouteMounts reads per-USER
+// mounts only, so the route is a noLimiter row there). The request goes through the real h.Routes
+// with oauthLimiter's probe budget (newProbeLimiters gives the limiter at index len-1 a budget of
+// len): every request up to the budget reaches the handler (no Content-Type, so it dies with
+// invalid_request before any store, which this Handler does not have), the next one from the same
+// address is the limiter's 429, which still carries Cache-Control: no-store and Pragma: no-cache,
+// and another address has its own budget.
+func TestOAuthTokenIsBehindThePerIPOAuthLimiter(t *testing.T) {
+	limiters := newProbeLimiters()
+	budget := len(limiterNames) // the oauth limiter is the last one: budget = its position + 1
+	if limiterNames[budget-1] != limOAuth {
+		t.Fatalf("limiterNames[%d] = %q, want %q", budget-1, limiterNames[budget-1], limOAuth)
+	}
+	h := &Handler{cfg: config.Config{}}
+	router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
+		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9], limiters[10])
+
+	post := func(remote string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/oauth/token", nil)
+		req.RemoteAddr = remote
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+	for i := 0; i < budget; i++ {
+		if rec := post("192.0.2.10:4000"); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid_request") {
+			t.Fatalf("request %d = %d %q, want the handler's 400 invalid_request", i+1, rec.Code, rec.Body.String())
+		}
+	}
+	rec := post("192.0.2.10:4001")
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("request %d from the same address = %d, want 429 from oauthLimiter", budget+1, rec.Code)
+	}
+	// The refusal is OAuth-shaped (RFC 6749 section 5.2 JSON), not the generic limiter body, and tells
+	// the product when to retry.
+	if body := strings.TrimSpace(rec.Body.String()); body != `{"error":"temporarily_unavailable"}` {
+		t.Fatalf("the limiter's 429 body = %q, want the OAuth-shaped temporarily_unavailable", body)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra == "" {
+		t.Fatal("the limiter's 429 has no Retry-After")
+	}
+	if rec.Header().Get("Cache-Control") != "no-store" || rec.Header().Get("Pragma") != "no-cache" {
+		t.Fatalf("the limiter's 429 lacks the no-store headers: %v", rec.Header())
+	}
+	if rec := post("192.0.2.11:4000"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("first request from another address = %d, want 400: the budget is per IP", rec.Code)
+	}
+}
+
+// TestOAuthRevokeIsBehindThePerIPOAuthLimiter is the same pin for POST /api/oauth/revoke (PRD #1910 M4).
+func TestOAuthRevokeIsBehindThePerIPOAuthLimiter(t *testing.T) {
+	limiters := newProbeLimiters()
+	budget := len(limiterNames) // the oauth limiter is the last one: budget = its position + 1
+	if limiterNames[budget-1] != limOAuth {
+		t.Fatalf("limiterNames[%d] = %q, want %q", budget-1, limiterNames[budget-1], limOAuth)
+	}
+	h := &Handler{cfg: config.Config{}}
+	router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
+		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9], limiters[10])
+
+	post := func(remote string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/oauth/revoke", nil)
+		req.RemoteAddr = remote
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+	for i := 0; i < budget; i++ {
+		if rec := post("192.0.2.10:4000"); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid_request") {
+			t.Fatalf("request %d = %d %q, want the handler's 400 invalid_request", i+1, rec.Code, rec.Body.String())
+		}
+	}
+	rec := post("192.0.2.10:4001")
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("request %d from the same address = %d, want 429 from oauthLimiter", budget+1, rec.Code)
+	}
+	// The refusal is OAuth-shaped (RFC 6749 section 5.2 JSON), not the generic limiter body, and tells
+	// the product when to retry.
+	if body := strings.TrimSpace(rec.Body.String()); body != `{"error":"temporarily_unavailable"}` {
+		t.Fatalf("the limiter's 429 body = %q, want the OAuth-shaped temporarily_unavailable", body)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra == "" {
+		t.Fatal("the limiter's 429 has no Retry-After")
+	}
+	if rec.Header().Get("Cache-Control") != "no-store" || rec.Header().Get("Pragma") != "no-cache" {
+		t.Fatalf("the limiter's 429 lacks the no-store headers: %v", rec.Header())
+	}
+	if rec := post("192.0.2.11:4000"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("first request from another address = %d, want 400: the budget is per IP", rec.Code)
 	}
 }
 
@@ -1479,6 +1634,7 @@ var limiterConfigFields = map[string]string{
 	limCLIPoll:    "CLIPollRateLimitMax",
 	limBoardOrder: "BoardOrderRateLimitMax",
 	limV1:         "V1RateLimitMax",
+	limOAuth:      "OAuthRateLimitMax",
 }
 
 // limiterConstruction is one `x := mw.NewLimiter(cfg.Y, …)` found in main.
@@ -1612,6 +1768,27 @@ func TestEachLimiterIsBuiltFromItsOwnConfigField(t *testing.T) {
 			t.Errorf("main builds %s from cfg.%s, but limiterConfigFields declares cfg.%s — "+
 				"the routes that mount %s would run on the wrong budget",
 				name, field, want, name)
+		}
+	}
+}
+
+// TestOAuthRoutesAreNoStoreOnEveryMethod pins PRD #1910 D7: Cache-Control: no-store and Pragma:
+// no-cache come from middleware on the whole /api/oauth route group, so a GET (405) or any other
+// method on the token path carries them as well as the POST.
+func TestOAuthRoutesAreNoStoreOnEveryMethod(t *testing.T) {
+	limiters := newProbeLimiters()
+	h := &Handler{cfg: config.Config{}}
+	router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
+		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9], limiters[10])
+	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete, http.MethodPost} {
+		for _, path := range []string{"/api/oauth/token", "/api/oauth/revoke"} {
+			req := httptest.NewRequest(method, path, nil)
+			req.RemoteAddr = "192.0.2.77:4000"
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Header().Get("Cache-Control") != "no-store" || rec.Header().Get("Pragma") != "no-cache" {
+				t.Errorf("%s %s = %d with headers %v, want no-store and no-cache", method, path, rec.Code, rec.Header())
+			}
 		}
 	}
 }

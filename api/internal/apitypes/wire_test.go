@@ -940,9 +940,34 @@ func TestMintProductTokenResponseTags(t *testing.T) {
 
 func TestProductDTOTags(t *testing.T) {
 	assertTags(t, "ProductDTO", ProductDTO{},
-		"id", "name", "description", "enabled", "deleted_at", "created_at", "active_token_count",
+		"id", "name", "description", "enabled", "deleted_at", "created_at", "active_token_count", "live_connection_count",
 		// PRD #1908 D-C: the job types the product's tokens may create; never null on the wire.
-		"allowed_job_types")
+		"allowed_job_types",
+		// PRD #1910 D2: the OAuth client registration; never carries the secret or its hash.
+		"oauth_client")
+	assertTags(t, "ProductOAuthClientDTO", ProductOAuthClientDTO{},
+		"redirect_uris", "scopes", "has_secret", "secret_prefix", "rotated_at", "is_client")
+	assertTags(t, "RotateProductClientSecretResponse", RotateProductClientSecretResponse{},
+		"client_secret", "product")
+	// PRD #1910 D5: manual tokens and live connections are stopped and counted apart.
+	assertTags(t, "AdminDeleteProductResponse", AdminDeleteProductResponse{},
+		"product", "stopped_token_count", "stopped_connection_count")
+}
+
+// PRD #1910 M2: the consent page's metadata and the server-built redirect. Neither carries a
+// code, a challenge, a binding hash or the redirect URI list.
+func TestOAuthConsentDTOTags(t *testing.T) {
+	assertTags(t, "OAuthAuthorizeRequestDTO", OAuthAuthorizeRequestDTO{},
+		"product_name", "product_description", "redirect_host", "scopes", "status", "expires_at")
+	assertTags(t, "OAuthRedirectResponse", OAuthRedirectResponse{}, "redirect_url")
+	assertTags(t, "OAuthTokenResponse", OAuthTokenResponse{}, "access_token", "token_type", "expires_in", "refresh_token", "scope")
+	assertTags(t, "OAuthRefreshResponse", OAuthRefreshResponse{}, "access_token", "token_type", "expires_in", "scope")
+	assertTags(t, "OAuthConnectionDTO", OAuthConnectionDTO{}, "id", "product_id", "product_name", "scopes",
+		"connected_at", "created_at", "last_used_at", "refresh_issued_at")
+	assertTags(t, "AdminOAuthConnectionDTO", AdminOAuthConnectionDTO{}, "id", "user_id", "owner_email", "scopes",
+		"connected_at", "created_at", "last_used_at")
+	// error_description is omitempty, so tagSet leaves it out (the contract fixtures pin it).
+	assertTags(t, "OAuthErrorResponse", OAuthErrorResponse{}, "error")
 }
 
 // /api/v1 is the stable external contract (PRD #1907 D12): the whoami user carries

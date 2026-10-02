@@ -16,8 +16,10 @@ import "time"
 
 // ProductDTO is one registered external product. DeletedAt is null for a live
 // product; a soft-deleted product (PRD #1907 D9) is always disabled and stays
-// listed for the audit trail. ActiveTokenCount is the number of its tokens that are
-// neither revoked nor expired, so the delete confirm can say how many it stops.
+// listed for the audit trail. ActiveTokenCount is the number of its MANUAL tokens (minted
+// by a user, not by an OAuth connection) that are neither revoked nor expired, and
+// LiveConnectionCount the number of its live OAuth connections (grants not revoked; PRD
+// #1910 D5), so the delete confirm can say how many of each it stops.
 type ProductDTO struct {
 	ID               string     `json:"id"`
 	Name             string     `json:"name"`
@@ -26,19 +28,54 @@ type ProductDTO struct {
 	DeletedAt        *time.Time `json:"deleted_at"`
 	CreatedAt        time.Time  `json:"created_at"`
 	ActiveTokenCount int64      `json:"active_token_count"`
-	AllowedJobTypes  []string   `json:"allowed_job_types"`
+	// LiveConnectionCount is the number of live OAuth connections of the product (oauth_grants
+	// with revoked_at NULL), across all users; the access tokens of a connection are not
+	// counted in ActiveTokenCount.
+	LiveConnectionCount int64    `json:"live_connection_count"`
+	AllowedJobTypes     []string `json:"allowed_job_types"`
+	// OAuthClient is the product's OAuth client registration (PRD #1910 D2): its redirect
+	// URIs, allowed scopes and secret metadata. Always present; a product that is not a
+	// client carries empty lists and is_client false.
+	OAuthClient ProductOAuthClientDTO `json:"oauth_client"`
+}
+
+// ProductOAuthClientDTO is the OAuth-client half of a registered product (PRD #1910 D2).
+// THE CLIENT SECRET AND ITS HASH APPEAR IN NO FIELD: the hash is projected into no DTO, and
+// the plaintext appears exactly once, in RotateProductClientSecretResponse.ClientSecret.
+// HasSecret says a secret exists; SecretPrefix is its short display prefix ("" when there is
+// none) and RotatedAt when it was last replaced (null when never). IsClient is the derived
+// "this product can run the consent flow": at least one redirect URI, a non-empty scope
+// list and a secret. RedirectURIs and Scopes are never null on the wire.
+type ProductOAuthClientDTO struct {
+	RedirectURIs []string   `json:"redirect_uris"`
+	Scopes       []string   `json:"scopes"`
+	HasSecret    bool       `json:"has_secret"`
+	SecretPrefix string     `json:"secret_prefix"`
+	RotatedAt    *time.Time `json:"rotated_at"`
+	IsClient     bool       `json:"is_client"`
+}
+
+// RotateProductClientSecretResponse is the POST /api/admin/products/{id}/oauth/secret
+// response: the new plaintext client secret, shown exactly once (only its sha256 is
+// stored), plus the updated product. Mirrors MintProductTokenResponse.
+type RotateProductClientSecretResponse struct {
+	ClientSecret string     `json:"client_secret"`
+	Product      ProductDTO `json:"product"`
 }
 
 // AdminDeleteProductResponse is the DELETE /api/admin/products/{id} response (PRD #1907
-// M4): the soft-deleted product plus StoppedTokenCount, the number of its tokens this
-// delete made unusable. That is the product's active (not revoked, not expired) tokens
-// when the product was enabled at deletion, and 0 when it was already disabled: those
-// tokens were already refused, so the delete stopped none of them. Product's own
-// active_token_count keeps its registry meaning (active tokens, whatever the product's
-// state), so the two differ exactly for an already-disabled product.
+// M4): the soft-deleted product plus StoppedTokenCount, the number of its MANUAL tokens
+// this delete made unusable, and StoppedConnectionCount, the number of its live OAuth
+// connections it made unusable (PRD #1910). Each is the product's active (not revoked,
+// not expired) manual tokens, respectively its live connections, when the product was
+// enabled at deletion, and 0 when it was already disabled: those were already refused,
+// so the delete stopped none of them. Product's own active_token_count and
+// live_connection_count keep their registry meaning (whatever the product's state), so
+// they differ from the stopped counts exactly for an already-disabled product.
 type AdminDeleteProductResponse struct {
-	Product           ProductDTO `json:"product"`
-	StoppedTokenCount int64      `json:"stopped_token_count"`
+	Product                ProductDTO `json:"product"`
+	StoppedTokenCount      int64      `json:"stopped_token_count"`
+	StoppedConnectionCount int64      `json:"stopped_connection_count"`
 }
 
 // MintableProductDTO is one entry of the user mint picker (GET

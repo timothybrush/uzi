@@ -151,6 +151,27 @@ func contractCases() []contractCase {
 		// NOT NULL and non-empty). AdminProductTokenDTO embeds ProductTokenDTO, so its
 		// fixture carries the row's keys inline; MintProductTokenResponse nests it.
 		newContractCase[ProductDTO]("product"),
+		// PRD #1910 M1: the product's nested oauth_client (rotated_at is a present-as-null
+		// pointer; the redirect_uris/scopes slices are non-omitempty, null in zero.json and
+		// never null on the real wire) and the rotate-secret response that carries the
+		// one-time plaintext beside the updated product.
+		newContractCase[RotateProductClientSecretResponse]("rotate_product_client_secret"),
+		// PRD #1910 M2: the /connect consent-screen metadata (scopes is a nil-slice null in
+		// zero.json, never null on the wire) and the approve / deny redirect response.
+		newContractCase[OAuthAuthorizeRequestDTO]("oauth_authorize_request"),
+		newContractCase[OAuthRedirectResponse]("oauth_redirect_response"),
+		// PRD #1910 M3: the token endpoint bodies. Go-only (the SPA never calls /api/oauth/token), like
+		// the v1_* pairs.
+		newContractCase[OAuthTokenResponse]("oauth_token_response"),
+		newContractCase[OAuthRefreshResponse]("oauth_refresh_response"),
+		newContractCase[OAuthErrorResponse]("oauth_error_response"),
+		// PRD #1910 M3: one live OAuth connection of the caller (GET /api/me/oauth-connections;
+		// last_used_at and refresh_issued_at are present-as-null pointers; scopes is a nil-slice
+		// null in zero.json, never null on the wire).
+		newContractCase[OAuthConnectionDTO]("oauth_connection"),
+		// PRD #1910 M5: one live connection of a product in the admin list (last_used_at is a
+		// present-as-null pointer; scopes is a nil-slice null in zero.json, never null on the wire).
+		newContractCase[AdminOAuthConnectionDTO]("admin_oauth_connection"),
 		newContractCase[ProductTokenDTO]("product_token"),
 		newContractCase[AdminProductTokenDTO]("admin_product_token"),
 		newContractCase[MintProductTokenResponse]("mint_product_token"),

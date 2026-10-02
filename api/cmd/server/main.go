@@ -780,6 +780,17 @@ func run() error {
 				return q.DeleteExpiredCLIAuthRequests(ctx)
 			},
 		},
+		// OAuth authorize requests (PRD #1910 M2) are pending for 5 minutes, and an approved one
+		// carries a 60 s authorization code. The authorize handler sweeps opportunistically;
+		// this rides the same ticker. DeleteExpiredOAuthAuthorizeRequests keeps approved and
+		// redeemed rows until their code expired more than 10 minutes ago, so M3's code replay
+		// detection still recognises a recently redeemed code.
+		sweeper.Pass{
+			Name: "oauth_authorize_requests_expired",
+			Run: func(ctx context.Context) (int64, error) {
+				return q.DeleteExpiredOAuthAuthorizeRequests(ctx)
+			},
+		},
 		// Stranded issue-filing claims (PRD #68 M3): a file handler killed after the
 		// claim (filing_since set) but before it settled leaves a row that blocks the
 		// coordinate forever. This DELETEs claims older than the clamped cutoff (>= 2x
@@ -1331,6 +1342,7 @@ func run() error {
 	// Dedicated per-user budget for the whole /api/v1 subtree (PRD #1908 D-B): job clients poll,
 	// which the 10/min authLimiter budget PRD #1907 used there cannot carry.
 	v1Limiter := mw.NewLimiter(cfg.V1RateLimitMax, cfg.V1RateLimitWindow, cfg.TrustedProxies)
+	oauthLimiter := mw.NewLimiter(cfg.OAuthRateLimitMax, cfg.OAuthRateLimitWindow, cfg.TrustedProxies)
 	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub, settingsCache)
 	// GitHub Projects v2 Status-sync provisioning service (PRD #364 M3), wired
 	// post-construction like the other optional forge collaborators.
@@ -1417,7 +1429,7 @@ func run() error {
 	// the SAME api on a second port, not a second surface. Building Routes twice
 	// would be two independent middleware chains — and two rate limiters, so a
 	// per-IP budget would silently double.
-	routes := h.Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter, cliPollLimiter, boardOrderLimiter, v1Limiter)
+	routes := h.Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter, cliPollLimiter, boardOrderLimiter, v1Limiter, oauthLimiter)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

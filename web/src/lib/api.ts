@@ -43,6 +43,10 @@ import type {
   Card,
   ChatListResponse,
   CliAuthRequestMeta,
+  OAuthAuthorizeRequest,
+  OAuthConnection,
+  AdminOAuthConnection,
+  OAuthRedirect,
   CliToken,
   CliTokenMint,
   CliTokenScope,
@@ -51,6 +55,7 @@ import type {
   MintableProduct,
   Product,
   ProductPatch,
+  RotateProductClientSecretResponse,
   ProductSkills,
   ProductEgressProfile,
   ProductToken,
@@ -1880,6 +1885,16 @@ const realApi = {
     ),
   adminDisallowProductEgressProfile: (id: string, name: string) =>
     request<null>("DELETE", `/admin/products/${id}/egress-profiles/${encodeURIComponent(name)}`),
+  // PRD #1910 M1: make a product an OAuth client. PUT replaces the redirect URIs and scopes
+  // together (both empty clears the registration; non-empty URIs need non-empty scopes) and
+  // answers {product}; the POST rotates the client secret and returns the plaintext ONCE.
+  adminSetProductOAuth: (id: string, redirectUris: string[], scopes: ProductTokenScope[]) =>
+    request<{ product: Product }>("PUT", `/admin/products/${id}/oauth`, {
+      redirect_uris: redirectUris,
+      scopes,
+    }),
+  adminRotateProductClientSecret: (id: string) =>
+    request<RotateProductClientSecretResponse>("POST", `/admin/products/${id}/oauth/secret`),
   adminDeleteProduct: (id: string) =>
     request<AdminDeleteProductResponse>("DELETE", `/admin/products/${id}`),
   // Capped at 1000 rows, active first, then newest; `truncated` says the cut happened.
@@ -1887,6 +1902,15 @@ const realApi = {
     request<{ tokens: AdminProductToken[]; truncated: boolean }>("GET", "/admin/product-tokens"),
   adminRevokeProductToken: (id: string) =>
     request<null>("POST", `/admin/product-tokens/${id}/revoke`),
+  // A product's live OAuth connections (PRD #1910 M5), whatever the state of their access tokens;
+  // capped at 1000 rows, `truncated` says the cut happened. The revoke is a cookie-only admin write.
+  adminListProductConnections: (productId: string) =>
+    request<{ connections: AdminOAuthConnection[]; truncated: boolean }>(
+      "GET",
+      `/admin/products/${encodeURIComponent(productId)}/connections`,
+    ),
+  adminRevokeOAuthConnection: (id: string) =>
+    request<null>("POST", `/admin/oauth-connections/${encodeURIComponent(id)}/revoke`),
 
   // ── CLI browser-login consent flow (PRD #64) ───────────────────────────────
   // The `/cli-auth` page's three calls. getCliAuthRequest is a cookie-only read
@@ -1903,6 +1927,27 @@ const realApi = {
     request<{ status: string }>("POST", "/auth/cli/deny", {
       request_id: requestId,
     }),
+
+  // ── OAuth consent flow (PRD #1910 M2) ──────────────────────────────────────
+  // The `/connect` page's three calls, all cookie-session reads/writes (the POSTs carry CSRF)
+  // that the server also gates on the browser-binding cookie. approve and deny answer the
+  // server-built redirect_url the page navigates to.
+  getOAuthRequest: (id: string) =>
+    request<OAuthAuthorizeRequest>("GET", `/oauth/requests/${encodeURIComponent(id)}`),
+  approveOAuthRequest: (id: string) =>
+    request<OAuthRedirect>("POST", `/oauth/requests/${encodeURIComponent(id)}/approve`),
+  denyOAuthRequest: (id: string) =>
+    request<OAuthRedirect>("POST", `/oauth/requests/${encodeURIComponent(id)}/deny`),
+
+  // ── OAuth connections (PRD #1910 M3) — cookie-only, owner-scoped ───────────
+  // The caller's LIVE grants to connected products, whatever the state of their access tokens
+  // (a grant whose tokens all expired is still a connection). Revoke all (revokeAllCliTokens
+  // above) revokes them too. revokeOAuthConnection (M5) is the owner's disconnect of one: the
+  // grant and every token under it, a CSRF write, 204.
+  listOAuthConnections: () =>
+    request<{ connections: OAuthConnection[] }>("GET", "/me/oauth-connections"),
+  revokeOAuthConnection: (id: string) =>
+    request<null>("POST", `/me/oauth-connections/${encodeURIComponent(id)}/revoke`),
 
   // ── Agent memory (PRD #90 M6) — cookie-only, owner-scoped ──────────────────
   // list is newest-first across all the caller's repos (the component groups by

@@ -6,6 +6,9 @@
 // next to the product they unlock. Soft-deleted products (D9) stay listed, last, as the
 // audit trail; they have no controls, since a deleted product cannot change.
 //
+// Each product card also ends in its OAuth connections panel (PRD #1910 M5), collapsed and
+// loaded on open: who connected the product, with a revoke.
+//
 // Each live product card ends in its skill set (PRD #1909 M6, components/ProductSkills.tsx),
 // collapsed and loaded on open: the approve view for skills synced from the product's repo.
 //
@@ -43,12 +46,24 @@ import {
   productTokenExpiryText,
 } from "../components/ProductTokens";
 import { PackageIcon } from "../components/icons";
+import { ProductConnectionsPanel } from "../components/ProductConnections";
 import { ProductEgressProfilesPanel } from "../components/ProductEgressProfiles";
+import { ProductOAuthPanel } from "../components/ProductOAuthClient";
 import { ProductSkillsPanel } from "../components/ProductSkills";
 import { JOB_TYPES, jobTypeLabel } from "../lib/jobTypes";
 import { stripUnsafeChars } from "../lib/safeText";
 
 const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? "" : "s"}`;
+
+// What stopping a product stops, in words: its active MANUAL tokens (the access tokens of an
+// OAuth connection are not counted as tokens, PRD #1910 D5) and its live connections. A zero
+// side is left out and both zero reads as "no active manual tokens or connections".
+function stoppedWhat(tokens: number, connections: number): string {
+  const t = tokens > 0 ? plural(tokens, "active manual token") : "";
+  const c = connections > 0 ? plural(connections, "connection") : "";
+  if (t && c) return `${t} and ${c}`;
+  return t || c || "no active manual tokens or connections";
+}
 
 export function AdminProducts() {
   const { data, loading, error: loadError, reload } = useAsyncData<{
@@ -103,7 +118,7 @@ export function AdminProducts() {
   };
 
   return (
-    <AdminShell description="External products your users can connect to uzi’s /api/v1. Disabling or deleting a product stops every token for it on its next request.">
+    <AdminShell description="External products your users can connect to uzi’s /api/v1. Disabling or deleting a product stops every token and connection for it on its next request.">
       {(error || loadError) && <Alert message={error || loadError} />}
       {notice && <Alert tone="success" message={notice} />}
 
@@ -159,7 +174,7 @@ export function AdminProducts() {
               onDelete={() =>
                 run(async () => {
                   const res = await api.adminDeleteProduct(p.id);
-                  return `Deleted “${res.product.name}”. Stopped ${plural(res.stopped_token_count, "active token")}.`;
+                  return `Deleted “${res.product.name}”. Stopped ${stoppedWhat(res.stopped_token_count, res.stopped_connection_count ?? 0)}.`;
                 }, "Failed to delete product")
               }
               onRevoke={(t) =>
@@ -168,6 +183,7 @@ export function AdminProducts() {
                   return `Revoked “${t.name}” (${t.token_prefix}…).`;
                 }, "Failed to revoke token")
               }
+              onOAuthChanged={reload}
             />
           ))}
         </div>
@@ -396,6 +412,7 @@ function ProductCard({
   onJobTypes,
   onDelete,
   onRevoke,
+  onOAuthChanged,
 }: {
   product: Product;
   tokens: AdminProductToken[];
@@ -409,6 +426,9 @@ function ProductCard({
   onJobTypes: (allowed: string[]) => Promise<{ error: string } | { error: null; saved: string[] }>;
   onDelete: () => Promise<boolean>;
   onRevoke: (t: AdminProductToken) => Promise<boolean>;
+  // Reloads the registry after an OAuth client write or a connection revoke (the panels own their
+  // own banners).
+  onOAuthChanged: () => Promise<unknown> | void;
 }) {
   const deleted = product.deleted_at !== null;
   const [busy, setBusy] = useState(false);
@@ -455,10 +475,11 @@ function ProductCard({
     setTypesError(res.error ?? "");
   };
 
-  // What the delete will stop: an enabled product's active tokens. A disabled
-  // product's tokens are already refused, so deleting it stops none (the server's
-  // stopped_token_count says the same).
-  const stops = product.enabled ? product.active_token_count : 0;
+  // What the delete will stop: an enabled product's active manual tokens and live
+  // connections. A disabled product's are already refused, so deleting it stops none (the
+  // server's stopped_token_count and stopped_connection_count say the same).
+  const connections = product.live_connection_count ?? 0;
+  const stops = stoppedWhat(product.enabled ? product.active_token_count : 0, product.enabled ? connections : 0);
   const warningId = `delete-warning-${product.id}`;
   const headingId = `product-${product.id}`;
 
@@ -473,7 +494,8 @@ function ProductCard({
               </h3>
               {product.deleted_at !== null && <DeletedBadge deletedAt={product.deleted_at} />}
               <span className="text-xs text-muted">
-                {plural(product.active_token_count, "active token")}
+                {plural(product.active_token_count, "active manual token")}
+                {connections > 0 && `, ${plural(connections, "connection")}`}
               </span>
             </div>
             {product.description ? (
@@ -516,10 +538,10 @@ function ProductCard({
             className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 outline-hidden"
           >
             <p id={warningId} className="text-xs text-warn">
-              Delete “{product.name}”? This stops {plural(stops, "active token")}
+              Delete “{product.name}”?{" "}
               {product.enabled
-                ? " on their next request."
-                : ": it is disabled, so its tokens are already refused."}{" "}
+                ? `This stops ${stops} on their next request.`
+                : "It is disabled, so its tokens and connections are already refused and deleting it stops none."}{" "}
               It can never be re-enabled; the product and its token history stay listed.
             </p>
             <div className="flex items-center gap-1.5">
@@ -571,6 +593,9 @@ function ProductCard({
           <ProductTokenTable tokens={tokens} onRevoke={onRevoke} />
         )}
 
+        {/* PRD #1910 M1: the OAuth client registration (redirect URIs, scopes, client secret). */}
+        <ProductOAuthPanel product={product} onChanged={onOAuthChanged} />
+
         {/* PRD #1909 M6: the product's skill set (source, staged review, approved set).
             A deleted product cannot change, so it gets no panel. */}
         {!deleted && <ProductSkillsPanel product={product} />}
@@ -578,6 +603,10 @@ function ProductCard({
         {/* PRD #1976 M2: the site lists the product's tokens may name on job create. A deleted
             product still lists them (read-only). */}
         <ProductEgressProfilesPanel product={product} />
+
+        {/* PRD #1910 M5: the users who connected the product through OAuth, with a revoke. A
+            deleted product still lists what it had (the audit trail). */}
+        <ProductConnectionsPanel product={product} onChanged={onOAuthChanged} />
       </Card>
     </section>
   );

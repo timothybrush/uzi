@@ -74,11 +74,14 @@ SELECT pg_advisory_xact_lock(
 -- name: CountActiveProductTokensForUserProduct :one
 -- The D15 cap count: tokens of one user for one product that are not revoked and not
 -- expired (the NULL trap again: a never-expiring token IS active). Run under
--- LockProductTokenMint, in the minting transaction.
+-- LockProductTokenMint, in the minting transaction. Access tokens of an OAuth grant
+-- (grant_id set) are not manual tokens and never count against the cap (PRD #1910 D5): their
+-- own bound is ten live tokens per grant.
 SELECT count(*)
   FROM product_tokens
  WHERE user_id = $1
    AND product_id = $2
+   AND grant_id IS NULL
    AND NOT revoked
    AND (expires_at IS NULL OR expires_at > now());
 
@@ -108,6 +111,8 @@ RETURNING id, user_id, product_id, name, token_prefix, scopes, revoked,
           created_at, last_used_at, last_used_ip, expires_at;
 
 -- name: ListProductTokensForUser :many
+-- Manual tokens only (grant_id IS NULL): an OAuth connection's hourly access tokens would bury
+-- them, and their lifecycle is the connection's (PRD #1910 D5).
 -- The per-user product-token list (Settings > Access), metadata only: the value is never
 -- stored and the hash is not projected. Joined for the product name. Includes tokens
 -- of disabled or soft-deleted products (they still exist, and the user may want to
@@ -135,6 +140,7 @@ SELECT t.id,
   FROM product_tokens t
   JOIN products p ON p.id = t.product_id
  WHERE t.user_id = sqlc.arg(user_id)
+   AND t.grant_id IS NULL
  ORDER BY (t.revoked OR (t.expires_at IS NOT NULL AND t.expires_at <= now())) ASC,
           t.created_at DESC,
           t.id ASC
@@ -148,11 +154,17 @@ UPDATE product_tokens SET revoked = true
  WHERE id = $1 AND user_id = $2 AND NOT revoked;
 
 -- name: RevokeAllProductTokens :exec
--- The panic button's product half (D8): revoke every un-revoked product token of one
--- user. Called by the existing revoke-all handler (POST /api/me/cli-tokens/revoke-all,
--- handler.RevokeAllCLITokens) in the SAME transaction as RevokeAllCLITokens, so the
--- button revokes both token kinds or neither. Idempotent, and scoped to $1.
-UPDATE product_tokens SET revoked = true WHERE user_id = $1 AND NOT revoked;
+-- The panic button's product half (D8): revoke every un-revoked MANUAL product token of one
+-- user (grant_id IS NULL). Access tokens of an OAuth grant are not swept here: the revoke-all
+-- handler revokes every live grant first through revokeGrantLocked (grant lock, then the grant's
+-- tokens). The filter is defence in depth: the per-user lock (LockOAuthUserGrants) already
+-- serializes grant creation with Revoke all, and token exchanges wait on the grant rows Revoke
+-- all holds, so no grant can appear mid-sweep; the filter keeps a plain sweep from ever revoking
+-- a grant's access token without its grant lock (PRD #1910 D8). Called by the existing revoke-all handler (POST
+-- /api/me/cli-tokens/revoke-all, handler.RevokeAllCLITokens) in the SAME transaction as
+-- RevokeAllCLITokens, so the button revokes both token kinds or neither. Idempotent, and scoped
+-- to $1.
+UPDATE product_tokens SET revoked = true WHERE user_id = $1 AND grant_id IS NULL AND NOT revoked;
 
 -- name: AdminRevokeProductToken :execrows
 -- An admin revokes one product token by id (D8). Product tokens are product
@@ -162,6 +174,7 @@ UPDATE product_tokens SET revoked = true WHERE user_id = $1 AND NOT revoked;
 UPDATE product_tokens SET revoked = true WHERE id = $1 AND NOT revoked;
 
 -- name: ListAllProductTokensForAdmin :many
+-- Manual tokens only (grant_id IS NULL), as ListProductTokensForUser (PRD #1910 D5).
 -- The factory-wide product-credential inventory (admin), sibling of
 -- ListAllCLITokensForAdmin, and it carries that query's security rule verbatim:
 -- COLUMNS ARE PROJECTED EXPLICITLY, AND THAT IS A SECURITY BOUNDARY, NOT A STYLE
@@ -200,6 +213,7 @@ SELECT t.id,
   FROM product_tokens t
   JOIN users u ON u.id = t.user_id
   JOIN products p ON p.id = t.product_id
+ WHERE t.grant_id IS NULL
  ORDER BY (t.revoked OR (t.expires_at IS NOT NULL AND t.expires_at <= now())) ASC,
           t.created_at DESC,
           t.id ASC
@@ -217,7 +231,9 @@ RETURNING *;
 -- name: ListProducts :many
 -- Every product, soft-deleted ones included (admin registry view), each with its count
 -- of ACTIVE tokens (not revoked, not expired, the NULL trap spelled out) so the delete
--- confirm can say how many tokens it stops. Live products first, then by name.
+-- confirm can say how many tokens it stops (manual tokens only: grant_id IS NULL, PRD #1910 D5),
+-- plus its count of LIVE CONNECTIONS (oauth_grants with revoked_at IS NULL) so the same confirm
+-- can say how many connections it stops. Live products first, then by name.
 SELECT p.id,
        p.name,
        p.description,
@@ -227,11 +243,21 @@ SELECT p.id,
        p.created_at,
        p.updated_at,
        p.allowed_job_types,
+       p.redirect_uris,
+       p.oauth_scopes,
+       (p.client_secret_hash IS NOT NULL)::boolean AS has_client_secret,
+       p.client_secret_prefix,
+       p.client_secret_rotated_at,
        (SELECT count(*)
           FROM product_tokens t
          WHERE t.product_id = p.id
+           AND t.grant_id IS NULL
            AND NOT t.revoked
-           AND (t.expires_at IS NULL OR t.expires_at > now()))::bigint AS active_token_count
+           AND (t.expires_at IS NULL OR t.expires_at > now()))::bigint AS active_token_count,
+       (SELECT count(*)
+          FROM oauth_grants g
+         WHERE g.product_id = p.id
+           AND g.revoked_at IS NULL)::bigint AS live_connection_count
   FROM products p
  ORDER BY (p.deleted_at IS NOT NULL) ASC, lower(p.name) ASC, p.created_at ASC, p.id ASC;
 
@@ -257,12 +283,24 @@ SELECT * FROM products WHERE id = $1;
 SELECT * FROM products WHERE id = $1 FOR UPDATE;
 
 -- name: CountActiveProductTokensForProduct :one
--- Active (not revoked, not expired) tokens of one product, across all users.
+-- Active (not revoked, not expired) MANUAL tokens of one product, across all users. OAuth grant
+-- access tokens (grant_id set) are excluded: connections are counted from grants (PRD #1910 D5).
 SELECT count(*)
   FROM product_tokens
  WHERE product_id = $1
+   AND grant_id IS NULL
    AND NOT revoked
    AND (expires_at IS NULL OR expires_at > now());
+
+-- name: CountLiveOAuthGrantsForProduct :one
+-- Live connections (oauth_grants with revoked_at IS NULL) of one product, across all users: the
+-- connection half of what disabling or deleting the product stops (PRD #1910 D5, D6). Counts
+-- grants, not their hourly access tokens, and a grant whose access tokens all expired is still a
+-- connection (it can refresh).
+SELECT count(*)
+  FROM oauth_grants
+ WHERE product_id = $1
+   AND revoked_at IS NULL;
 
 -- name: UpdateProduct :one
 -- Admin edit of the mutable fields (description, enabled, allowed_job_types). Each is a NULLABLE argument:
@@ -293,3 +331,32 @@ UPDATE products
        updated_at = now()
  WHERE id = $1
    AND deleted_at IS NULL;
+
+-- name: SetProductOAuthClient :one
+-- Admin write (PRD #1910 M1): set a product's OAuth redirect URIs and allowed scopes. Both are
+-- always written together (the handler validates the pair with oauthsrv), and clearing both
+-- stops the product being a client; the secret is untouched. Guarded by deleted_at IS NULL like
+-- UpdateProduct: no row for an unknown id (404) or a soft-deleted product (409, the handler
+-- reads which). The CHECKs on redirect_uris and oauth_scopes back the handler's validation up.
+UPDATE products
+   SET redirect_uris = sqlc.arg(redirect_uris)::text[],
+       oauth_scopes = sqlc.arg(oauth_scopes)::text[],
+       updated_at = now()
+ WHERE id = sqlc.arg(id)
+   AND deleted_at IS NULL
+RETURNING *;
+
+-- name: RotateProductClientSecret :one
+-- Admin write (PRD #1910 M1): replace the product's client secret with a new one, effective
+-- immediately (the previous secret stops authenticating). Stores only the sha256 and the display
+-- prefix; the plaintext exists only in the handler's response. Same live-product guard as
+-- SetProductOAuthClient. The returned row carries client_secret_hash (products queries may use
+-- RETURNING *); no DTO ever projects it.
+UPDATE products
+   SET client_secret_hash = sqlc.arg(client_secret_hash)::bytea,
+       client_secret_prefix = sqlc.arg(client_secret_prefix)::text,
+       client_secret_rotated_at = now(),
+       updated_at = now()
+ WHERE id = sqlc.arg(id)
+   AND deleted_at IS NULL
+RETURNING *;

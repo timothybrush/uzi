@@ -304,11 +304,16 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 		Use:   "products",
 		Short: "List registered external products (read-only)",
 		Long: "List every external product registered for product tokens (PRD #1907), " +
-			"soft-deleted ones included, with how many of its tokens are active (neither " +
-			"revoked nor expired).\n\n" +
+			"soft-deleted ones included, with how many of its manual tokens are active " +
+			"(neither revoked nor expired; OAuth connections' access tokens are not counted) " +
+			"and how many live OAuth connections it has.\n\n" +
 			"STATE is enabled, disabled, or deleted. A disabled or deleted product's " +
-			"tokens are refused on /api/v1; a deleted product can never be re-enabled. " +
-			"Registering, editing and deleting products are browser-only admin actions.",
+			"tokens and connections are refused on /api/v1; a deleted product can never be re-enabled. " +
+			"CLIENT is yes when the product can run the OAuth consent flow (PRD #1910: a " +
+			"redirect URI, a scope list and a client secret) and SCOPES lists the scopes it " +
+			"may be granted. The client secret is never shown here. " +
+			"Registering, editing and deleting products, and OAuth client registration, " +
+			"are browser-only admin actions.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := env.client(gf)
@@ -329,18 +334,22 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 					pr.Name,
 					productStateCell(pr),
 					strconv.FormatInt(pr.ActiveTokenCount, 10),
+					strconv.FormatInt(pr.LiveConnectionCount, 10),
 					allowedJobTypesCell(pr.AllowedJobTypes),
+					oauthClientCell(pr.OAuthClient),
+					allowedJobTypesCell(pr.OAuthClient.Scopes),
 					pr.CreatedAt.UTC().Format(time.RFC3339),
 					// Up to 1000 bytes server-side: cellText bounds the cell.
 					cellText(pr.Description),
 				})
 			}
-			return p.Table([]string{"NAME", "STATE", "ACTIVE_TOKENS", "JOB_TYPES", "CREATED", "DESCRIPTION"}, rows)
+			return p.Table([]string{"NAME", "STATE", "ACTIVE_TOKENS", "CONNECTIONS", "JOB_TYPES", "CLIENT", "SCOPES", "CREATED", "DESCRIPTION"}, rows)
 		},
 	}
 
 	products.AddCommand(newAdminProductSkillsCmd(env, gf))
 	products.AddCommand(newAdminProductEgressProfilesCmd(env, gf))
+	products.AddCommand(newAdminProductConnectionsCmd(env, gf))
 
 	guardrailImpact := &cobra.Command{
 		Use:   "guardrail-impact",
@@ -917,6 +926,15 @@ func allowedJobTypesCell(types []string) string {
 		return "-"
 	}
 	return cellText(strings.Join(types, ","))
+}
+
+// oauthClientCell renders whether a product is an OAuth client (PRD #1910): yes only when it
+// has a redirect URI, a scope list and a secret (the server derives is_client).
+func oauthClientCell(c apitypes.ProductOAuthClientDTO) string {
+	if c.IsClient {
+		return "yes"
+	}
+	return "no"
 }
 
 // tsCell renders a nullable timestamp. "-" means the column is genuinely empty, not

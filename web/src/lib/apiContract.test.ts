@@ -47,6 +47,12 @@ import type {
   HealthDoc,
   BuildInfo,
   Product,
+  ProductOAuthClient,
+  OAuthAuthorizeRequest,
+  OAuthConnection,
+  AdminOAuthConnection,
+  OAuthRedirect,
+  RotateProductClientSecretResponse,
   ProductToken,
   AdminProductToken,
   ProductTokenMint,
@@ -147,6 +153,16 @@ import healthDocZero from "../../../fixtures/api-contract/health_doc.zero.json";
 import healthDocFull from "../../../fixtures/api-contract/health_doc.full.json";
 import productZero from "../../../fixtures/api-contract/product.zero.json";
 import productFull from "../../../fixtures/api-contract/product.full.json";
+import rotateProductClientSecretZero from "../../../fixtures/api-contract/rotate_product_client_secret.zero.json";
+import rotateProductClientSecretFull from "../../../fixtures/api-contract/rotate_product_client_secret.full.json";
+import oauthAuthorizeRequestZero from "../../../fixtures/api-contract/oauth_authorize_request.zero.json";
+import oauthAuthorizeRequestFull from "../../../fixtures/api-contract/oauth_authorize_request.full.json";
+import oauthRedirectResponseZero from "../../../fixtures/api-contract/oauth_redirect_response.zero.json";
+import oauthRedirectResponseFull from "../../../fixtures/api-contract/oauth_redirect_response.full.json";
+import oauthConnectionZero from "../../../fixtures/api-contract/oauth_connection.zero.json";
+import oauthConnectionFull from "../../../fixtures/api-contract/oauth_connection.full.json";
+import adminOauthConnectionZero from "../../../fixtures/api-contract/admin_oauth_connection.zero.json";
+import adminOauthConnectionFull from "../../../fixtures/api-contract/admin_oauth_connection.full.json";
 import productTokenZero from "../../../fixtures/api-contract/product_token.zero.json";
 import runJobZero from "../../../fixtures/api-contract/run_job.zero.json";
 import runJobFull from "../../../fixtures/api-contract/run_job.full.json";
@@ -208,6 +224,12 @@ type Widen<T> = T extends string
         : T extends object
           ? { [K in keyof T]: Widen<T[K]> }
           : T;
+
+// ProductZero is the recorded zero marshal of a Product (PRD #1910): allowed_job_types and the
+// nested oauth_client's two slices are nil-slice nulls the handler normalizes to [].
+type ProductZero = Omit<ZeroOf<Product, "allowed_job_types">, "oauth_client"> & {
+  oauth_client: ZeroOf<ProductOAuthClient, "redirect_uris" | "scopes">;
+};
 
 // ZeroOf<T, NeverNull> is Widen<T> with the named fields additionally accepting
 // null. It is the per-field, reason-carrying exemption list of Decision 7: the
@@ -1019,7 +1041,7 @@ void _buildInfoFull;
   const _productExtra: never = null as unknown as Exclude<keyof typeof productFull, keyof Product>;
   // allowed_job_types: jobTypesOrEmpty (handler/admin_products.go) normalizes the nil-slice
   // null in product.zero.json to [], so it is never null on the wire.
-  const _productZero: ZeroOf<Product, "allowed_job_types"> = productZero;
+  const _productZero: ProductZero = productZero;
   const _productFull: Widen<Product> = productFull;
   void _productMissing;
   void _productExtra;
@@ -1066,14 +1088,82 @@ void _buildInfoFull;
   void _v1WhoamiZero;
   void _v1WhoamiFull;
 }
+// PRD #1910 M1: the nested oauth_client and the rotate-secret response. ZeroOf is shallow, so
+// the nested oauth_client block carries its own exemption: redirect_uris and scopes are the
+// nil-slice nulls in product.zero.json that oauthClientDTO (handler/admin_products.go)
+// normalizes to [] (jobTypesOrEmpty), so they are never null on the wire. rotated_at is
+// typed `string | null`, no exemption. oauth_client is optional in Product (rollout skew),
+// so the checks read it through Required.
+{
+  const _oauthClientMissing: never = null as unknown as Exclude<keyof ProductOAuthClient, keyof typeof productFull.oauth_client>;
+  const _oauthClientExtra: never = null as unknown as Exclude<keyof typeof productFull.oauth_client, keyof ProductOAuthClient>;
+  const _oauthClientFull: Widen<ProductOAuthClient> = productFull.oauth_client;
+  const _rotateMissing: never = null as unknown as Exclude<keyof RotateProductClientSecretResponse, keyof typeof rotateProductClientSecretFull>;
+  const _rotateExtra: never = null as unknown as Exclude<keyof typeof rotateProductClientSecretFull, keyof RotateProductClientSecretResponse>;
+  const _rotateZero: { client_secret: string; product: ProductZero } = rotateProductClientSecretZero;
+  const _rotateFull: Widen<RotateProductClientSecretResponse> = rotateProductClientSecretFull;
+  void _oauthClientMissing;
+  void _oauthClientExtra;
+  void _oauthClientFull;
+  void _rotateMissing;
+  void _rotateExtra;
+  void _rotateZero;
+  void _rotateFull;
+}
+// PRD #1910 M2: the consent page's metadata and the approve / deny redirect. scopes is the
+// nil-slice null in oauth_authorize_request.zero.json that the handler normalizes to [] (never
+// null on the wire).
+{
+  const _oauthRequestMissing: never = null as unknown as Exclude<keyof OAuthAuthorizeRequest, keyof typeof oauthAuthorizeRequestFull>;
+  const _oauthRequestExtra: never = null as unknown as Exclude<keyof typeof oauthAuthorizeRequestFull, keyof OAuthAuthorizeRequest>;
+  const _oauthRequestZero: ZeroOf<OAuthAuthorizeRequest, "scopes"> = oauthAuthorizeRequestZero;
+  const _oauthRequestFull: Widen<OAuthAuthorizeRequest> = oauthAuthorizeRequestFull;
+  const _oauthRedirectMissing: never = null as unknown as Exclude<keyof OAuthRedirect, keyof typeof oauthRedirectResponseFull>;
+  const _oauthRedirectExtra: never = null as unknown as Exclude<keyof typeof oauthRedirectResponseFull, keyof OAuthRedirect>;
+  const _oauthRedirectZero: Widen<OAuthRedirect> = oauthRedirectResponseZero;
+  const _oauthRedirectFull: Widen<OAuthRedirect> = oauthRedirectResponseFull;
+  void _oauthRequestMissing;
+  void _oauthRequestExtra;
+  void _oauthRequestZero;
+  void _oauthRequestFull;
+  void _oauthRedirectMissing;
+  void _oauthRedirectExtra;
+  void _oauthRedirectZero;
+  void _oauthRedirectFull;
+}
+// PRD #1910 M3: one live OAuth connection. last_used_at and refresh_issued_at are present-as-null
+// pointers; scopes is the nil-slice null in the zero fixture that the handler normalizes to [].
+{
+  const _oauthConnectionMissing: never = null as unknown as Exclude<keyof OAuthConnection, keyof typeof oauthConnectionFull>;
+  const _oauthConnectionExtra: never = null as unknown as Exclude<keyof typeof oauthConnectionFull, keyof OAuthConnection>;
+  const _oauthConnectionZero: ZeroOf<OAuthConnection, "scopes"> = oauthConnectionZero;
+  const _oauthConnectionFull: Widen<OAuthConnection> = oauthConnectionFull;
+  void _oauthConnectionMissing;
+  void _oauthConnectionExtra;
+  void _oauthConnectionZero;
+  void _oauthConnectionFull;
+}
+// PRD #1910 M5: one live connection in the admin product list. last_used_at is a present-as-null
+// pointer; scopes is the nil-slice null in the zero fixture that the handler normalizes to [].
+{
+  const _adminOauthConnectionMissing: never = null as unknown as Exclude<keyof AdminOAuthConnection, keyof typeof adminOauthConnectionFull>;
+  const _adminOauthConnectionExtra: never = null as unknown as Exclude<keyof typeof adminOauthConnectionFull, keyof AdminOAuthConnection>;
+  const _adminOauthConnectionZero: ZeroOf<AdminOAuthConnection, "scopes"> = adminOauthConnectionZero;
+  const _adminOauthConnectionFull: Widen<AdminOAuthConnection> = adminOauthConnectionFull;
+  void _adminOauthConnectionMissing;
+  void _adminOauthConnectionExtra;
+  void _adminOauthConnectionZero;
+  void _adminOauthConnectionFull;
+}
 // PRD #1907 M4/M5: the typed admin delete response (its nested product's deleted_at is
 // `string | null`, no exemption) and the user mint-picker entry (all strings).
 {
   const _adminDeleteProductMissing: never = null as unknown as Exclude<keyof AdminDeleteProductResponse, keyof typeof adminDeleteProductFull>;
   const _adminDeleteProductExtra: never = null as unknown as Exclude<keyof typeof adminDeleteProductFull, keyof AdminDeleteProductResponse>;
   const _adminDeleteProductZero: {
-    product: ZeroOf<Product, "allowed_job_types">;
+    product: ProductZero;
     stopped_token_count: number;
+    stopped_connection_count: number;
   } = adminDeleteProductZero;
   const _adminDeleteProductFull: Widen<AdminDeleteProductResponse> = adminDeleteProductFull;
   void _adminDeleteProductMissing;

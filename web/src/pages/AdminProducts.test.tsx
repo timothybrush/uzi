@@ -18,6 +18,8 @@ vi.mock("../lib/api", async (importOriginal) => {
       adminUpdateProduct: vi.fn(),
       adminDeleteProduct: vi.fn(),
       adminRevokeProductToken: vi.fn(),
+      adminListProductConnections: vi.fn(),
+      adminRevokeOAuthConnection: vi.fn(),
       // AdminShell's health pip self-fetches; it never settles here, so the pip stays off.
       getAdminHealth: vi.fn(() => new Promise(() => {})),
     },
@@ -107,7 +109,7 @@ describe("AdminProducts list", () => {
 
     const helpdesk = await productCard("Helpdesk assistant");
     expect(within(helpdesk).getByRole("switch", { name: "Disable Helpdesk assistant" }).getAttribute("aria-checked")).toBe("true");
-    expect(within(helpdesk).getByText("3 active tokens")).toBeTruthy();
+    expect(within(helpdesk).getByText("3 active manual tokens")).toBeTruthy();
     expect(within(helpdesk).getByText("mira@uzi.local")).toBeTruthy();
     expect(within(helpdesk).getByText("support-prod")).toBeTruthy();
     expect(within(helpdesk).getByText(CLS + "4c1e…")).toBeTruthy();
@@ -172,31 +174,95 @@ describe("AdminProducts writes", () => {
     await waitFor(() => expect(mockApi.adminUpdateProduct).toHaveBeenCalledWith("prod-a", { enabled: false }));
   });
 
-  it("confirms delete with the number of active tokens it stops, then reports stopped_token_count", async () => {
+  it("updates the card's connection count after a revoke in the Connections panel", async () => {
+    mockApi.adminListProducts
+      .mockResolvedValueOnce({ products: [aProduct({ active_token_count: 3, live_connection_count: 1 })] })
+      .mockResolvedValue({ products: [aProduct({ active_token_count: 3, live_connection_count: 0 })] });
+    mockApi.adminListProductConnections
+      .mockResolvedValueOnce({
+        connections: [
+          {
+            id: "g1",
+            user_id: "u1",
+            owner_email: "ann@example.test",
+            scopes: ["jobs:run"],
+            connected_at: daysAgo(3),
+            created_at: daysAgo(30),
+            last_used_at: null,
+          },
+        ],
+        truncated: false,
+      })
+      .mockResolvedValue({ connections: [], truncated: false });
+    mockApi.adminRevokeOAuthConnection.mockResolvedValue(null);
+    const { container } = renderPage();
+
+    expect(await screen.findByText("3 active manual tokens, 1 connection")).toBeTruthy();
+    const details = Array.from(container.querySelectorAll("details")).find((d) =>
+      d.textContent?.includes("The users who connected this product"),
+    ) as HTMLDetailsElement;
+    details.open = true;
+    fireEvent(details, new Event("toggle"));
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke the connection of ann@example.test" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke connection" }));
+
+    await waitFor(() => expect(mockApi.adminRevokeOAuthConnection).toHaveBeenCalledWith("g1"));
+    // The page reloaded the registry: the card header no longer counts the connection.
+    expect(await screen.findByText("3 active manual tokens")).toBeTruthy();
+    expect(screen.queryByText("3 active manual tokens, 1 connection")).toBeNull();
+  });
+
+  it("confirms delete with the manual tokens and connections it stops, then reports both stopped counts", async () => {
+    mockApi.adminListProducts.mockResolvedValue({
+      products: [aProduct({ active_token_count: 3, live_connection_count: 2 })],
+    });
     mockApi.adminDeleteProduct.mockResolvedValue({
       product: aProduct({ enabled: false, deleted_at: new Date().toISOString() }),
       stopped_token_count: 3,
+      stopped_connection_count: 2,
     });
     renderPage();
 
+    expect(await screen.findByText("3 active manual tokens, 2 connections")).toBeTruthy();
     fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
     expect(mockApi.adminDeleteProduct).not.toHaveBeenCalled();
     const confirm = screen.getByRole("group", { name: "Confirm deleting Helpdesk assistant" });
-    expect(within(confirm).getByText(/This stops 3 active tokens on their next request\./)).toBeTruthy();
+    expect(within(confirm).getByText(/This stops 3 active manual tokens and 2 connections on their next request\./)).toBeTruthy();
 
     fireEvent.click(within(confirm).getByRole("button", { name: "Delete product" }));
     await waitFor(() => expect(mockApi.adminDeleteProduct).toHaveBeenCalledWith("prod-a"));
-    expect(await screen.findByText("Deleted “Helpdesk assistant”. Stopped 3 active tokens.")).toBeTruthy();
+    expect(await screen.findByText("Deleted “Helpdesk assistant”. Stopped 3 active manual tokens and 2 connections.")).toBeTruthy();
   });
 
-  it("says a disabled product's delete stops 0 tokens", async () => {
+  it.each([
+    [0, 2, /This stops 2 connections on their next request\./, "Stopped 2 connections."],
+    [1, 0, /This stops 1 active manual token on their next request\./, "Stopped 1 active manual token."],
+    [0, 0, /This stops no active manual tokens or connections on their next request\./, "Stopped no active manual tokens or connections."],
+  ])("words a delete of %i tokens and %i connections", async (tokens, conns, confirmText, toast) => {
     mockApi.adminListProducts.mockResolvedValue({
-      products: [aProduct({ enabled: false, active_token_count: 2 })],
+      products: [aProduct({ active_token_count: tokens, live_connection_count: conns })],
+    });
+    mockApi.adminDeleteProduct.mockResolvedValue({
+      product: aProduct({ enabled: false, deleted_at: new Date().toISOString() }),
+      stopped_token_count: tokens,
+      stopped_connection_count: conns,
     });
     renderPage();
     fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
     const confirm = screen.getByRole("group", { name: "Confirm deleting Helpdesk assistant" });
-    expect(within(confirm).getByText(/This stops 0 active tokens: it is disabled/)).toBeTruthy();
+    expect(within(confirm).getByText(confirmText)).toBeTruthy();
+    fireEvent.click(within(confirm).getByRole("button", { name: "Delete product" }));
+    expect(await screen.findByText(`Deleted “Helpdesk assistant”. ${toast}`)).toBeTruthy();
+  });
+
+  it("says a disabled product's delete stops none of its tokens or connections", async () => {
+    mockApi.adminListProducts.mockResolvedValue({
+      products: [aProduct({ enabled: false, active_token_count: 2, live_connection_count: 1 })],
+    });
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    const confirm = screen.getByRole("group", { name: "Confirm deleting Helpdesk assistant" });
+    expect(within(confirm).getByText(/It is disabled, so its tokens and connections are already refused and deleting it stops none\./)).toBeTruthy();
   });
 
   it("admin revoke calls the revoke endpoint for that token", async () => {

@@ -519,6 +519,40 @@ type Notification struct {
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
+type OauthAuthorizeRequest struct {
+	ID            uuid.UUID          `json:"id"`
+	ProductID     uuid.UUID          `json:"product_id"`
+	RedirectUri   string             `json:"redirect_uri"`
+	Scopes        []string           `json:"scopes"`
+	State         string             `json:"state"`
+	CodeChallenge string             `json:"code_challenge"`
+	BindingHash   []byte             `json:"binding_hash"`
+	SourcePrefix  string             `json:"source_prefix"`
+	SourceMid     string             `json:"source_mid"`
+	SourceWide    string             `json:"source_wide"`
+	Status        string             `json:"status"`
+	UserID        pgtype.UUID        `json:"user_id"`
+	GrantID       pgtype.UUID        `json:"grant_id"`
+	CodeHash      []byte             `json:"code_hash"`
+	CodeExpiresAt pgtype.Timestamptz `json:"code_expires_at"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	ExpiresAt     pgtype.Timestamptz `json:"expires_at"`
+}
+
+type OauthGrant struct {
+	ID                 uuid.UUID          `json:"id"`
+	UserID             uuid.UUID          `json:"user_id"`
+	ProductID          uuid.UUID          `json:"product_id"`
+	Scopes             []string           `json:"scopes"`
+	RefreshTokenHash   []byte             `json:"refresh_token_hash"`
+	RefreshTokenPrefix pgtype.Text        `json:"refresh_token_prefix"`
+	RefreshIssuedAt    pgtype.Timestamptz `json:"refresh_issued_at"`
+	RefreshLastUsedAt  pgtype.Timestamptz `json:"refresh_last_used_at"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	ConsentedAt        pgtype.Timestamptz `json:"consented_at"`
+	RevokedAt          pgtype.Timestamptz `json:"revoked_at"`
+}
+
 type PipelineStatus struct {
 	ID             int64              `json:"id"`
 	RepoID         uuid.UUID          `json:"repo_id"`
@@ -559,21 +593,26 @@ type PrDescriptionVersion struct {
 }
 
 type Product struct {
-	ID                uuid.UUID          `json:"id"`
-	Name              string             `json:"name"`
-	Description       string             `json:"description"`
-	Enabled           bool               `json:"enabled"`
-	DeletedAt         pgtype.Timestamptz `json:"deleted_at"`
-	CreatedBy         pgtype.UUID        `json:"created_by"`
-	CreatedAt         pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
-	AllowedJobTypes   []string           `json:"allowed_job_types"`
-	SkillsRepoUrl     string             `json:"skills_repo_url"`
-	SkillsRef         string             `json:"skills_ref"`
-	SkillsTokenSealed []byte             `json:"skills_token_sealed"`
-	SkillsAppliedSha  string             `json:"skills_applied_sha"`
-	SkillsAppliedBy   pgtype.UUID        `json:"skills_applied_by"`
-	SkillsAppliedAt   pgtype.Timestamptz `json:"skills_applied_at"`
+	ID                    uuid.UUID          `json:"id"`
+	Name                  string             `json:"name"`
+	Description           string             `json:"description"`
+	Enabled               bool               `json:"enabled"`
+	DeletedAt             pgtype.Timestamptz `json:"deleted_at"`
+	CreatedBy             pgtype.UUID        `json:"created_by"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt             pgtype.Timestamptz `json:"updated_at"`
+	AllowedJobTypes       []string           `json:"allowed_job_types"`
+	SkillsRepoUrl         string             `json:"skills_repo_url"`
+	SkillsRef             string             `json:"skills_ref"`
+	SkillsTokenSealed     []byte             `json:"skills_token_sealed"`
+	SkillsAppliedSha      string             `json:"skills_applied_sha"`
+	SkillsAppliedBy       pgtype.UUID        `json:"skills_applied_by"`
+	SkillsAppliedAt       pgtype.Timestamptz `json:"skills_applied_at"`
+	RedirectUris          []string           `json:"redirect_uris"`
+	OauthScopes           []string           `json:"oauth_scopes"`
+	ClientSecretHash      []byte             `json:"client_secret_hash"`
+	ClientSecretPrefix    pgtype.Text        `json:"client_secret_prefix"`
+	ClientSecretRotatedAt pgtype.Timestamptz `json:"client_secret_rotated_at"`
 }
 
 type ProductEgressProfile struct {
@@ -605,6 +644,7 @@ type ProductToken struct {
 	LastUsedAt  pgtype.Timestamptz `json:"last_used_at"`
 	LastUsedIp  *netip.Addr        `json:"last_used_ip"`
 	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
+	GrantID     pgtype.UUID        `json:"grant_id"`
 }
 
 type RecommendationDisposition struct {
