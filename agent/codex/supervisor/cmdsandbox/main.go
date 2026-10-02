@@ -19,6 +19,14 @@
 //     worker's default mode; `required` stays the default only for an argv
 //     without --mode, which the worker never builds.
 //
+// The optional `--stdin null` (after --mode) gives the command an empty stdin
+// (/dev/null) instead of the inherited one. The worker sets it only for
+// model-authorized commands, whose inherited stdin is a pipe nobody writes or
+// closes, so a command reading it (rg PATTERN with no path, cat) would block
+// until the command deadline. Without it stdin is inherited, which the
+// worker's own streaming processes rely on (the fileop protocol, git
+// index-pack --stdin). Only the value null is accepted.
+//
 // The private tmp (--tmp) is created, locked and removed by the supervisor
 // above this process: it holds the creation pin and outlives any backgrounded
 // descendant, so it alone can tell when removal is safe. This command has no
@@ -155,7 +163,7 @@ func setupFailure(stage string, err error) int {
 }
 
 func realMain(args []string) int {
-	root, tmp, cwd, cache, mode, child, err := parseArgs(args)
+	root, tmp, cwd, cache, mode, nullStdin, child, err := parseArgs(args)
 	if err != nil {
 		return setupFailure("invalid arguments", err)
 	}
@@ -181,6 +189,11 @@ func realMain(args []string) int {
 	}
 	cmd := exec.Command(child[0], child[1:]...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if nullStdin {
+		// A nil Stdin makes os/exec open /dev/null here, after applyPolicy (the
+		// /dev Landlock rule in addRules keeps read access for this open).
+		cmd.Stdin = nil
+	}
 	cmd.Env = os.Environ()
 	if err := cmd.Run(); err != nil {
 		var exit *exec.ExitError
@@ -284,17 +297,18 @@ func requireEmptyDir(fd int) error {
 
 // parseArgs reads the trusted worker-built argv. Grammar:
 //
-//	--root R --tmp T --cwd C [--cache K] [--mode required|best-effort|off] -- CMD...
+//	--root R --tmp T --cwd C [--cache K] [--mode required|best-effort|off] [--stdin null] -- CMD...
 //
-// The three path flags stay positional (as before). The cache and mode flags
-// are OPTIONAL and, when present, come in that order after --cwd and before
-// the `--` separator. Everything after `--` is the child command verbatim, so a
-// `--cache` or `--mode` token there is part of the CHILD and is NEVER read as
-// a sandbox flag (the trust property: both come only from this argv, built by
-// the trusted worker). cache is "" when --cache is absent.
-func parseArgs(args []string) (root, tmp, cwd, cache string, mode sandboxMode, child []string, err error) {
-	fail := func(err error) (string, string, string, string, sandboxMode, []string, error) {
-		return "", "", "", "", "", nil, err
+// The three path flags stay positional (as before). The cache, mode and stdin
+// flags are OPTIONAL and, when present, come in that order after --cwd and
+// before the `--` separator. Everything after `--` is the child command
+// verbatim, so a `--cache`, `--mode` or `--stdin` token there is part of the
+// CHILD and is NEVER read as a sandbox flag (the trust property: all come only
+// from this argv, built by the trusted worker). cache is "" when --cache is
+// absent; nullStdin is false (inherit stdin) when --stdin is absent.
+func parseArgs(args []string) (root, tmp, cwd, cache string, mode sandboxMode, nullStdin bool, child []string, err error) {
+	fail := func(err error) (string, string, string, string, sandboxMode, bool, []string, error) {
+		return "", "", "", "", "", false, nil, err
 	}
 	mode = modeRequired
 	if len(args) < 7 || args[0] != "--root" || args[2] != "--tmp" || args[4] != "--cwd" {
@@ -302,9 +316,9 @@ func parseArgs(args []string) (root, tmp, cwd, cache string, mode sandboxMode, c
 	}
 	root, tmp, cwd = args[1], args[3], args[5]
 	rest := args[6:]
-	// An OPTIONAL `--cache <dir>`, then an OPTIONAL `--mode <value>`, may
-	// precede the separator. Parsed only here, before `--`, so a child argument
-	// spelled `--cache` or `--mode` can never reach them.
+	// An OPTIONAL `--cache <dir>`, then `--mode <value>`, then `--stdin null`,
+	// may precede the separator. Parsed only here, before `--`, so a child
+	// argument spelled `--cache`, `--mode` or `--stdin` can never reach them.
 	if len(rest) >= 2 && rest[0] == "--cache" {
 		cache = rest[1]
 		if !validCachePath(cache) {
@@ -318,6 +332,13 @@ func parseArgs(args []string) (root, tmp, cwd, cache string, mode sandboxMode, c
 			return fail(modeErr)
 		}
 		mode = parsed
+		rest = rest[2:]
+	}
+	if len(rest) >= 2 && rest[0] == "--stdin" {
+		if rest[1] != "null" {
+			return fail(fmt.Errorf("unsupported --stdin value %q (only null)", rest[1]))
+		}
+		nullStdin = true
 		rest = rest[2:]
 	}
 	if len(rest) < 1 || rest[0] != "--" {
@@ -334,7 +355,7 @@ func parseArgs(args []string) (root, tmp, cwd, cache string, mode sandboxMode, c
 	if relErr != nil || rel == ".." || (len(rel) >= 3 && rel[:3] == ".."+string(filepath.Separator)) {
 		return fail(errors.New("cwd escapes root"))
 	}
-	return root, tmp, cwd, cache, mode, child, nil
+	return root, tmp, cwd, cache, mode, nullStdin, child, nil
 }
 
 // validCachePath accepts only a per-run cache directory: an absolute path that
