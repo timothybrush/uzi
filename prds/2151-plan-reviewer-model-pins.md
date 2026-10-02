@@ -33,7 +33,7 @@ Acceptance examples:
 - **Placement**: a `plan_review` child with a custom Codex pin is claimable only by a worker advertising `codex_custom_model_v1`, mirrored in ClaimRun, `CountOnlineWorkersClaimableForRun` and the ephemeral provisioning queries, following the custom-root clause in `runtime.sql`.
 - **Record**: the `plan_reviews` row stores the model and effort the claim delivered (PRD #2149) and, here, their source (`pin` or `worker default`).
 - **Web**: a "Plan reviewer" section on `web/src/pages/RunDefaults.tsx`, two rows of model and effort selects with epic #1703's `Default · value (source)` wording; mock-mode fixture.
-- **CLI**: the account settings view shows the four values and their sources; writes stay in the web UI, as for the other `/me/settings` fields. Check `api/cmd/uzi/` and `docs/cli.md`.
+- **CLI**: the account settings view shows the four values and their sources. No CLI model or effort setting has a write path yet; epic #1703 requires CLI get, set and reset for every model and effort setting through its child O, so these four fields are not an exception: child O covers them like the other model fields. Check `api/cmd/uzi/` and `docs/cli.md`.
 
 ## Testing decisions
 
