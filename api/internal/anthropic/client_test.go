@@ -11,6 +11,25 @@ import (
 	"time"
 )
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestProbeTestStatusWithoutHeaders(t *testing.T) {
+	calls := 0
+	client := New(&http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if r.Method != http.MethodPost || r.URL.String() != messagesURL || r.Header.Get("Authorization") != "Bearer "+"fixture" {
+			t.Fatalf("unexpected probe request: %s %s", r.Method, r.URL)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("{}"))}, nil
+	})})
+	_, hasGauge, err := client.ProbeTest(context.Background(), []byte("fixture"))
+	if err != nil || hasGauge || calls != 1 {
+		t.Fatalf("ProbeTest = (gauge %v, %v), calls %d", hasGauge, err, calls)
+	}
+}
+
 func TestParseUsage(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -181,7 +200,7 @@ func TestParseHeaders(t *testing.T) {
 	}
 }
 
-const secretToken = "sk-ant-oat-SECRETsentinelVALUE-do-not-leak"
+const secretToken = "sk-ant-oat-SECRETsentinelVALUE-do-not-leak" //nolint:gosec // G101: a sentinel the no-leak test searches for, not a credential
 
 // TestNoTokenInError is the load-bearing security test: no error path can carry
 // the token. It exercises HTTP-refusal and transport failures and asserts the
@@ -221,7 +240,7 @@ func (c *Client) doAndClassify(ctx context.Context, method, url string, body, to
 	if err != nil {
 		return Reading{}, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 	if resp.StatusCode != http.StatusOK {
 		return Reading{}, httpError("test", resp.StatusCode, b)

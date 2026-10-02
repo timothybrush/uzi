@@ -37,8 +37,11 @@ type fakeStore struct {
 	// Enablement (PRD #1732), keyed by secret id: a disabled token is neither listed
 	// nor resolved for a poke, and the upsert mirrors the SQL's revision fence so the
 	// engine's use of the written/refused answer is observable. rev is 0 when unset.
-	disabled map[uuid.UUID]bool
-	rev      map[uuid.UUID]int64
+	disabled       map[uuid.UUID]bool
+	rev            map[uuid.UUID]int64
+	rejected       map[uuid.UUID]bool
+	generation     map[uuid.UUID]int64
+	markGeneration int64
 	// resolved records every poke resolve, so a test can assert which token a poke named.
 	resolved []store.GetAnthropicTokenToPollParams
 }
@@ -51,12 +54,14 @@ func newFakeStore(users ...uuid.UUID) *fakeStore {
 		})
 	}
 	return &fakeStore{
-		rows:     rows,
-		upserts:  map[uuid.UUID]store.UpsertRateLimitsParams{},
-		prev:     map[uuid.UUID]store.AnthropicRateLimit{},
-		notify:   map[uuid.UUID]bool{},
-		disabled: map[uuid.UUID]bool{},
-		rev:      map[uuid.UUID]int64{},
+		rows:       rows,
+		upserts:    map[uuid.UUID]store.UpsertRateLimitsParams{},
+		prev:       map[uuid.UUID]store.AnthropicRateLimit{},
+		notify:     map[uuid.UUID]bool{},
+		disabled:   map[uuid.UUID]bool{},
+		rev:        map[uuid.UUID]int64{},
+		rejected:   map[uuid.UUID]bool{},
+		generation: map[uuid.UUID]int64{},
 	}
 }
 func (f *fakeStore) ListAnthropicTokensToPoll(context.Context) ([]store.ListAnthropicTokensToPollRow, error) {
@@ -72,6 +77,7 @@ func (f *fakeStore) ListAnthropicTokensToPoll(context.Context) ([]store.ListAnth
 		}
 		r.NotifyEarlyLimitReset = f.notify[r.UserID]
 		r.EnablementRev = f.rev[r.ID]
+		r.AnthropicSuccessGeneration = f.generation[r.ID]
 		out = append(out, r)
 	}
 	return out, nil
@@ -90,6 +96,7 @@ func (f *fakeStore) GetAnthropicTokenToPoll(_ context.Context, arg store.GetAnth
 			return store.GetAnthropicTokenToPollRow{
 				ID: r.ID, UserID: r.UserID, Ciphertext: r.Ciphertext, SealedWith: r.SealedWith,
 				NotifyEarlyLimitReset: f.notify[r.UserID], EnablementRev: f.rev[r.ID],
+				AnthropicSuccessGeneration: f.generation[r.ID],
 			}, nil
 		}
 	}
@@ -106,9 +113,22 @@ func (f *fakeStore) UpsertRateLimits(_ context.Context, arg store.UpsertRateLimi
 		return 0, nil // the D13 fence: disabled, or the revision moved on
 	}
 	f.upserts[arg.UserSecretID] = arg
+	f.rejected[arg.UserSecretID] = false
+	f.generation[arg.UserSecretID]++
 	// Mirror the write into prev, so a following tick's GetRateLimitsForToken sees the
 	// row this tick just wrote — the once-only edge-consumption property depends on it.
 	f.prev[arg.UserSecretID] = gaugeRow(arg)
+	return 1, nil
+}
+func (f *fakeStore) MarkAnthropicTokenRejected(_ context.Context, arg store.MarkAnthropicTokenRejectedParams) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.markGeneration = arg.AnthropicSuccessGeneration
+	if f.disabled[arg.UserSecretID] || f.rev[arg.UserSecretID] != arg.EnablementRev || arg.UserID != arg.UserSecretID ||
+		f.generation[arg.UserSecretID] != arg.AnthropicSuccessGeneration {
+		return 0, nil
+	}
+	f.rejected[arg.UserSecretID] = true
 	return 1, nil
 }
 func (f *fakeStore) GetRateLimitsForToken(_ context.Context, arg store.GetRateLimitsForTokenParams) (store.AnthropicRateLimit, error) {
@@ -486,6 +506,9 @@ func (m *multiTokenStore) UpsertRateLimits(_ context.Context, arg store.UpsertRa
 	if m.prev != nil {
 		m.prev[arg.UserSecretID] = gaugeRow(arg)
 	}
+	return 1, nil
+}
+func (m *multiTokenStore) MarkAnthropicTokenRejected(context.Context, store.MarkAnthropicTokenRejectedParams) (int64, error) {
 	return 1, nil
 }
 func (m *multiTokenStore) GetRateLimitsForToken(_ context.Context, arg store.GetRateLimitsForTokenParams) (store.AnthropicRateLimit, error) {

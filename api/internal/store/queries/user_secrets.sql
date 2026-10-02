@@ -60,7 +60,8 @@ RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 -- and is_default flag are deliberately untouched: rotating a credential's value is
 -- not the same operation as renaming it or changing which one is the default.
 UPDATE user_secrets
-SET ciphertext = $3, sealed_with = $4, updated_at = now()
+SET ciphertext = $3, sealed_with = $4, updated_at = now(),
+    enablement_rev = enablement_rev + 1, anthropic_rejected_at = NULL
 WHERE id = $1 AND user_id = $2
 RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 
@@ -86,7 +87,9 @@ VALUES ($1, $2, CASE WHEN EXISTS (
 ON CONFLICT (user_id, kind) WHERE is_default DO UPDATE
     SET ciphertext = EXCLUDED.ciphertext,
         sealed_with = EXCLUDED.sealed_with,
-        updated_at = now()
+        updated_at = now(),
+        enablement_rev = user_secrets.enablement_rev + 1,
+        anthropic_rejected_at = NULL
         -- Preserve the existing opt-in/opt-out state on rotation.
     WHERE user_secrets.disabled_at IS NULL
 RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
@@ -253,7 +256,8 @@ ORDER BY is_default DESC, lower(label) ASC;
 -- per-(user,kind) advisory lock the mutation takes first, it is what lets
 -- set-default's clear-then-set and delete-default's guard read a stable picture.
 -- Owner-scoped, so a foreign id is pgx.ErrNoRows (a 404), never another user's row.
-SELECT id, kind, label, is_default, auto_eligible, disabled_at, enablement_rev FROM user_secrets
+SELECT id, kind, label, is_default, auto_eligible, disabled_at, enablement_rev,
+       anthropic_success_generation FROM user_secrets
 WHERE id = @id AND user_id = @user_id
 FOR UPDATE;
 
@@ -405,7 +409,7 @@ FROM user_secrets WHERE id = @id AND user_id = @user_id;
 -- UpsertCodexAccountRateLimits in codex_rate_limits.sql for why the Codex poll writes rely on it.
 UPDATE user_secrets
 SET disabled_at = CASE WHEN @enabled::boolean THEN NULL ELSE now() END,
-    enablement_rev = enablement_rev + 1, updated_at = now()
+    enablement_rev = enablement_rev + 1, anthropic_rejected_at = NULL, updated_at = now()
 WHERE id = @id AND user_id = @user_id
   AND (disabled_at IS NULL) <> @enabled::boolean
 RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at,

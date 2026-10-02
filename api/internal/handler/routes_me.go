@@ -26,18 +26,31 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 		r.Group(func(r chi.Router) {
 			r.Use(mw.RequireUser(h.q, h.cfg))
 			r.Get("/", h.ListMySecrets)
-			// The auto-selection pool toggle (PRD #111 M2, D13). RequireUser, and
-			// it is the ONE write in this route tree that is — deliberately, and
-			// on the SAME reasoning as PATCH /workers/{id}: it mints
-			// nothing, reveals nothing, and only re-points SPEND among tokens the
-			// caller already holds. It is a separate, narrow path precisely so
+			r.Post("/{kind}/{id}/test", h.TestMySecret)
+			// Credential Test (issue #1988) is a bounded, owner-scoped exception to
+			// the cookie-only rule below: it reveals no credential and stores no new
+			// one, and each request is rate-limited per credential and per owner. It
+			// may make up to two provider calls (Anthropic: Usage, then a small
+			// Messages check when probing is enabled). Its writes, fenced on the
+			// credential revision: an Anthropic success records usage gauges when
+			// available, increments the success generation and clears the rejection
+			// marker; a Messages 401/403 sets that marker; a Codex login in staging or
+			// failed goes through the existing identity reconciliation, which can link
+			// it and, when the verified account is quarantined or needs re-login,
+			// install the user's already-stored login on that account
+			// (RefreshCodexAccountLogin). OpenAI results are not persisted.
+			//
+			// The auto-selection pool toggle (PRD #111 M2, D13) is the other write
+			// here, deliberately, on the SAME reasoning as PATCH /workers/{id}: it
+			// mints nothing, reveals nothing, and only re-points SPEND among tokens
+			// the caller already holds. It is a separate, narrow path precisely so
 			// that reasoning applies to it alone; folding the flag into the PATCH
 			// in the group below would have required moving that route here,
 			// making rename, rotate and set-default Bearer-reachable as
 			// collateral damage.
 			r.Patch("/anthropic_token/{id}/auto-eligible", h.PatchAnthropicTokenAutoEligible)
 		})
-		// Every WRITE stays cookie-only (RequireAuth), DELIBERATELY (D8): creating,
+		// Every other WRITE stays cookie-only (RequireAuth), DELIBERATELY (D8): creating,
 		// rotating and deleting credentials is the CLI's exclusion zone — a
 		// Bearer-reachable mint would let a stolen uzc_ replace a user's tokens, the
 		// same reason POST /workers is cookie-only.

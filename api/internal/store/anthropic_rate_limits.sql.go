@@ -34,7 +34,7 @@ func (q *Queries) DeleteRateLimits(ctx context.Context, userID uuid.UUID) (int64
 
 const getAnthropicTokenToPoll = `-- name: GetAnthropicTokenToPoll :one
 SELECT s.id, s.user_id, s.ciphertext, s.sealed_with, u.notify_early_limit_reset,
-       s.enablement_rev
+       s.enablement_rev, s.anthropic_success_generation
 FROM user_secrets s
 JOIN users u ON s.user_id = u.id
 WHERE s.user_id = $1 AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL
@@ -48,19 +48,20 @@ type GetAnthropicTokenToPollParams struct {
 }
 
 type GetAnthropicTokenToPollRow struct {
-	ID                    uuid.UUID `json:"id"`
-	UserID                uuid.UUID `json:"user_id"`
-	Ciphertext            []byte    `json:"ciphertext"`
-	SealedWith            string    `json:"sealed_with"`
-	NotifyEarlyLimitReset bool      `json:"notify_early_limit_reset"`
-	EnablementRev         int64     `json:"enablement_rev"`
+	ID                         uuid.UUID `json:"id"`
+	UserID                     uuid.UUID `json:"user_id"`
+	Ciphertext                 []byte    `json:"ciphertext"`
+	SealedWith                 string    `json:"sealed_with"`
+	NotifyEarlyLimitReset      bool      `json:"notify_early_limit_reset"`
+	EnablementRev              int64     `json:"enablement_rev"`
+	AnthropicSuccessGeneration int64     `json:"anthropic_success_generation"`
 }
 
 // The single-token sibling of ListAnthropicTokensToPoll for the out-of-band poke
 // (PRD #1732 M3a): the named token when @secret_id is set, else the owner's
 // default. Same projection as the listing, so the poke opens exactly the row it
 // resolved (never "whatever the default is by open time") and captures the same
-// enablement_rev fence. A disabled token resolves to no row, so a poke never polls
+// enablement_rev fence and success generation. A disabled token resolves to no row, so a poke never polls
 // it (D1).
 func (q *Queries) GetAnthropicTokenToPoll(ctx context.Context, arg GetAnthropicTokenToPollParams) (GetAnthropicTokenToPollRow, error) {
 	row := q.db.QueryRow(ctx, getAnthropicTokenToPoll, arg.UserID, arg.SecretID)
@@ -72,6 +73,7 @@ func (q *Queries) GetAnthropicTokenToPoll(ctx context.Context, arg GetAnthropicT
 		&i.SealedWith,
 		&i.NotifyEarlyLimitReset,
 		&i.EnablementRev,
+		&i.AnthropicSuccessGeneration,
 	)
 	return i, err
 }
@@ -112,7 +114,7 @@ func (q *Queries) GetRateLimitsForToken(ctx context.Context, arg GetRateLimitsFo
 
 const listAnthropicTokensToPoll = `-- name: ListAnthropicTokensToPoll :many
 SELECT s.id, s.user_id, s.ciphertext, s.sealed_with, u.notify_early_limit_reset,
-       s.enablement_rev
+       s.enablement_rev, s.anthropic_success_generation
 FROM user_secrets s
 JOIN users u ON s.user_id = u.id
 WHERE s.kind = 'anthropic_token' AND s.disabled_at IS NULL
@@ -120,12 +122,13 @@ ORDER BY s.user_id, s.id
 `
 
 type ListAnthropicTokensToPollRow struct {
-	ID                    uuid.UUID `json:"id"`
-	UserID                uuid.UUID `json:"user_id"`
-	Ciphertext            []byte    `json:"ciphertext"`
-	SealedWith            string    `json:"sealed_with"`
-	NotifyEarlyLimitReset bool      `json:"notify_early_limit_reset"`
-	EnablementRev         int64     `json:"enablement_rev"`
+	ID                         uuid.UUID `json:"id"`
+	UserID                     uuid.UUID `json:"user_id"`
+	Ciphertext                 []byte    `json:"ciphertext"`
+	SealedWith                 string    `json:"sealed_with"`
+	NotifyEarlyLimitReset      bool      `json:"notify_early_limit_reset"`
+	EnablementRev              int64     `json:"enablement_rev"`
+	AnthropicSuccessGeneration int64     `json:"anthropic_success_generation"`
 }
 
 // Every anthropic_token secret to poll each tick (PRD #104 M5): the token's id and
@@ -152,7 +155,8 @@ type ListAnthropicTokensToPollRow struct {
 //
 // A DISABLED token is not listed (PRD #1732 D1: background polling stops on
 // disable). enablement_rev is captured with the row so the poll's write can be
-// fenced on the revision it started at (D13, see UpsertRateLimits).
+// fenced on the revision it started at (D13, see UpsertRateLimits). The success
+// generation is captured before the provider call to fence a later refusal.
 func (q *Queries) ListAnthropicTokensToPoll(ctx context.Context) ([]ListAnthropicTokensToPollRow, error) {
 	rows, err := q.db.Query(ctx, listAnthropicTokensToPoll)
 	if err != nil {
@@ -169,6 +173,7 @@ func (q *Queries) ListAnthropicTokensToPoll(ctx context.Context) ([]ListAnthropi
 			&i.SealedWith,
 			&i.NotifyEarlyLimitReset,
 			&i.EnablementRev,
+			&i.AnthropicSuccessGeneration,
 		); err != nil {
 			return nil, err
 		}
@@ -184,6 +189,7 @@ const listAutoSelectCandidates = `-- name: ListAutoSelectCandidates :many
 SELECT s.id                     AS user_secret_id,
        s.label                  AS label,
        s.auto_eligible          AS auto_eligible,
+       (s.anthropic_rejected_at IS NOT NULL)::boolean AS rejected,
        rl.five_hour_pct,
        rl.five_hour_resets_at,
        rl.seven_day_pct,
@@ -241,6 +247,7 @@ type ListAutoSelectCandidatesRow struct {
 	UserSecretID     uuid.UUID          `json:"user_secret_id"`
 	Label            string             `json:"label"`
 	AutoEligible     bool               `json:"auto_eligible"`
+	Rejected         bool               `json:"rejected"`
 	FiveHourPct      pgtype.Int2        `json:"five_hour_pct"`
 	FiveHourResetsAt pgtype.Timestamptz `json:"five_hour_resets_at"`
 	SevenDayPct      pgtype.Int2        `json:"seven_day_pct"`
@@ -310,6 +317,7 @@ func (q *Queries) ListAutoSelectCandidates(ctx context.Context, userID uuid.UUID
 			&i.UserSecretID,
 			&i.Label,
 			&i.AutoEligible,
+			&i.Rejected,
 			&i.FiveHourPct,
 			&i.FiveHourResetsAt,
 			&i.SevenDayPct,
@@ -336,6 +344,7 @@ SELECT
     s.label         AS label,
     s.is_default    AS is_default,
     s.auto_eligible AS auto_eligible,
+    (s.anthropic_rejected_at IS NOT NULL)::boolean AS rejected,
     rl.five_hour_pct,
     rl.five_hour_resets_at,
     rl.seven_day_pct,
@@ -358,6 +367,7 @@ type ListRateLimitsRow struct {
 	Label            pgtype.Text        `json:"label"`
 	IsDefault        pgtype.Bool        `json:"is_default"`
 	AutoEligible     pgtype.Bool        `json:"auto_eligible"`
+	Rejected         bool               `json:"rejected"`
 	FiveHourPct      pgtype.Int2        `json:"five_hour_pct"`
 	FiveHourResetsAt pgtype.Timestamptz `json:"five_hour_resets_at"`
 	SevenDayPct      pgtype.Int2        `json:"seven_day_pct"`
@@ -409,6 +419,7 @@ func (q *Queries) ListRateLimits(ctx context.Context) ([]ListRateLimitsRow, erro
 			&i.Label,
 			&i.IsDefault,
 			&i.AutoEligible,
+			&i.Rejected,
 			&i.FiveHourPct,
 			&i.FiveHourResetsAt,
 			&i.SevenDayPct,
@@ -431,6 +442,7 @@ SELECT s.id            AS user_secret_id,
        s.label         AS label,
        s.is_default    AS is_default,
        s.auto_eligible AS auto_eligible,
+       (s.anthropic_rejected_at IS NOT NULL)::boolean AS rejected,
        rl.five_hour_pct,
        rl.five_hour_resets_at,
        rl.seven_day_pct,
@@ -449,6 +461,7 @@ type ListRateLimitsForUserRow struct {
 	Label            string             `json:"label"`
 	IsDefault        bool               `json:"is_default"`
 	AutoEligible     bool               `json:"auto_eligible"`
+	Rejected         bool               `json:"rejected"`
 	FiveHourPct      pgtype.Int2        `json:"five_hour_pct"`
 	FiveHourResetsAt pgtype.Timestamptz `json:"five_hour_resets_at"`
 	SevenDayPct      pgtype.Int2        `json:"seven_day_pct"`
@@ -497,6 +510,7 @@ func (q *Queries) ListRateLimitsForUser(ctx context.Context, userID uuid.UUID) (
 			&i.Label,
 			&i.IsDefault,
 			&i.AutoEligible,
+			&i.Rejected,
 			&i.FiveHourPct,
 			&i.FiveHourResetsAt,
 			&i.SevenDayPct,
@@ -512,6 +526,38 @@ func (q *Queries) ListRateLimitsForUser(ctx context.Context, userID uuid.UUID) (
 		return nil, err
 	}
 	return items, nil
+}
+
+const markAnthropicTokenRejected = `-- name: MarkAnthropicTokenRejected :execrows
+UPDATE user_secrets SET anthropic_rejected_at = clock_timestamp()
+WHERE id = $1 AND user_id = $2
+  AND kind = 'anthropic_token' AND disabled_at IS NULL
+  AND enablement_rev = $3
+  AND anthropic_success_generation = $4
+`
+
+type MarkAnthropicTokenRejectedParams struct {
+	UserSecretID               uuid.UUID `json:"user_secret_id"`
+	UserID                     uuid.UUID `json:"user_id"`
+	EnablementRev              int64     `json:"enablement_rev"`
+	AnthropicSuccessGeneration int64     `json:"anthropic_success_generation"`
+}
+
+// Only a definitive probe refusal marks the exact enabled credential revision.
+// A replacement, disable, or re-enable makes an older poll's write affect zero rows.
+// The generation predicate is rechecked after a row-lock wait by UPDATE under
+// read committed, so an in-flight refusal cannot undo a newer success.
+func (q *Queries) MarkAnthropicTokenRejected(ctx context.Context, arg MarkAnthropicTokenRejectedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markAnthropicTokenRejected,
+		arg.UserSecretID,
+		arg.UserID,
+		arg.EnablementRev,
+		arg.AnthropicSuccessGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const markFiveHourExhausted = `-- name: MarkFiveHourExhausted :execrows
@@ -576,6 +622,14 @@ func (q *Queries) MarkSevenDayExhausted(ctx context.Context, userSecretID uuid.U
 }
 
 const upsertRateLimits = `-- name: UpsertRateLimits :execrows
+WITH current_secret AS (
+    UPDATE user_secrets s SET anthropic_rejected_at = NULL,
+                              anthropic_success_generation = s.anthropic_success_generation + 1
+    WHERE s.id = $7 AND s.user_id = $8
+      AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL
+      AND s.enablement_rev = $9
+    RETURNING s.id, s.user_id, s.enablement_rev
+)
 INSERT INTO anthropic_rate_limits (
     user_secret_id, user_id, five_hour_pct, five_hour_resets_at,
     seven_day_pct, seven_day_resets_at, source, synced_at, enablement_rev
@@ -588,11 +642,7 @@ SELECT s.id, s.user_id,
        $5::text,
        $6::timestamptz,
        s.enablement_rev
-FROM user_secrets s
-WHERE s.id = $7 AND s.user_id = $8
-  AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL
-  AND s.enablement_rev = $9
-FOR SHARE OF s
+FROM current_secret s
 ON CONFLICT (user_secret_id) DO UPDATE SET
     five_hour_pct       = EXCLUDED.five_hour_pct,
     five_hour_resets_at = EXCLUDED.five_hour_resets_at,
@@ -633,14 +683,12 @@ type UpsertRateLimitsParams struct {
 // the poll captured when it started, so a poll that started before a disable (or
 // before a disable and the following re-enable) writes nothing: the SELECT yields
 // no row and the statement affects 0 rows, which the caller reads as "not written"
-// and then must not notify. FOR SHARE serialises the check against the transition
-// (SetSecretEnablement's UPDATE, and the handler's FOR UPDATE, conflict with it):
-// a transition that commits first makes this re-check see the new revision and
-// write nothing, and one that comes second waits for this write. Without it the
-// write still waits behind the enablement handler's FOR UPDATE (the FK's KEY SHARE
-// check conflicts with it) but then lands the old revision's reading, because the
-// fence was evaluated before the wait; TestRateLimitFenceSerializesWithTransitionLiveDB
-// measures exactly that.
+// and then must not notify. The current_secret UPDATE takes the secret row lock
+// before the gauge insert or conflict update, increments the success generation,
+// and clears the rejection marker in
+// the same statement as the successful reading. A credential transition that
+// commits first makes the revision check write zero rows; one that comes second
+// waits for the successful reading. This also orders locks secret then gauge.
 // The row is stamped with the revision it was polled at, which is what hides it
 // from every reader once the revision moves on.
 func (q *Queries) UpsertRateLimits(ctx context.Context, arg UpsertRateLimitsParams) (int64, error) {
