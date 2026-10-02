@@ -32,6 +32,9 @@ through `[0.52.0]`.)
 - **Codex transient retry backoff respects the remaining wall budget, and agent CI reruns select fresh shard reports ([#2111](https://github.com/vtmocanu/uzi/issues/2111)).**
   Early timer wakes no longer finish a wall-capped backoff with budget left for an extra provider turn. CI stores reports separately for each attempt and checks the latest available report independently for each shard, so partial reruns cannot use a stale M4 completion marker.
 
+- **Fetch credentials are now scrubbed from API text and CI failure log tails ([#2035](https://github.com/vtmocanu/uzi/issues/2035)).**
+  The outbound text and issue draft scrubbers replace recognized `uzf_` credentials, and the CI failure snapshot scrubber replaces them in log tails.
+
 - **Admin Health no longer expects a controller when chart hosting is disabled ([#1982](https://github.com/vtmocanu/uzi/issues/1982)).**
   The chart emits HOSTED_WORKER_VERSION only when workers.enabled is true, so an installation with no hosted workers does not show a false controller-report Danger banner after startup. External worker upgrade targets are unaffected.
 
