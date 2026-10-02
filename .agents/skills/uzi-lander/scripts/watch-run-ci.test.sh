@@ -70,6 +70,27 @@ if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then
       printf '104\tcompleted\tfailure\tCI%s[2J\n' "$escape"
       ;;
     stuck) printf '105\tin_progress\t\tCI\n' ;;
+    jobs-cancelled)
+      # The run is still listed in_progress while every job already ended cancelled.
+      case " $* " in
+        *" --commit "*) printf '106\tin_progress\t\tCI\n' ;;
+        *) printf '106\n' ;;
+      esac
+      ;;
+    jobs-cancelled-success)
+      # GitHub already concluded the run success although one job inside it was cancelled.
+      case " $* " in
+        *" --commit "*) printf '107\tcompleted\tsuccess\tCI\n' ;;
+        *) printf '107\n' ;;
+      esac
+      ;;
+    jobs-cancelled-failure)
+      # GitHub concluded the run failure; the job rows show only success and cancelled.
+      case " $* " in
+        *" --commit "*) printf '108\tcompleted\tfailure\tCI\n' ;;
+        *) printf '108\n' ;;
+      esac
+      ;;
     *) echo "unknown MODE=$MODE" >&2; exit 1 ;;
   esac
   exit 0
@@ -85,6 +106,17 @@ if [ "${1:-}" = run ] && [ "${2:-}" = view ]; then
     else printf 'completed\tsuccess\tCI\thttps://example.invalid/job/103\t103\n'; fi
   elif [ "$MODE" = stuck ]; then
     printf 'in_progress\t\tCI\thttps://example.invalid/job/105\t105\n'
+  elif [ "$MODE" = jobs-cancelled ] || [ "$MODE" = jobs-cancelled-success ] || [ "$MODE" = jobs-cancelled-failure ]; then
+    case " $* " in
+      *" --json conclusion "*)
+        case "$MODE" in
+          jobs-cancelled-success) printf 'success\n' ;;
+          jobs-cancelled-failure) printf 'failure\n' ;;
+          *) printf '\n' ;;
+        esac ;;
+      *) printf 'completed\tsuccess\tlint\thttps://example.invalid/job/1061\t1061\n'
+         printf 'completed\tcancelled\ttest\thttps://example.invalid/job/1062\t1062\n' ;;
+    esac
   else
     printf 'completed\tsuccess\tCI\thttps://example.invalid/job/%s\t%s\n' "${3:-run}" "${3:-0}"
   fi
@@ -250,4 +282,48 @@ grep -Fq 'live log: gh api --allow-escape-sequences repos/test/repo/actions/jobs
 grep -Fq 'after run terminal: gh run view 104 --repo test/repo --job 999 --log-failed' "$WORK/failure-derived.out" \
   || fail "URL-derived repo missing from terminal command: $(cat "$WORK/failure-derived.out")"
 
-echo "PASS watch-run-ci: SHA validation/retry/canonicalization, transient empty recovery, pending heartbeat (xpg_echo-safe), default intervals and tick limits, live failed-job logs"
+# A run still listed in_progress whose jobs all ended, one cancelled, is superseded:
+# --sha exits 4, never 0 ("none failed" green); --branch keeps re-resolving.
+: > "$CALLS"
+MODE=jobs-cancelled; export MODE
+set +e
+bash "$SCRIPT" --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2 > "$WORK/jobs-cancelled-sha.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 4 ] || fail "--sha run with cancelled jobs did not report superseded (exit 4), rc=$rc: $(cat "$WORK/jobs-cancelled-sha.out")"
+set +e
+bash "$SCRIPT" --branch main --repo test/repo --interval 0 --max-ticks 2 > "$WORK/jobs-cancelled-branch.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "--branch run with cancelled jobs was not kept pending (exit 2), rc=$rc: $(cat "$WORK/jobs-cancelled-branch.out")"
+grep -Fq 'jobs cancelled before the run concluded' "$WORK/jobs-cancelled-branch.out" \
+  || fail "--branch cancelled-jobs tick printed no supersession line: $(cat "$WORK/jobs-cancelled-branch.out")"
+
+# A run GitHub already concluded success keeps that verdict despite a cancelled job inside it.
+MODE=jobs-cancelled-success; export MODE
+set +e
+bash "$SCRIPT" --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2 > "$WORK/jobs-cancelled-success-sha.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "--sha concluded-success run with a cancelled job was not green, rc=$rc: $(cat "$WORK/jobs-cancelled-success-sha.out")"
+set +e
+bash "$SCRIPT" --branch main --repo test/repo --interval 0 --max-ticks 2 > "$WORK/jobs-cancelled-success-branch.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "--branch concluded-success run with a cancelled job was not green, rc=$rc: $(cat "$WORK/jobs-cancelled-success-branch.out")"
+
+# A run GitHub already concluded failure stays a failure even when its job rows show only
+# success and cancelled.
+MODE=jobs-cancelled-failure; export MODE
+set +e
+bash "$SCRIPT" --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2 > "$WORK/jobs-cancelled-failure-sha.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "--sha concluded-failure run with a cancelled job was not a failure, rc=$rc: $(cat "$WORK/jobs-cancelled-failure-sha.out")"
+set +e
+bash "$SCRIPT" --branch main --repo test/repo --interval 0 --max-ticks 2 > "$WORK/jobs-cancelled-failure-branch.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "--branch concluded-failure run with a cancelled job was not a failure, rc=$rc: $(cat "$WORK/jobs-cancelled-failure-branch.out")"
+
+echo "PASS watch-run-ci: SHA validation/retry/canonicalization, transient empty recovery, pending heartbeat (xpg_echo-safe), default intervals and tick limits, live failed-job logs, cancelled jobs never green"
