@@ -801,7 +801,9 @@ describe("AgentRosterSummary (read-only, post-approval)", () => {
     );
     // Positive: the pending copy names the source (repo agents) and explains the gap.
     expect(screen.getByText(/roster appears here once the worker checks out/i)).toBeTruthy();
+    // Not yet reported, so neither folder is claimed: both are named.
     expect(screen.getByText(".claude/agents/")).toBeTruthy();
+    expect(screen.getByText(".codex/agents/")).toBeTruthy();
     // Non-vacuous negative: the past-tense "internal review was performed by" claim —
     // the misleading assertion this fix removes — must NOT render here. It CAN render
     // (the adjacent "repo-source run" test above asserts it does for a populated roster),
@@ -812,6 +814,38 @@ describe("AgentRosterSummary (read-only, post-approval)", () => {
     expect(screen.queryByText(/used the repository's own agents/i)).toBeNull();
     // And no chip is rendered claiming a specific agent.
     expect(screen.queryByText(/^●?\s*coder/i)).toBeNull();
+  });
+});
+
+describe("AgentRosterSummary — repo agent folder", () => {
+  it("names .codex/agents/ for a repo-source run whose roster was read from it", () => {
+    render(
+      <AgentRosterSummary
+        run={run({
+          status: "completed",
+          agent_source: "repo",
+          repo_agents: [{ name: "coder", description: "Codes.", folder: ".codex/agents" }],
+        })}
+      />,
+    );
+    expect(screen.getByText(/used the repository's own agents/i)).toBeTruthy();
+    expect(screen.getByText(".codex/agents/")).toBeTruthy();
+    expect(screen.queryByText(".claude/agents/")).toBeNull();
+  });
+
+  it("names .claude/agents/ when the roster carries no folder", () => {
+    render(
+      <AgentRosterSummary
+        run={run({
+          status: "completed",
+          agent_source: "repo",
+          repo_agents: [{ name: "coder", description: "Codes." }],
+        })}
+      />,
+    );
+    expect(screen.getByText(/used the repository's own agents/i)).toBeTruthy();
+    expect(screen.getByText(".claude/agents/")).toBeTruthy();
+    expect(screen.queryByText(".codex/agents/")).toBeNull();
   });
 });
 
