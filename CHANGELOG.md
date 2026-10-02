@@ -38,6 +38,9 @@ through `[0.52.0]`.)
 - **Lead text follows frame origin across Claude and Codex harnesses ([#2116](https://github.com/vtmocanu/uzi/issues/2116)).**
   Child frames displayed as lead no longer enter either harness's finalText; Claude also uses origin to request lead context only for main frames and to count subagent frames as no-progress activity, while emitted attribution and signal handling stay the same.
 
+- **A short database outage no longer signs web users out or rejects a good CLI token ([#1991](https://github.com/vtmocanu/uzi/issues/1991)).**
+  Session and CLI-token authentication now answer 503 instead of 401 when the user or token lookup fails for a reason other than a missing row, so the CLI exits 6 (retry) rather than 3 (re-authenticate). On initial load the web app shows a "Can't reach the server" panel that retries every 5 seconds and on demand, instead of redirecting to /login.
+
 - **Codex transient retry backoff respects the remaining wall budget, and agent CI reruns select fresh shard reports ([#2111](https://github.com/vtmocanu/uzi/issues/2111)).**
   Early timer wakes no longer finish a wall-capped backoff with budget left for an extra provider turn. CI stores reports separately for each attempt and checks the latest available report independently for each shard, so partial reruns cannot use a stale M4 completion marker.
 

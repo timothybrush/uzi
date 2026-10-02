@@ -1,15 +1,15 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { AuthProvider, useAuth } from "./AuthContext";
-import { api } from "../lib/api";
+import { api, ApiError } from "../lib/api";
 import type { SessionResponse } from "../lib/api";
 
 // Only api.me is swapped; the un/vault-locked handler setters and everything else
 // stay real so the provider's effects compose as they do in the app.
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
-  return { ...actual, api: { ...actual.api, me: vi.fn() } };
+  return { ...actual, api: { ...actual.api, me: vi.fn(), logout: vi.fn(), login: vi.fn() } };
 });
 
 const mockApi = vi.mocked(api);
@@ -45,9 +45,21 @@ const baseSession = (over: Partial<SessionResponse> = {}): SessionResponse => ({
 // A tiny consumer that renders the uzi label and the resolved appearance so the
 // test can assert on what the provider exposes (PRD #764, PRD #1167).
 function Probe() {
-  const { uziLabel, appearance } = useAuth();
+  const { uziLabel, appearance, user, loading, serverUnreachable, logout, retry, login } = useAuth();
   return (
     <div>
+      <span data-testid="loading">{String(loading)}</span>
+      <span data-testid="user">{user ? user.email : "none"}</span>
+      <span data-testid="unreachable">{String(serverUnreachable)}</span>
+      <button type="button" onClick={() => void logout()}>
+        do logout
+      </button>
+      <button type="button" onClick={() => void retry()}>
+        do retry
+      </button>
+      <button type="button" onClick={() => void login("a@b.c", "pw")}>
+        do login
+      </button>
       <span data-testid="uzi">{uziLabel}</span>
       <span data-testid="mode">{appearance.mode}</span>
       <span data-testid="dark">{appearance.dark_theme}</span>
@@ -122,5 +134,66 @@ describe("AuthContext — appearance fallback for an older API (PRD #1167)", () 
     renderProbe();
     await waitFor(() => expect(screen.getByTestId("dark").textContent).toBe("ember"));
     expect(screen.getByTestId("override-dark").textContent).toBe("null");
+  });
+});
+
+describe("AuthContext — server unreachable (#1991)", () => {
+  it("flags serverUnreachable and keeps user null when the session probe returns 503", async () => {
+    mockApi.me.mockRejectedValue(new ApiError(503, "service unavailable"));
+    renderProbe();
+    await waitFor(() => expect(screen.getByTestId("loading").textContent).toBe("false"));
+    expect(screen.getByTestId("unreachable").textContent).toBe("true");
+    expect(screen.getByTestId("user").textContent).toBe("none");
+  });
+
+  it("does not flag serverUnreachable on a 401", async () => {
+    mockApi.me.mockRejectedValue(new ApiError(401, "unauthorized"));
+    renderProbe();
+    await waitFor(() => expect(screen.getByTestId("loading").textContent).toBe("false"));
+    expect(screen.getByTestId("unreachable").textContent).toBe("false");
+    expect(screen.getByTestId("user").textContent).toBe("none");
+  });
+
+  it("logout clears the flag", async () => {
+    mockApi.me.mockRejectedValue(new ApiError(503, "service unavailable"));
+    mockApi.logout.mockResolvedValue({ status: "ok" });
+    renderProbe();
+    await waitFor(() => expect(screen.getByTestId("unreachable").textContent).toBe("true"));
+    await act(async () => {
+      screen.getByRole("button", { name: "do logout" }).click();
+    });
+    expect(mockApi.logout).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("unreachable").textContent).toBe("false");
+  });
+
+  it("a retry while a probe is pending joins it instead of starting another", async () => {
+    let rejectProbe: (err: unknown) => void = () => {};
+    mockApi.me.mockImplementationOnce(() => new Promise((_, reject) => (rejectProbe = reject)));
+    renderProbe();
+    await act(async () => {
+      screen.getByRole("button", { name: "do retry" }).click();
+    });
+    expect(mockApi.me).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      rejectProbe(new ApiError(503, "service unavailable"));
+    });
+    expect(screen.getByTestId("loading").textContent).toBe("false");
+    expect(screen.getByTestId("unreachable").textContent).toBe("true");
+  });
+
+  it("a probe that started before a login cannot sign the new session out", async () => {
+    let rejectProbe: (err: unknown) => void = () => {};
+    mockApi.me.mockImplementationOnce(() => new Promise((_, reject) => (rejectProbe = reject)));
+    mockApi.login.mockResolvedValue(baseSession());
+    renderProbe();
+    await act(async () => {
+      screen.getByRole("button", { name: "do login" }).click();
+    });
+    expect(screen.getByTestId("user").textContent).toBe("vlad@uzi.local");
+    await act(async () => {
+      rejectProbe(new ApiError(401, "unauthorized"));
+    });
+    expect(screen.getByTestId("user").textContent).toBe("vlad@uzi.local");
+    expect(screen.getByTestId("loading").textContent).toBe("false");
   });
 });
