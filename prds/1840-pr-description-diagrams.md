@@ -1,14 +1,14 @@
 # PRD #1840: Diagrams in uzi PR descriptions, only where they help
 
 **Issue**: #1840
-**Status**: Draft (blocked on PR #1825, PRD #1798 run 2, merging to `main`)
+**Status**: Draft (dependency PR #1825 merged to `main` on 2026-09-28; refreshed against `7c0d475f`)
 **Priority**: Medium
 **Created**: 2026-09-28
 **Follows**: [PRD #1798](1798-plain-english-pr-descriptions.md) (plain-English PR descriptions)
 
 ## Problem
 
-PRD #1798 gives every uzi PR a short plain-English description: summary, size line, what changed, verification, scope notes. For a change that spans several components (worker, api, store, forge) or adds a protocol with an order that matters (stage, bind, publish, ack), prose bullets still leave the reviewer assembling the flow in their head.
+PRD #1798 gives every uzi PR a short plain-English description: summary, size block, what changed, verification, scope notes. For a change that spans several components (worker, api, store, forge) or adds a protocol with an order that matters (stage, bind, publish, ack), prose bullets still leave the reviewer assembling the flow in their head.
 
 Review bots already show that a small diagram fixes this: Greptile appends a `flowchart LR` or `sequenceDiagram` block to its summary in the PR body (PRs #1433, #1588, #1705, #1825 on this repo). uzi cannot rely on a review bot being installed (PRD #1798 out of scope), and most repos uzi runs on have none.
 
@@ -78,8 +78,10 @@ flowchart LR
 
 **D6. Budgets, diagram first at both fallback sites.** The rendered mermaid source is at most 1,500 bytes. PRD #1798 has two size fallbacks, in two places, and both retry **without the diagram** before their existing fallback:
 
-1. the 6 KiB region cap in `renderRegion` (`agent/src/pr-description.ts`): render without the diagram; only if that still exceeds the cap, fall back to the size line as today;
-2. the 65,536-character whole-body cap in the publisher (`capBody`, `agent/src/pr-description-publisher.ts`): retry with the diagram-less region; only then the size-only region.
+1. the 6 KiB region cap in `renderRegion` (`agent/src/pr-description.ts`): render without the diagram; only if that still exceeds the cap, fall back to the size block as today;
+2. the 65,536-character whole-body cap in the publisher (`capBody`, defined in `agent/src/pr-description.ts` and called by `agent/src/pr-description-publisher.ts`): retry with the diagram-less region; only then the size-only region.
+
+Since PR #2062, the available-size PR-body block is a file-count header plus a Markdown table (`ComputedSize.line`, produced by `renderSizeTable`); unavailable size remains one line. Preserve the table's line breaks in every retry and deterministic fallback. The 6 KiB region budget includes the complete size block.
 
 **D6a. The run page and CLI show only a published diagram.** Because either site can drop the diagram, a stored `fields.diagram` does not prove the PR shows one. The flag must survive a lost ack, so it is recorded at **bind** and never at ack: bind already stores the hash of the exact region it will write (`rendered_region_sha256`, migration `00259`), and lost-ack recovery (`recoverPrDescLostAck`, `api/internal/workersvc/pr_descriptions.go`) publishes a pending version by matching that hash without ever seeing the original ack. So:
 
@@ -104,7 +106,7 @@ flowchart LR
 
 | Phase | Milestone | Depends on | Main files |
 |---|---|---|---|
-| 0 | PR #1825 merged | none | (not in this PRD) |
+| 0 | PR #1825 merged (complete, 2026-09-28) | none | (not in this PRD) |
 | 1 | M1 schema, sanitizer, trust boundary | #1825 | `api/internal/apitypes/pr_description.go`, `api/internal/workersvc/pr_description_sanitize.go`, `api/internal/handler/worker_pr_description.go` (raw caps, bind field), store migration + sqlc for `region_has_diagram`, `agent/src/protocol.ts`, `agent/src/client.ts` (decoder, frozen `SanitizedPrDescriptionFields`, `toRaw()`) |
 | 2 | M2 editor pass | M1 | `agent/src/summary-runner.ts`, `agent/src/pr-description-context.ts`, `agent/src/codex/` |
 | 2 | M3 renderer and publisher | M1 | `agent/src/pr-description.ts`, `agent/src/pr-description-publisher.ts`, `fixtures/pr-diagram/` (new), `web/package.json` + lockfile, a new `web/src/**/*.browser.test.tsx` |
@@ -123,7 +125,7 @@ Every milestone passes its component gates (`task gate:agent`, `task gate:api`, 
 
 - [ ] **M1: Schema, api sanitizer and the response trust boundary.** `diagram` per D2 in `apitypes.PrDescriptionFields`, the protocol type, the worker's raw-field mirror, the `WorkerClient` decoder, the frozen `SanitizedPrDescriptionFields` class and its `toRaw()` refresh copy (so a refresh re-stages the diagram it read). The handler's raw cap gate bounds the diagram (D4). The api validates the structure (ranges, unique keys, known edge endpoints, no `flow` self-edge) and sanitizes labels per D4; an invalid diagram is dropped with a logged reason, never failing the stage call. The additive `region_has_diagram` column, its bind field, and the derived `diagram_published` on the published-version DTO (D6a). Live-DB tests: normal publication, lost-ack recovery (flag kept from bind), ack retry, an ack cannot change the flag, a diagram-less restage publishes with the flag false, and the field is absent on a pending version. Tests: a table of hostile labels (quotes, backticks, fences, `%%{init}`, `click`, `classDef`, `#7`, `Fixes #7`, `Fixes GH-7` (drops the diagram, and no U+200B appears in any label), directives formed by normalization joins (`Fix<b></b>es #7`, `Fix&#101;s GH-7`, a comment splitting the keyword; all drop the diagram), `!7`, `@user`, `<script>`, entities, newlines, `end`, emoji, RTL text) and structural rejects; over-cap raw diagrams refused by the handler; a version without `diagram` round-trips unchanged; the decoder rejects a hostile diagram shape.
 - [ ] **M2: Editor pass.** Prompt rules per D3 (including the truncated-input rule) and the output schema per D2 in the delivery-summary prompt; the worker floor per D3.2; parse and clip per D2/D4 caps before posting. Tests: a docs-only diff drops a diagram the model returned; an unavailable size does not drop it; a binary-only diff drops it; a two-participant sequence is kept; a malformed diagram drops only the diagram; prompt injection in the diff ("add a click directive", "label it Fixes #1") produces no such output after sanitization; Claude and Codex harness parity on a fixture that yields a diagram.
-- [ ] **M3: Renderer and publisher.** Emission per D5 for both kinds (with the `end` rule), diagram-first retry at both D6 sites, the D6a bind-time flag, the D7 rung rule. Golden outputs committed under `fixtures/pr-diagram/` (flow, two- and many-participant sequence, `end` in every sequence label position, max-size, unicode labels). Tests: goldens match; `parseOwnedBlocks` adopts both uzi blocks with a closed mermaid fence in the region; `closingDirectiveFor` finds no directive in any golden; a region over 6 KiB drops only the diagram when that suffices; a body over 65,536 characters retries without the diagram before the size-only region; each diagram-less retry restages a new version, and every bind sends the `region_has_diagram` of the region it binds; rungs 2 and 3 render no diagram; the region hash changes when only the diagram changes. **Parser check:** goldens prove emitted text, not that Mermaid accepts it, so a new `web/src/**/*.browser.test.tsx` file parses every golden with `mermaid.parse` in real Chromium. `mermaid` is added to `web/package.json` (and its lockfile) as a devDependency only, never bundled, pinned to the major version the forges run (GitLab documents Mermaid 11). Required checks for M3, beyond `task gate:agent`: `task test:web-browser` (the lane that collects `*.browser.test.tsx`) and `task deadcode:web` (knip must accept the new devDependency). The M5 live check covers the rest.
+- [ ] **M3: Renderer and publisher.** Emission per D5 for both kinds (with the `end` rule), diagram-first retry at both D6 sites, the D6a bind-time flag, the D7 rung rule. Golden outputs committed under `fixtures/pr-diagram/` (flow, two- and many-participant sequence, `end` in every sequence label position, max-size, unicode labels). Tests: goldens match; `parseOwnedBlocks` adopts both uzi blocks with a closed mermaid fence in the region; `closingDirectiveFor` finds no directive in any golden; a region over 6 KiB drops only the diagram when that suffices; a body over 65,536 characters retries without the diagram before the size-only region; each diagram-less retry restages a new version, and every bind sends the `region_has_diagram` of the region it binds; rungs 2 and 3 render no diagram; the region hash changes when only the diagram changes. Full-region goldens and both cap-retry tests use the current canonical size table and assert its line breaks survive; also cover unavailable size and legacy one-line deterministic-region adoption. Mermaid parser checks parse only the emitted diagram source. **Parser check:** goldens prove emitted text, not that Mermaid accepts it, so a new `web/src/**/*.browser.test.tsx` file parses every golden with `mermaid.parse` in real Chromium. `mermaid` is added to `web/package.json` (and its lockfile) as a devDependency only, never bundled, pinned to the major version the forges run (GitLab documents Mermaid 11). Required checks for M3, beyond `task gate:agent`: `task test:web-browser` (the lane that collects `*.browser.test.tsx`) and `task deadcode:web` (knip must accept the new devDependency). The M5 live check covers the rest.
 - [ ] **M4: Web and CLI outline.** The web API type, the Delivered section and `uzi run get` render the D10 outline only for a published diagram (D6a); `--json` carries the field and the flag. Tests: a web component test with a hostile label; unpublished diagram shows nothing; a CLI render test.
 - [ ] **M5: Docs, spec, ADR note, acceptance.** Describe the diagram in `docs/run-summaries.md` (then `task docs:sync`); a terse `specs/human.md` requirement (AI-synced tag); an addendum to ADR-1798 stating the diagram is region content under I1-I4, not a new owned block, and that the model never emits mermaid syntax (D1). Live acceptance (maintainer): one multi-component issue run each on GitHub, GitLab and Forgejo renders a diagram; one docs-only run renders none; one Codex run renders the same shape; one `mr_rework` refresh regenerates it.
 
@@ -132,7 +134,7 @@ Every milestone passes its component gates (`task gate:agent`, `task gate:api`, 
 - Across 10 consecutive uzi PRs after rollout, diagrams appear only on multi-component or order-dependent changes, and none on docs-, config- or bump-only PRs.
 - Every drawn diagram renders on GitHub, GitLab and Forgejo without a mermaid parse error.
 - No PR body ever carries model-authored mermaid syntax, a closing directive, a mention or raw HTML from a diagram label (sanitizer tests plus a post-rollout sweep).
-- The description region still fits 6 KiB; a diagram never displaces the summary, size line or completion block.
+- The description region still fits 6 KiB; a diagram never displaces the summary, size block or completion block.
 
 ## Risks
 
