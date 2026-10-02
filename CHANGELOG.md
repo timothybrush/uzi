@@ -27,6 +27,8 @@ through `[0.52.0]`.)
 - **Feature bingo and refactor scout inherit the owner's default model ([#2095](https://github.com/vtmocanu/uzi/issues/2095)).**
   Newly enabled schedules use the owner's per-harness default instead of pinning `fable`. Existing schedules keep their saved model; reset the schedule to catalog defaults or clear its model in the editor to inherit.
 - **Built-in agents synced to skills v0.44.0** ([#2086](https://github.com/vtmocanu/uzi/pull/2086)). The architect (v12) consults a `dba` database specialist on schema, index, transaction and migration decisions when the team has one, and the reviewer (v19) asks for it when correctness depends on database behaviour instead of certifying that behaviour without evidence.
+- **Routine dependency bumps: `gitlab.com/gitlab-org/api/client-go/v3` to v3.14.0 ([#2000](https://github.com/vtmocanu/uzi/pull/2000)) and the Kubernetes client libraries (`k8s.io/api`, `apimachinery`, `client-go`) to v0.37.1 in the controller ([#1996](https://github.com/vtmocanu/uzi/pull/1996)).**
+  No uzi code change required.
 
 ### Fixed
 
