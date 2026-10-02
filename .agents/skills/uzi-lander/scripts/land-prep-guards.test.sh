@@ -6,7 +6,9 @@
 #   2. a branch that deletes CHANGELOG.md lines the base carries stops with exit 9;
 #   3. a gate on a worktree without node_modules installs them with --ignore-scripts first;
 #   4. a reused worktree reinstalls when the recorded package-lock.json hash is absent or stale;
-#   5. a workflow edit on a uzi-owned branch stops before the push (exit 10) unless overridden.
+#   5. a workflow edit on a uzi-owned branch stops before the push (exit 10) unless overridden;
+#   6. a checkout of the PR branch that land-prep did not create is refused (exit 3), at
+#      the default path too, unless --worktree names it.
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -207,4 +209,48 @@ run deps 103 --skip-rebase --no-push
 grep -q -- 'ci --ignore-scripts' "$NPM_LOG" || fail "node_modules without a recorded hash was not reinstalled"
 [ -s "$STAMP" ] || fail "the reinstall recorded no hash"
 
-echo "PASS land-prep guards: migration collision under pipefail, CHANGELOG removal stop, node_modules install, lockfile-hash reinstall, workflow edit on a uzi branch"
+# 6. A checkout of the PR branch that land-prep did not create (another session's tree) is
+# refused, not rebased in place; naming it with --worktree is the explicit opt-in.
+git -C "$SEED" switch -q main
+git -C "$SEED" switch -qc foreign
+printf 'f\n' > "$SEED/f.txt"
+git -C "$SEED" add -A && git -C "$SEED" commit -qm foreign
+git -C "$SEED" push -q origin foreign
+git -C "$ROOT" fetch -q origin foreign
+FOREIGN="$WORK/someone-elses-tree"
+git -C "$ROOT" worktree add -q "$FOREIGN" -b foreign origin/foreign
+before=$(git -C "$FOREIGN" rev-parse HEAD)
+run foreign 108 --gate none --no-push
+[ "$rc" -eq 3 ] || fail "a foreign checkout was not refused, rc=$rc: $(cat "$WORK/out.108")"
+grep -q 'land-prep did not create' "$WORK/out.108" || fail "the refusal does not name the cause: $(cat "$WORK/out.108")"
+[ "$(git -C "$FOREIGN" rev-parse HEAD)" = "$before" ] || fail "the foreign tree's HEAD moved"
+[ ! -e "$WORK/wt-108" ] || fail "a second worktree was created"
+# ...and the explicit opt-in reuses it.
+set +e
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/uzi 108 --repo-root "$ROOT" --worktree "$FOREIGN" --gate none --no-push > "$WORK/out.108b" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "--worktree naming the tree did not reuse it, rc=$rc: $(cat "$WORK/out.108b")"
+# ...and an unmarked checkout sitting at the DEFAULT path (no --worktree) is refused too.
+git -C "$SEED" switch -q main
+git -C "$SEED" switch -qc foreign2
+printf 'g\n' > "$SEED/g.txt"
+git -C "$SEED" add -A && git -C "$SEED" commit -qm foreign2
+git -C "$SEED" push -q origin foreign2
+git -C "$ROOT" fetch -q origin foreign2
+DEFAULT_WT="${ROOT}-land-109"
+git -C "$ROOT" worktree add -q "$DEFAULT_WT" -b foreign2 origin/foreign2
+before=$(git -C "$DEFAULT_WT" rev-parse HEAD)
+PR_JSON=$(jq -cn --arg h "$(git --git-dir="$ORIGIN" rev-parse refs/heads/foreign2)" \
+  '{state:"OPEN",headRefName:"foreign2",baseRefName:"main",headRefOid:$h,headRepository:{name:"uzi"},headRepositoryOwner:{login:"test"}}')
+export PR_JSON
+set +e
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/uzi 109 --repo-root "$ROOT" --gate none --no-push > "$WORK/out.109" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "an unmarked checkout at the default path was not refused, rc=$rc: $(cat "$WORK/out.109")"
+grep -q 'land-prep did not create' "$WORK/out.109" || fail "the default-path refusal does not name the cause: $(cat "$WORK/out.109")"
+[ "$(git -C "$DEFAULT_WT" rev-parse HEAD)" = "$before" ] || fail "the default-path tree's HEAD moved"
+git -C "$ROOT" worktree remove --force "$DEFAULT_WT"
+
+echo "PASS land-prep guards: migration collision under pipefail, CHANGELOG removal stop, node_modules install, lockfile-hash reinstall, workflow edit on a uzi branch, foreign worktree refusal"

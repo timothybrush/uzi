@@ -11,6 +11,9 @@
 #                     [--allow-workflow-edit] [--repo-root DIR]
 #   --worktree DIR   where the PR branch is checked out (default: <repo-root>-land-<PR>,
 #                    a sibling of the repo root). Reused if it already exists on the branch.
+#                    An existing checkout (at the default path or elsewhere) is reused only
+#                    if land-prep created it or --worktree names it; any other (e.g. a
+#                    buddy's own tree) is refused, exit 3.
 #   --skip-rebase    re-entry after you resolved a conflict by hand (`git rebase --continue`
 #                    done) or after a manual renumber fix: skips straight to gates + push.
 #   --fresh          start the landing over: reset the (clean) worktree to origin/<branch>
@@ -91,10 +94,10 @@
 #      after the CHANGELOG guard (exit 9), also after a pre-push base-move rebase
 set -uo pipefail
 
-REPO=""; PR=""; WT=""; SKIP_REBASE=0; GATE="auto"; PUSH=1; ROOT=""; REWORK_CHECK=1; FRESH=0; ALLOW_CL_RM=0; ALLOW_WF=0
+REPO=""; PR=""; WT=""; WT_EXPLICIT=0; SKIP_REBASE=0; GATE="auto"; PUSH=1; ROOT=""; REWORK_CHECK=1; FRESH=0; ALLOW_CL_RM=0; ALLOW_WF=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --worktree) WT="${2:?}"; shift 2;;
+    --worktree) WT="${2:?}"; WT_EXPLICIT=1; shift 2;;
     --skip-rebase) SKIP_REBASE=1; shift;;
     --fresh) FRESH=1; shift;;
     --gate) GATE="${2:?}"; shift 2;;
@@ -168,12 +171,22 @@ mrw_check || exit 4
 # ---- worktree -----------------------------------------------------------------------------
 git -C "$ROOT" fetch origin "$BRANCH" "$BASE" --quiet || { echo "git fetch failed" >&2; exit 3; }
 base_now=$(git -C "$ROOT" rev-parse "origin/$BASE" 2>/dev/null) || { echo "cannot resolve origin/$BASE" >&2; exit 3; }
-# A branch can be checked out in only one worktree: if one already holds it (this session
-# or an earlier one made it), reuse that path instead of failing on `worktree add`.
+# A branch can be checked out in only one worktree: if one already holds it, reuse that path
+# instead of failing on `worktree add`. Any existing checkout, at the default path or found
+# elsewhere, is reused only when land-prep created it (its marker sits in that worktree's git
+# dir) or when --worktree names it explicitly. An unmarked checkout may be another session's
+# working tree, e.g. the author of a buddy-written PR: rebasing it in place moves their HEAD.
+OWN_MARK=uzi-land-prep-worktree
 existing=$(git -C "$ROOT" worktree list --porcelain | awk -v b="refs/heads/$BRANCH" '$1=="worktree"{p=$2} $1=="branch" && $2==b {print p}' | head -1)
-if [ -n "$existing" ] && [ "$existing" != "$WT" ]; then
-  log "branch $BRANCH is already checked out at $existing; using it"
-  WT="$existing"
+# git lists physical paths; compare against the physical form of an existing --worktree
+# (macOS /var is a symlink to /private/var), so naming the tree explicitly always matches.
+[ ! -d "$WT" ] || WT=$(cd "$WT" && pwd -P)
+named="$WT"; [ "$WT_EXPLICIT" -eq 1 ] || named=""
+if [ -n "$existing" ] && [ "$existing" != "$WT" ]; then WT="$existing"; fi
+if [ -d "$WT" ] && [ "$WT" != "$named" ] && [ ! -f "$(git -C "$WT" rev-parse --absolute-git-dir 2>/dev/null)/$OWN_MARK" ]; then
+  echo "refusing: $WT holds a checkout land-prep did not create (another session's?)." >&2
+  echo "Rebase in your own detached worktree and push with an explicit lease, or pass --worktree $WT if that tree is yours." >&2
+  exit 3
 fi
 if [ -d "$WT" ]; then
   cur=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
@@ -181,6 +194,7 @@ if [ -d "$WT" ]; then
   log "reusing worktree $WT"
 else
   git -C "$ROOT" worktree add "$WT" -B "$BRANCH" "origin/$BRANCH" --quiet || { echo "git worktree add failed" >&2; exit 3; }
+  : > "$(git -C "$WT" rev-parse --absolute-git-dir)/$OWN_MARK" || { echo "cannot mark $WT as land-prep's" >&2; exit 3; }
   log "worktree $WT on $BRANCH"
 fi
 cd "$WT" || exit 3
