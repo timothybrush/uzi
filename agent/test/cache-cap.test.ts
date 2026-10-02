@@ -1,8 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { type CacheCapConfig, DiskGovernor, type DiskGovernorOptions, hardStopThreshold, runCacheCapBytes } from "../src/cache-cap.js";
-import type { TrimResult, TrimTarget } from "../src/run-caches.js";
+import type { RunCacheDropResult, TrimResult, TrimTarget } from "../src/run-caches.js";
 import { nullLogger } from "./helpers.js";
+import type { Logger } from "../src/log.js";
 
 // PRD #1809 D4: the cache governor's two layers with every I/O faked: an injected volume size,
 // injected cache sizes (the measurement), a recording trim, and a controllable clock.
@@ -26,19 +27,39 @@ interface Harness {
   sizes: Map<string, number>;
   trims: { home: string; target: TrimTarget }[];
   stops: string[];
+  /** Issue #1830: the runs whose caches were dropped in place, in order. */
+  inPlace: string[];
+  /** What an in-place drop does to the run's measured bytes (default: all gone). */
+  inPlaceLeaves: { bytes: number | undefined; throws: boolean };
   reclaims: () => number;
   clock: { now: number };
+  /** The governor's warn messages, in order. */
+  warns: string[];
+  /** The governor's warn messages with their structured fields, in order. */
+  warnFields: { msg: string; fields?: Record<string, unknown> }[];
+  /** While set, every in-place drop waits for it before it does anything (a PENDING drop). */
+  inPlaceHold: { until?: Promise<void> };
 }
 
 function harness(opts: { config?: Partial<CacheCapConfig>; trimTo?: (target: TrimTarget) => number; threshold?: number } = {}): Harness {
   const sizes = new Map<string, number>();
   const trims: { home: string; target: TrimTarget }[] = [];
   const stops: string[] = [];
+  const inPlace: string[] = [];
+  const inPlaceLeaves: Harness["inPlaceLeaves"] = { bytes: 0, throws: false };
   let reclaims = 0;
   const clock = { now: 1_000_000 };
+  const warns: string[] = [];
+  const warnFields: Harness["warnFields"] = [];
+  const inPlaceHold: Harness["inPlaceHold"] = {};
+  const log: Logger = { ...nullLogger(), warn: (m: string, fields?: Record<string, unknown>) => {
+      warns.push(m);
+      warnFields.push({ msg: m, fields });
+    },
+  };
   const options: DiskGovernorOptions = {
     config: { ...CONFIG, ...opts.config },
-    log: nullLogger(),
+    log,
     volumeTotalBytes: () => VOLUME,
     thresholdOf: () => opts.threshold,
     reclaim: async () => {
@@ -68,13 +89,36 @@ function harness(opts: { config?: Partial<CacheCapConfig>; trimTo?: (target: Tri
     now: () => clock.now,
   };
   const gov = new DiskGovernor(options);
-  return { gov, sizes, trims, stops, reclaims: () => reclaims, clock };
+  return { gov, sizes, trims, stops, inPlace, inPlaceLeaves, reclaims: () => reclaims, clock, warns, warnFields, inPlaceHold };
 }
 
-function watch(h: Harness, runId: string, bytes: number): void {
+/** Register a run with no executor yet (cloning / setup): no status sent, not in the executor. */
+function watchSetup(h: Harness, runId: string, bytes: number, requestStop: () => void = () => h.stops.push(runId)): void {
   const home = `/data/agent-home/${runId}`;
   h.sizes.set(home, bytes);
-  h.gov.register(runId, { home, requestStop: () => h.stops.push(runId) });
+  h.gov.register(runId, {
+    home,
+    requestStop,
+    reclaimInPlace: async (): Promise<RunCacheDropResult | undefined> => {
+      h.inPlace.push(runId);
+      if (h.inPlaceHold.until) await h.inPlaceHold.until;
+      if (h.inPlaceLeaves.throws) throw new Error("drop failed");
+      if (h.inPlaceLeaves.bytes !== undefined) h.sizes.set(home, h.inPlaceLeaves.bytes);
+      return { dropped: ["go/pkg/mod"], absent: [], failed: [], skipped: [] };
+    },
+  });
+}
+
+/** The runner's report choke point: a status is sent, then the server ACKs it. */
+function report(h: Harness, runId: string, sent: string): void {
+  h.gov.statusAcked(runId, h.gov.statusRequested(runId, sent), sent);
+}
+
+/** A run in `executor.run` whose status is `running` on both sides: the parkable shape. */
+function watch(h: Harness, runId: string, bytes: number, requestStop?: () => void): void {
+  watchSetup(h, runId, bytes, requestStop);
+  h.gov.enterRun(runId);
+  report(h, runId, "running");
 }
 
 const quiet = async (): Promise<boolean> => false;
@@ -185,11 +229,10 @@ describe("soft layer: the per-run cache cap at turn boundaries", () => {
 });
 
 describe("hard layer: the per-tick pressure stop", () => {
-  it("at or over the hard threshold it stops the stoppable run with the largest caches, once", async () => {
+  it("at or over the hard threshold it stops the parkable run with the largest caches, once", async () => {
     const h = harness();
     watch(h, "small", GIB);
     watch(h, "large", 4 * GIB);
-    watch(h, "planning", 9 * GIB); // never reached its implement loop: not stoppable
     await h.gov.boundary("small", quiet);
     await h.gov.boundary("large", quiet);
     h.sizes.set("/data/agent-home/large", 5 * GIB); // it grew mid-turn: the stop measures afresh
@@ -277,17 +320,13 @@ describe("hard layer: the per-tick pressure stop", () => {
 describe("hard layer: a stop is never wedged, and never lost to the soft park (PRD #1809 D4 rework)", () => {
   it("a hard stop requested while the soft boundary measures resolves the boundary to continue, never a (preventive) park (N1)", async () => {
     const h = harness();
-    watch(h, "r1", Math.ceil(CAP * 1.5)); // runaway: a live process would park it at once
     let stopAsked: () => void = () => {};
     const asked = new Promise<void>((r) => (stopAsked = r));
-    h.gov.register("r1", {
-      home: "/data/agent-home/r1",
-      requestStop: () => {
-        h.stops.push("r1");
-        stopAsked();
-      },
+    watch(h, "r1", Math.ceil(CAP * 1.5), () => {
+      h.stops.push("r1");
+      stopAsked();
     });
-    await h.gov.boundary("r1", quiet); // stoppable; trimmed to the low-water mark
+    await h.gov.boundary("r1", quiet); // trimmed to the low-water mark
     h.sizes.set("/data/agent-home/r1", Math.ceil(CAP * 1.5));
     const verdict = h.gov.boundary("r1", async () => {
       // The volume crosses the hard threshold while this boundary is between measure and trim.
@@ -299,7 +338,7 @@ describe("hard layer: a stop is never wedged, and never lost to the soft park (P
     assert.deepStrictEqual(h.stops, ["r1"]);
   });
 
-  it("a stopped run that leaves its implement loop without a disk park releases the stop, and is no candidate any more (N4)", async () => {
+  it("a stopped run that leaves its executor without a disk park releases the stop (N4)", async () => {
     const h = harness();
     watch(h, "a", 3 * GIB);
     watch(h, "b", 2 * GIB);
@@ -314,16 +353,6 @@ describe("hard layer: a stop is never wedged, and never lost to the soft park (P
     h.gov.observe(0.9);
     await settle();
     assert.deepStrictEqual(h.stops, ["a", "b"], "the hard layer is not wedged on a stop that will never park");
-  });
-
-  it("a finalizing run is never stopped (N4)", async () => {
-    const h = harness();
-    watch(h, "a", 3 * GIB);
-    await h.gov.boundary("a", quiet);
-    h.gov.leftLoop("a", false);
-    h.gov.observe(0.99);
-    await settle();
-    assert.deepStrictEqual(h.stops, []);
   });
 
   it("a run that left for its disk park keeps the stop until its flight ends", async () => {
@@ -385,5 +414,346 @@ describe("hard layer: a stop is never wedged, and never lost to the soft park (P
     await settle();
     assert.strictEqual(measures, 2);
     assert.deepStrictEqual(h.stops, []);
+  });
+});
+
+describe("issue #1830: the hard layer covers every phase of a run", () => {
+  it("the heaviest cache on a PLANNING run (never at a boundary) is stopped once the hard threshold is crossed", async () => {
+    const h = harness();
+    watch(h, "planning", 5 * GIB); // in the executor, status running both sides; no cacheCapBoundary ever
+    watch(h, "implement", GIB);
+    await h.gov.boundary("implement", quiet);
+    h.gov.observe(0.9);
+    await settle();
+    assert.deepStrictEqual(h.stops, ["planning"]);
+    assert.deepStrictEqual(h.inPlace, []);
+  });
+
+  it("a run at its plan gate (ACKed awaiting_approval) is reclaimed in place, not stopped, and only again from a fresh sample", async () => {
+    const h = harness();
+    watch(h, "gated", 5 * GIB);
+    report(h, "gated", "awaiting_approval");
+    h.gov.observe(0.9);
+    await settle();
+    assert.deepStrictEqual(h.stops, []);
+    assert.deepStrictEqual(h.inPlace, ["gated"]);
+    // It regrew; a sample taken before the drop ended is not fresh.
+    h.sizes.set("/data/agent-home/gated", 2 * GIB);
+    h.gov.observe(0.9, h.clock.now - 1);
+    await settle();
+    assert.deepStrictEqual(h.inPlace, ["gated"], "a stale sample does nothing");
+    h.clock.now += 1_000;
+    h.gov.observe(0.9);
+    await settle();
+    assert.deepStrictEqual(h.inPlace, ["gated", "gated"]);
+    assert.deepStrictEqual(h.stops, []);
+    // The drop used its own slot: a later parkable stop is not blocked by it.
+    watch(h, "impl", 9 * GIB);
+    h.clock.now += 1_000;
+    h.gov.observe(0.9);
+    await settle();
+    assert.deepStrictEqual(h.stops, ["impl"]);
+  });
+
+  it("a revision turn (in the executor, ACKed awaiting_approval) is reclaimed, not stopped", async () => {
+    const h = harness();
+    watch(h, "r", 3 * GIB);
+    report(h, "r", "awaiting_approval");
+    h.gov.observe(0.9);
+    await settle();
+    assert.deepStrictEqual(h.stops, []);
+    assert.deepStrictEqual(h.inPlace, ["r"]);
+  });
+
+  it("a non-running report in flight and an unreadable first ACK are not parkable", async () => {
+    const h = harness();
+    watch(h, "inflight", 3 * GIB);
+    h.gov.statusRequested("inflight", "awaiting_approval"); // sent, ACK not back; ACKed is still running
+    h.gov.observe(0.9);
+    await settle();
+    assert.deepStrictEqual(h.inPlace, ["inflight"], "sent awaiting_approval, ACKed running for the older send");
+    assert.deepStrictEqual(h.stops, []);
+
+    const h2 = harness();
+    watchSetup(h2, "unknown", 3 * GIB); // no earlier running ACK to lean on
+    h2.gov.enterRun("unknown");
+    h2.gov.statusAcked("unknown", h2.gov.statusRequested("unknown", "running"), undefined);
+    h2.gov.observe(0.9);
+    await settle();
+    assert.deepStrictEqual(h2.inPlace, ["unknown"]);
+    assert.deepStrictEqual(h2.stops, []);
+  });
+
+  it("a late running ACK of a send older than the last non-running send never makes the run parkable", async () => {
+    // running(1), awaiting_approval(2), running(3): the LAST send is running again, so only the
+    // ACK ordering keeps this honest (the old latest-send-only guard is not what is pinned here).
+    const h = harness();
+    watchSetup(h, "stale", 3 * GIB);
+    h.gov.enterRun("stale");
+    const first = h.gov.statusRequested("stale", "running");
+    h.gov.statusRequested("stale", "awaiting_approval");
+    h.gov.statusRequested("stale", "running");
+    h.gov.statusAcked("stale", first, "running"); // the late ACK of send 1
+    h.gov.observe(0.9);
+    await settle();
+    assert.deepStrictEqual(h.inPlace, ["stale"], "reclaimed in place, not stopped");
+    assert.deepStrictEqual(h.stops, []);
+  });
+
+  it("running(3) ACKed running after a non-running send is parkable", async () => {
+    const h = harness();
+    watchSetup(h, "back", 3 * GIB);
+    h.gov.enterRun("back");
+    const first = h.gov.statusRequested("back", "running");
+    const second = h.gov.statusRequested("back", "awaiting_approval");
+    const third = h.gov.statusRequested("back", "running");
+    h.gov.statusAcked("back", first, "running");
+    h.gov.statusAcked("back", second, "awaiting_approval");
+    h.gov.statusAcked("back", third, "running");
+    h.gov.observe(0.9);
+    await settle();
+    assert.deepStrictEqual(h.stops, ["back"]);
+    assert.deepStrictEqual(h.inPlace, []);
+  });
+
+  it("a late declined ACK of an older send does not cancel a newer running ACK (lastNonRunningAckedSeq is monotone)", async () => {
+    const h = harness();
+    watchSetup(h, "ooo", 3 * GIB);
+    h.gov.enterRun("ooo");
+    h.gov.statusRequested("ooo", "running"); // 1
+    const second = h.gov.statusRequested("ooo", "running");
+    const third = h.gov.statusRequested("ooo", "running");
+    h.gov.statusAcked("ooo", third, "running");
+    h.gov.statusAcked("ooo", second, "awaiting_approval"); // late, older than the running ACK
+    h.gov.observe(0.9);
+    await settle();
+    assert.deepStrictEqual(h.stops, ["ooo"]);
+    assert.deepStrictEqual(h.inPlace, []);
+  });
+
+  it("a late declined ACK of an older send does not undo an earlier declined ACK's cancel", async () => {
+    const h = harness();
+    watchSetup(h, "ooo2", 3 * GIB);
+    h.gov.enterRun("ooo2");
+    const first = h.gov.statusRequested("ooo2", "running");
+    const second = h.gov.statusRequested("ooo2", "running");
+    const third = h.gov.statusRequested("ooo2", "running");
+    h.gov.statusAcked("ooo2", second, "running");
+    h.gov.statusAcked("ooo2", third, "awaiting_approval"); // cancels the running ACK of 2
+    h.gov.statusAcked("ooo2", first, "awaiting_approval"); // late: must not lower the cancel mark
+    h.gov.observe(0.9);
+    await settle();
+    assert.deepStrictEqual(h.stops, []);
+    assert.deepStrictEqual(h.inPlace, ["ooo2"]);
+  });
+
+  it("the logged acked_status is the newest send's, not a late ACK of an older one", async () => {
+    const h = harness();
+    watch(h, "log", 3 * GIB);
+    h.gov.statusRequested("log", "awaiting_approval"); // 2
+    const second = 2;
+    const third = h.gov.statusRequested("log", "awaiting_input"); // 3
+    h.gov.statusAcked("log", third, "awaiting_input");
+    h.gov.statusAcked("log", second, "awaiting_approval"); // late ACK of the older send
+    h.gov.observe(0.9);
+    await settle();
+    assert.deepStrictEqual(h.inPlace, ["log"]);
+    const drop = h.warnFields.find((w) => w.fields?.in_place === true);
+    assert.ok(drop, "the in-place drop was logged");
+    assert.strictEqual(drop.fields?.acked_status, "awaiting_input");
+  });
+
+  for (const declined of ["awaiting_approval", undefined] as const) {
+    it(`a declined or unreadable ACK (${String(declined)}) of a LATER running send cancels the earlier running ACK`, async () => {
+      const h = harness();
+      watch(h, "later", 5 * GIB); // running sent (1) and ACKed running
+      const second = h.gov.statusRequested("later", "running");
+      h.gov.statusAcked("later", second, declined); // the server declined it (409) or the ACK was unreadable
+      h.gov.observe(0.99);
+      await settle();
+      assert.deepStrictEqual(h.stops, [], "no stop: the server may not be at running");
+      assert.deepStrictEqual(h.inPlace, ["later"], "dropped in place instead");
+    });
+  }
+
+  it("a LATER running ACK (a higher seq) after a declined one restores parkable", async () => {
+    const h = harness();
+    watch(h, "restored", 5 * GIB);
+    const second = h.gov.statusRequested("restored", "running");
+    h.gov.statusAcked("restored", second, undefined);
+    const third = h.gov.statusRequested("restored", "running");
+    h.gov.statusAcked("restored", third, "running");
+    h.gov.observe(0.99);
+    await settle();
+    assert.deepStrictEqual(h.stops, ["restored"]);
+    assert.deepStrictEqual(h.inPlace, []);
+  });
+
+  it("a same-status running report in flight (un-ACKed) does not unmake a parkable run", async () => {
+    const h = harness();
+    watch(h, "impl", 5 * GIB); // running sent and ACKed
+    h.gov.statusRequested("impl", "running"); // the next running report is sent, ACK not back yet
+    h.gov.observe(0.95);
+    await settle();
+    assert.deepStrictEqual(h.inPlace, [], "no in-place drop under the live turn");
+    assert.deepStrictEqual(h.stops, ["impl"]);
+  });
+
+  it("a run skipped in place while its first running report was un-ACKed is stopped once that ACK lands", async () => {
+    const h = harness();
+    h.inPlaceLeaves.bytes = 4 * GIB; // the drop leaves bytes, so the run is skipped for the stretch
+    watchSetup(h, "impl", 5 * GIB);
+    h.gov.enterRun("impl");
+    const seq = h.gov.statusRequested("impl", "running"); // sent, no running ACK yet
+    h.gov.observe(0.95);
+    await settle();
+    assert.deepStrictEqual(h.inPlace, ["impl"]);
+    assert.deepStrictEqual(h.stops, []);
+    h.gov.statusAcked("impl", seq, "running");
+    h.clock.now += 1_000;
+    h.gov.observe(0.95);
+    await settle();
+    assert.deepStrictEqual(h.stops, ["impl"], "the skip did not outlive the run becoming parkable");
+  });
+
+  it("a setup run and a finalizing run are reclaimed in place, never stopped", async () => {
+    const h = harness();
+    watchSetup(h, "setup", 3 * GIB);
+    h.gov.observe(0.95);
+    await settle();
+    assert.deepStrictEqual(h.inPlace, ["setup"]);
+
+    const f = harness();
+    watch(f, "fin", 3 * GIB);
+    f.gov.leftLoop("fin", false); // executor returned: finalizing
+    f.gov.observe(0.95);
+    await settle();
+    assert.deepStrictEqual(f.inPlace, ["fin"]);
+    assert.deepStrictEqual(f.stops, []);
+  });
+
+  it("the action follows the run's state AFTER the measurement", async () => {
+    const h = harness();
+    watch(h, "a", 3 * GIB);
+    const gov = h.gov as unknown as { measure: (home: string, o: { deadline: number }) => Promise<unknown> };
+    const inner = gov.measure;
+    gov.measure = async (home, o) => {
+      const r = await inner(home, o);
+      report(h, "a", "awaiting_input"); // it reached a question wait while being measured
+      return r;
+    };
+    h.gov.observe(0.95);
+    await settle();
+    assert.deepStrictEqual(h.stops, []);
+    assert.deepStrictEqual(h.inPlace, ["a"]);
+  });
+
+  it("an in-place drop that throws is logged and releases the slot", async () => {
+    const h = harness();
+    h.inPlaceLeaves.throws = true;
+    watch(h, "gated", 3 * GIB);
+    report(h, "gated", "awaiting_approval");
+    h.gov.observe(0.95);
+    await settle();
+    assert.deepStrictEqual(h.inPlace, ["gated"]);
+    // The slot is free: the parkable run is acted on at the next fresh sample.
+    watch(h, "impl", GIB);
+    h.clock.now += 1_000;
+    h.gov.observe(0.95);
+    await settle();
+    assert.deepStrictEqual(h.stops, ["impl"], "the failed run is skipped for the stretch; the smaller parkable run is stopped");
+  });
+
+  it("a non-parkable run whose drop left bytes behind is skipped for the stretch so the next-heaviest run is stopped", async () => {
+    const h = harness();
+    h.inPlaceLeaves.bytes = 4 * GIB; // the drop leaves bytes (e.g. a kept subtree)
+    watch(h, "gated", 5 * GIB);
+    report(h, "gated", "awaiting_approval");
+    watch(h, "impl", 2 * GIB);
+    h.gov.observe(0.95);
+    await settle();
+    assert.deepStrictEqual(h.inPlace, ["gated"]);
+    assert.deepStrictEqual(h.stops, []);
+    h.clock.now += 1_000;
+    h.gov.observe(0.95);
+    await settle();
+    assert.deepStrictEqual(h.inPlace, ["gated"], "not reclaimed again this stretch");
+    assert.deepStrictEqual(h.stops, ["impl"]);
+  });
+
+  it("a PENDING in-place drop holds its own slot: leftLoop and unregister neither release a stop nor fire the D7 reclaim, and the give-up timeout skips it", async () => {
+    const h = harness();
+    let release: () => void = () => {};
+    h.inPlaceHold.until = new Promise<void>((r) => (release = r));
+    watch(h, "gated", 3 * GIB);
+    report(h, "gated", "awaiting_approval");
+    h.gov.observe(0.95);
+    await settle();
+    assert.deepStrictEqual(h.inPlace, ["gated"], "the drop started and is still pending");
+    h.gov.leftLoop("gated", false);
+    assert.ok(!h.warns.some((m) => m.includes("without a disk park")), "no stop is released for a drop");
+    h.clock.now += 11 * 60_000;
+    h.gov.observe(0.95);
+    assert.ok(!h.warns.some((m) => m.includes("giving it up")), "the give-up timeout does not touch a drop");
+    h.gov.unregister("gated");
+    await settle();
+    assert.strictEqual(h.reclaims(), 0, "no D7 reclaim for a run that was only reclaimed in place");
+    release();
+    await settle();
+  });
+
+  it("the in-place skip resets when usage falls under the threshold", async () => {
+    const h = harness();
+    h.inPlaceLeaves.bytes = 4 * GIB;
+    watch(h, "gated", 5 * GIB);
+    report(h, "gated", "awaiting_approval");
+    h.gov.observe(0.95);
+    await settle();
+    assert.deepStrictEqual(h.inPlace, ["gated"]);
+    h.clock.now += 1_000;
+    h.gov.observe(0.95);
+    await settle();
+    assert.deepStrictEqual(h.inPlace, ["gated"], "skipped for the rest of the stretch");
+    h.gov.observe(0.5); // the volume recovered: the stretch ends
+    h.clock.now += 1_000;
+    h.gov.observe(0.95);
+    await settle();
+    assert.deepStrictEqual(h.inPlace, ["gated", "gated"], "a new stretch acts on it again");
+  });
+
+  it("the in-place skip resets when the run's status changes", async () => {
+    const h = harness();
+    h.inPlaceLeaves.bytes = 4 * GIB;
+    watch(h, "gated", 5 * GIB);
+    report(h, "gated", "awaiting_approval");
+    h.gov.observe(0.95);
+    await settle();
+    assert.deepStrictEqual(h.inPlace, ["gated"]);
+    report(h, "gated", "awaiting_input"); // a different wait
+    h.clock.now += 1_000;
+    h.gov.observe(0.95);
+    await settle();
+    assert.deepStrictEqual(h.inPlace, ["gated", "gated"]);
+  });
+
+  it("a heavier gate-waiting run next to a lighter parkable run is dropped in place and nothing is stopped in that selection", async () => {
+    const h = harness();
+    watch(h, "gated", 6 * GIB);
+    report(h, "gated", "awaiting_approval");
+    watch(h, "impl", 2 * GIB);
+    h.gov.observe(0.95);
+    await settle();
+    assert.deepStrictEqual(h.inPlace, ["gated"]);
+    assert.deepStrictEqual(h.stops, [], "the lighter parkable run is not stopped in the same selection");
+  });
+
+  it("an in-place drop does not trigger the D7 reclaim and leaves leftLoop/unregister untouched", async () => {
+    const h = harness();
+    watch(h, "gated", 3 * GIB);
+    report(h, "gated", "awaiting_approval");
+    h.gov.observe(0.95);
+    await settle();
+    h.gov.unregister("gated");
+    assert.strictEqual(h.reclaims(), 0, "only a stopped run's flight end runs the D7 reclaim");
   });
 });
