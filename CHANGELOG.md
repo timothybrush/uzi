@@ -36,6 +36,8 @@ through `[0.52.0]`.)
 - **A transient provider error resumes the session the turn actually ran ([#1666](https://github.com/vtmocanu/uzi/issues/1666)).**
   A later turn whose requested resume came back as a fresh session and then hit a transient provider error (429/5xx/529) no longer retries the stale session from an earlier turn; the retry now continues the session that turn actually ran, as the signal-death resume already did.
 
+- **A milestone run that finishes at the operator's scope ceiling in the same turn as `signal_done` is now delivered as a partial ([#1514](https://github.com/vtmocanu/uzi/issues/1514)).**
+  A non-interlocked milestone run that reached the operator's scope ceiling and signalled done in the same turn (Claude: before the next loop-top check; Codex: which has no loop-top check) opened a closing MR (`Closes #N`) and settled the scope input as declined; the done exit now applies the ceiling from the last served state, so the MR is `[partial]` and non-closing and the run reports `scope_capped`.
 - **A fetch that timed out or was cancelled as the site responded is no longer logged as a success ([#1977](https://github.com/vtmocanu/uzi/issues/1977)).**
   A fetcher attempt whose fetch timeout or caller cancellation ended as the site's response arrived is now refused and logged as `timeout`/`cancelled` instead of being returned and recorded as a successful (possibly 0-byte) fetch.
 
