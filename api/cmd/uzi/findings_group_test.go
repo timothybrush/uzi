@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -25,6 +26,126 @@ func groupFake() *uzicli.FakeClient {
 		Issue:          &apitypes.IncidentalFindingFiledIssueDTO{IID: 9, WebURL: "https://forge/x/9", Title: "grouped"},
 	}
 	return fc
+}
+
+func TestFindingsDraftSingleAndCollapsed(t *testing.T) {
+	fc := groupFake()
+	fc.FindingDrafts["e-1"] = apitypes.IncidentalFindingIssueDraftDTO{DispositionID: "d-1", Title: "web title", Description: "web body", Location: "loc", Labels: []string{"bug"}, Provenance: "agent"}
+	out, _, code := runCLI(t, fakeEnv(fc), "findings", "draft", "e-1", "--json")
+	var got apitypes.IncidentalFindingIssueDraftDTO
+	if code != uzicli.ExitOK || json.Unmarshal([]byte(out), &got) != nil || !reflect.DeepEqual(got, fc.FindingDrafts["e-1"]) {
+		t.Fatalf("single JSON: exit=%d out=%s", code, out)
+	}
+	out, _, code = runCLI(t, fakeEnv(fc), "findings", "draft", "e-1", "e-1-old")
+	if code != uzicli.ExitOK || out != "web title\n\nweb body\n" || fc.LastFindingGroupDraftIDs != nil {
+		t.Errorf("collapsed: exit=%d out=%q group=%v", code, out, fc.LastFindingGroupDraftIDs)
+	}
+	if fc.LastFileFindingID != "" || fc.LastFileFindingGroupIDs != nil {
+		t.Errorf("preview wrote: single=%q group=%v", fc.LastFileFindingID, fc.LastFileFindingGroupIDs)
+	}
+}
+
+func TestFindingsDraftGroupDedupesAndPrintsServerText(t *testing.T) {
+	fc := groupFake()
+	fc.FindingGroupDraftResult = apitypes.FindingGroupDraftDTO{RepoID: "repo", DispositionIDs: []string{"d-2", "d-1"}, Title: "web group", Description: "web body", Labels: []string{"bug"}}
+	out, _, code := runCLI(t, fakeEnv(fc), "findings", "draft", "e-1", "e-1", "e-2", "e-1-old")
+	if code != uzicli.ExitOK || out != "web group\n\nweb body\n" || !reflect.DeepEqual(fc.LastFindingGroupDraftIDs, []string{"d-1", "d-2"}) || !reflect.DeepEqual(fc.LastFindingDraftIDs, []string{"e-1", "e-2", "e-1-old"}) {
+		t.Errorf("group: exit=%d out=%q ids=%v lookups=%v", code, out, fc.LastFindingGroupDraftIDs, fc.LastFindingDraftIDs)
+	}
+	out, _, code = runCLI(t, fakeEnv(fc), "findings", "draft", "e-1", "e-2", "--json")
+	var got apitypes.FindingGroupDraftDTO
+	if code != uzicli.ExitOK || json.Unmarshal([]byte(out), &got) != nil || !reflect.DeepEqual(got, fc.FindingGroupDraftResult) {
+		t.Errorf("group JSON: exit=%d out=%s", code, out)
+	}
+	out, _, code = runCLI(t, fakeEnv(fc), "--quiet", "findings", "draft", "e-1", "e-2")
+	if code != uzicli.ExitOK || out != "" {
+		t.Errorf("quiet: exit=%d out=%q", code, out)
+	}
+}
+
+func TestFindingsDraftMatchesWebDialogFixture(t *testing.T) {
+	raw, err := os.ReadFile("../../../fixtures/finding-group-draft/response.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var webDraft apitypes.FindingGroupDraftDTO
+	if err := json.Unmarshal(raw, &webDraft); err != nil {
+		t.Fatal(err)
+	}
+	fc := groupFake()
+	fc.FindingDrafts["e-1"] = apitypes.IncidentalFindingIssueDraftDTO{DispositionID: "d1"}
+	fc.FindingDrafts["e-2"] = apitypes.IncidentalFindingIssueDraftDTO{DispositionID: "d2"}
+	fc.FindingGroupDraftResult = webDraft
+	out, _, code := runCLI(t, fakeEnv(fc), "findings", "draft", "e-1", "e-2")
+	if code != uzicli.ExitOK || out != webDraft.Title+"\n\n"+webDraft.Description+"\n" || !reflect.DeepEqual(fc.LastFindingGroupDraftIDs, webDraft.DispositionIDs) {
+		t.Errorf("CLI preview = %q (exit %d, ids %v), web dialog draft = %+v", out, code, fc.LastFindingGroupDraftIDs, webDraft)
+	}
+	out, _, code = runCLI(t, fakeEnv(fc), "findings", "draft", "e-1", "e-2", "--json")
+	var cliJSON, webJSON map[string]any
+	if err := json.Unmarshal([]byte(out), &cliJSON); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &webJSON); err != nil {
+		t.Fatal(err)
+	}
+	if code != uzicli.ExitOK || !reflect.DeepEqual(cliJSON, webJSON) {
+		t.Errorf("CLI JSON draft = %q (exit %d), web dialog draft = %s", out, code, raw)
+	}
+}
+
+func TestFindingsDraftMissingDispositionAndCap(t *testing.T) {
+	fc := groupFake()
+	fc.FindingDrafts["missing"] = apitypes.IncidentalFindingIssueDraftDTO{}
+	_, errb, code := runCLI(t, fakeEnv(fc), "findings", "draft", "e-1", "missing")
+	if code != uzicli.ExitUsage || !strings.Contains(errb, "missing") || fc.LastFindingGroupDraftIDs != nil {
+		t.Errorf("missing: exit=%d stderr=%s group=%v", code, errb, fc.LastFindingGroupDraftIDs)
+	}
+	args := []string{"findings", "draft"}
+	for i := 0; i < 51; i++ {
+		args = append(args, "e-"+strconv.Itoa(i))
+	}
+	fc.LastFindingDraftIDs = nil
+	_, _, code = runCLI(t, fakeEnv(fc), args...)
+	if code != uzicli.ExitUsage || len(fc.LastFindingDraftIDs) != 0 {
+		t.Errorf("cap: exit=%d lookups=%v", code, fc.LastFindingDraftIDs)
+	}
+}
+
+func TestFindingsDraftAllowsFiftyDistinctWithRepeats(t *testing.T) {
+	fc := groupFake()
+	args := []string{"findings", "draft"}
+	for i := 0; i < 50; i++ {
+		id := "ev-" + strconv.Itoa(i)
+		fc.FindingDrafts[id] = apitypes.IncidentalFindingIssueDraftDTO{DispositionID: "d-" + strconv.Itoa(i)}
+		args = append(args, id)
+	}
+	args = append(args, "ev-0", "ev-1")
+	_, _, code := runCLI(t, fakeEnv(fc), args...)
+	if code != uzicli.ExitOK || len(fc.LastFindingDraftIDs) != 50 || len(fc.LastFindingGroupDraftIDs) != 50 {
+		t.Errorf("exit=%d lookups=%d group=%d", code, len(fc.LastFindingDraftIDs), len(fc.LastFindingGroupDraftIDs))
+	}
+}
+
+func TestFindingsDraftUnknownEvidence(t *testing.T) {
+	fc := groupFake()
+	_, _, code := runCLI(t, fakeEnv(fc), "findings", "draft", "e-1", "unknown")
+	if code != uzicli.ExitNotFound || fc.LastFindingGroupDraftIDs != nil {
+		t.Errorf("exit=%d group=%v", code, fc.LastFindingGroupDraftIDs)
+	}
+}
+
+func TestFindingsDraftSanitizesTerminalControls(t *testing.T) {
+	fc := groupFake()
+	fc.FindingGroupDraftResult = apitypes.FindingGroupDraftDTO{Title: "web\x1b[31m title\nFiled issue #123", Description: "body\x1b[2J text"}
+	out, _, code := runCLI(t, fakeEnv(fc), "findings", "draft", "e-1", "e-2")
+	if code != uzicli.ExitOK || strings.ContainsRune(out, '\x1b') || !strings.HasPrefix(out, "web[31m title Filed issue #123\n\n") || !strings.Contains(out, "body") {
+		t.Errorf("exit=%d out=%q", code, out)
+	}
+	fc.FindingDrafts["e-1"] = apitypes.IncidentalFindingIssueDraftDTO{Title: "single\nFiled issue #456", Description: "body"}
+	out, _, code = runCLI(t, fakeEnv(fc), "findings", "draft", "e-1")
+	if code != uzicli.ExitOK || out != "single Filed issue #456\n\nbody\n" {
+		t.Errorf("single: exit=%d out=%q", code, out)
+	}
 }
 
 func TestFindingsFileSingleIDSkipsDraftLookup(t *testing.T) {

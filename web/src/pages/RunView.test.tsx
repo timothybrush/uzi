@@ -62,6 +62,9 @@ vi.mock("../lib/api", async (importOriginal) => {
     ...actual,
     api: {
       listAgentTemplates: vi.fn(),
+      listFindings: vi.fn().mockResolvedValue({ findings: [], bucket: "to_file", repo: "", run: "", open_count: 0 }),
+      markFindingDone: vi.fn(),
+      undoFinding: vi.fn(),
       getRunReview: vi.fn(),
       rerunJudge: vi.fn(),
       // PRD #68 M4: the file-issue draft/write + the picker's repo list. Defaulted to an
@@ -2103,6 +2106,94 @@ describe("RunView report-only surfaces (issue #279)", () => {
     expect(link.textContent).toContain("Open merge request");
     expect(screen.queryByText("report only")).toBeNull();
     expect(screen.queryByText("Findings")).toBeNull();
+  });
+});
+
+describe("RunView incidental findings summary", () => {
+  type Backlog = Awaited<ReturnType<typeof api.listFindings>>;
+  function backlog(statuses: string[], runId = "r1", openCount = statuses.filter((s) => s === "open").length): Backlog {
+    return {
+      bucket: "to_file", repo: "", run: runId, open_count: openCount,
+      findings: statuses.map((status, i) => ({
+        location: `file-${i}`, repo_id: "repo1", repo_path: "owner/repo",
+        status, last_title: `Finding ${i}`, seen_in_runs: 1,
+      })),
+    };
+  }
+  function show(over: Partial<Run>, messages: RunMessage[] = []) {
+    mockUseRunStream.mockReturnValue({
+      run: run(over), messages, connected: true, error: "", submit: vi.fn(),
+      refreshRun: vi.fn(), inputs: [], canSteer: false,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+  }
+
+  it("counts returned open rows, ignores global open_count and links to the filtered page", async () => {
+    mockApi.listFindings.mockResolvedValue(backlog(["open", "open", "done", "filed"], "r/1 &", 99));
+    show({ id: "r/1 &", status: "completed", report_only: true, report_md: "Report result" });
+    render(<MemoryRouter initialEntries={["/runs/r%2F1%20%26"]}><RunView /></MemoryRouter>);
+    expect(await screen.findByText("Incidental findings: 2 open")).toBeTruthy();
+    expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r/1 &");
+    expect(screen.getByRole("link", { name: "View findings" }).getAttribute("href")).toBe("/findings?run=r%2F1%20%26");
+    expect(screen.getByText("Report result")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Findings" })).toBeTruthy();
+  });
+
+  it("hides zero rows, nonterminal runs and fetch errors", async () => {
+    mockApi.listFindings.mockResolvedValue(backlog([], "r1", 9));
+    show({ status: "completed" });
+    const view = render(<MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>);
+    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r1"));
+    expect(screen.queryByText(/Incidental findings:/)).toBeNull();
+    show({ status: "running" });
+    view.rerender(<MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>);
+    expect(screen.queryByText(/Incidental findings:/)).toBeNull();
+    mockApi.listFindings.mockRejectedValue(new Error("offline"));
+    show({ id: "r2", status: "failed" });
+    view.rerender(<MemoryRouter initialEntries={["/runs/r2"]}><RunView /></MemoryRouter>);
+    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r2"));
+    expect(screen.queryByText(/Incidental findings:/)).toBeNull();
+  });
+
+  it("refreshes the terminal summary after a feed card is marked done and undone", async () => {
+    const finding: RunMessage = {
+      seq: 1, kind: "finding", agent: "coder", agent_instance: null, agent_label: null,
+      payload: { id: "find-1", title: "Leaked ticker", location: "a.go#loop", labels: [] },
+      created_at: "2026-07-05T12:00:00Z",
+    };
+    mockApi.listFindings
+      .mockResolvedValueOnce(backlog(["open"]))
+      .mockResolvedValueOnce(backlog([]))
+      .mockResolvedValueOnce(backlog(["open"]));
+    mockApi.markFindingDone.mockResolvedValue({ status: "done", disposition_id: "disp-1" });
+    mockApi.undoFinding.mockResolvedValue({
+      location: "a.go#loop", repo_id: "repo1", repo_path: "owner/repo",
+      status: "open", last_title: "Leaked ticker", seen_in_runs: 1,
+    });
+    show({ status: "completed" }, [finding]);
+    render(<MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>);
+    expect(await screen.findByText("Incidental findings: 1 open")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Mark done" }));
+    await waitFor(() => expect(screen.queryByText(/Incidental findings:/)).toBeNull());
+    expect(mockApi.listFindings).toHaveBeenCalledTimes(2);
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    expect(await screen.findByText("Incidental findings: 1 open")).toBeTruthy();
+    expect(mockApi.listFindings).toHaveBeenCalledTimes(3);
+  });
+
+  it("ignores a response from the previous run", async () => {
+    let resolveOld!: (value: Awaited<ReturnType<typeof api.listFindings>>) => void;
+    mockApi.listFindings.mockImplementation((_, __, id) => id === "r1"
+      ? new Promise((resolve) => { resolveOld = resolve; })
+      : Promise.resolve(backlog([], "r2")));
+    show({ id: "r1", status: "completed" });
+    const view = render(<MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>);
+    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r1"));
+    show({ id: "r2", status: "completed" });
+    view.rerender(<MemoryRouter initialEntries={["/runs/r2"]}><RunView /></MemoryRouter>);
+    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r2"));
+    await act(async () => resolveOld(backlog(["open"], "r1")));
+    expect(screen.queryByText(/Incidental findings:/)).toBeNull();
   });
 });
 

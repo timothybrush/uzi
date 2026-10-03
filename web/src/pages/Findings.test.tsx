@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { Findings } from "./Findings";
+import { findingsApi } from "../mocks/mockApi/findings";
+import sharedGroupDraft from "../../../fixtures/finding-group-draft/response.json";
 import { AppShell } from "../components/AppShell";
 import { useAuth } from "../auth/AuthContext";
 import {
@@ -854,14 +856,45 @@ describe("Findings page - File as one issue (issue #1724)", () => {
   });
 
   function openDraft() {
-    mockApi.findingGroupIssueDraft.mockResolvedValue({
-      repo_id: "repo-uzi",
-      disposition_ids: ["d1", "d2"],
-      title: "Findings (2): Alpha bug",
-      description: "1. Alpha\n2. Beta",
-      labels: ["uzi"],
-    });
+    mockApi.findingGroupIssueDraft.mockResolvedValue(sharedGroupDraft);
   }
+
+  it("shows the completed mock run's two open findings as a selectable group", async () => {
+    mockApi.listFindings.mockImplementation(findingsApi.listFindings);
+    renderFindings(["/findings?run=run-done"]);
+    const first = await screen.findByRole("checkbox", { name: "Select Leaked ticker in sweepLoop never stopped on shutdown" });
+    const second = screen.getByRole("checkbox", { name: "Select Retry loop can never succeed — it retries a non-idempotent POST" });
+    expect(screen.getByText("Filtered to one run's findings.")).toBeTruthy();
+    expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "run-done");
+    fireEvent.click(first);
+    fireEvent.click(second);
+    expect(groupButton().disabled).toBe(false);
+    expect(screen.queryByText("Boot key-check skips the JWT audience claim")).toBeNull();
+  });
+
+  it("uses the run filter with the existing grouped filing flow", async () => {
+    mockApi.listFindings.mockResolvedValue(backlog({
+      run: "r/1 &", open_count: 40, findings: rows.slice(0, 2),
+    }));
+    openDraft();
+    mockApi.fileFindingGroup.mockResolvedValue({
+      operation_id: "op-filtered", disposition_ids: ["d1", "d2"], phase: "settled",
+      issue: { iid: 81, web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/81", title: "Grouped" },
+    });
+    renderFindings(["/findings?run=r%2F1%20%26"]);
+    expect(await screen.findByText("Alpha bug")).toBeTruthy();
+    expect(screen.getByText("Filtered to one run's findings.")).toBeTruthy();
+    expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r/1 &");
+    tick("Alpha bug");
+    tick("Beta bug");
+    fireEvent.click(groupButton());
+    fireEvent.click(await screen.findByRole("button", { name: "Create issue" }));
+    await waitFor(() => expect(mockApi.fileFindingGroup).toHaveBeenCalledWith({
+      ids: ["d1", "d2"], title: "Findings (2): Alpha bug",
+      description: "1. Alpha\n2. Beta", labels: ["uzi"],
+    }));
+    expect(await screen.findByText(/Filed 2 findings as issue #81/)).toBeTruthy();
+  });
 
   it("happy path: loads the draft, posts ids and edits, reloads, and shows the warning", async () => {
     openDraft();
@@ -877,7 +910,9 @@ describe("Findings page - File as one issue (issue #1724)", () => {
     tick("Beta bug");
     fireEvent.click(groupButton());
     await screen.findByRole("button", { name: "Create issue" });
-    expect(mockApi.findingGroupIssueDraft).toHaveBeenCalledWith(["d1", "d2"]);
+    expect(mockApi.findingGroupIssueDraft).toHaveBeenCalledWith(sharedGroupDraft.disposition_ids);
+    expect(screen.getByDisplayValue(sharedGroupDraft.title)).toBeTruthy();
+    expect(screen.getByText("Description").parentElement?.querySelector("textarea")?.value).toBe(sharedGroupDraft.description);
     expect(screen.getByText("vtmocanu/uzi", { selector: "span, p, div, code" })).toBeTruthy();
 
     fireEvent.change(screen.getByDisplayValue("Findings (2): Alpha bug"), { target: { value: "edited" } });

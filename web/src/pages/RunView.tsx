@@ -6,7 +6,7 @@
 // states get a hero banner: the MR link is the run's entire output and must
 // not hide in chrome. The breadcrumb keeps PRD #12's in-app board / issue links.
 
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   api,
@@ -1841,6 +1841,32 @@ export function RunView() {
   const currentRunIdRef = useRef(id);
   currentRunIdRef.current = id;
   const { run, messages, connected, error, submit, refreshRun, inputs, canSteer } = useRunStream(id);
+  const [incidentalSummary, setIncidentalSummary] = useState<{ runId: string; count: number } | null>(null);
+  const findingsRunId = run?.id;
+  const findingsTerminal = !!run && isTerminalRun(run.status);
+  const summaryContext = useRef({ runId: findingsRunId, terminal: findingsTerminal });
+  summaryContext.current = { runId: findingsRunId, terminal: findingsTerminal };
+  const summaryRequest = useRef(0);
+  const refreshIncidentalSummary = useCallback(() => {
+    if (!findingsTerminal || !findingsRunId ||
+        summaryContext.current.runId !== findingsRunId || !summaryContext.current.terminal) return;
+    const request = ++summaryRequest.current;
+    api.listFindings("to_file", undefined, findingsRunId)
+      .then(({ findings }) => {
+        if (summaryRequest.current === request) {
+          setIncidentalSummary({ runId: findingsRunId, count: findings.filter((f) => f.status === "open").length });
+        }
+      })
+      .catch(() => {
+        if (summaryRequest.current === request) setIncidentalSummary(null);
+      });
+  }, [findingsRunId, findingsTerminal]);
+  useEffect(() => {
+    setIncidentalSummary(null);
+    refreshIncidentalSummary();
+    const requestRef = summaryRequest;
+    return () => { requestRef.current++; };
+  }, [refreshIncidentalSummary]);
   const [repoWebUrl, setRepoWebUrl] = useState<string | null>(null);
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [actionErr, setActionErr] = useState("");
@@ -2759,6 +2785,15 @@ export function RunView() {
         </div>
       )}
 
+      {terminal && incidentalSummary?.runId === run.id && incidentalSummary.count > 0 && (
+        <Card className="flex flex-wrap items-center justify-between gap-2 p-3 text-sm">
+          <span>Incidental findings: {incidentalSummary.count} open</span>
+          <Link className="text-brand hover:underline" to={`/findings?run=${encodeURIComponent(run.id)}`}>
+            View findings
+          </Link>
+        </Card>
+      )}
+
       {/* issue #279: a report-only run's deliverable is report_md. Render it right
           under the completed hero, above the retrospective.
 
@@ -2978,6 +3013,7 @@ export function RunView() {
           connected={connected}
           terminal={terminal}
           phaseUsageBySeq={usage.phaseUsageBySeq}
+          onFindingMutation={refreshIncidentalSummary}
           // `?? null` tells ActivityFeed "the parent already derived; do not re-derive"
           // (PRD #516 / issue #553): null distinguishes "no reading" from "not computed".
           leadContext={usage.leadContext ?? null}

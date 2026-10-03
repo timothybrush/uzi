@@ -6,7 +6,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
+
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"testing"
 )
 
@@ -204,6 +207,43 @@ func TestFindingIssueDraftWire(t *testing.T) {
 	}
 	if gotMethod != http.MethodGet || gotPath != "/api/findings/e%2F1/issue-draft" || d.DispositionID != "d-3" {
 		t.Errorf("method=%q path=%q draft=%+v", gotMethod, gotPath, d)
+	}
+}
+
+func TestGetFindingGroupIssueDraftWire(t *testing.T) {
+	var method, path, query string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method, path, query = r.Method, r.URL.Path, r.URL.RawQuery
+		_, _ = w.Write([]byte(`{"repo_id":"repo","disposition_ids":["b","a"],"title":"web title","description":"web body","labels":["bug"]}`))
+	}))
+	defer srv.Close()
+	d, err := newTestClient(srv).GetFindingGroupIssueDraft(context.Background(), []string{"a/b", "c d"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if method != http.MethodGet || path != "/api/findings/issue-draft" || query != "ids=a%2Fb%2Cc+d" {
+		t.Errorf("method=%q path=%q query=%q", method, path, query)
+	}
+	want := apitypes.FindingGroupDraftDTO{
+		RepoID: "repo", DispositionIDs: []string{"b", "a"}, Title: "web title",
+		Description: "web body", Labels: []string{"bug"},
+	}
+	if !reflect.DeepEqual(d, want) {
+		t.Errorf("CLI draft DTO = %+v, server draft DTO = %+v", d, want)
+	}
+}
+
+func TestGetFindingGroupIssueDraftStatusMapping(t *testing.T) {
+	for status, want := range map[int]int{http.StatusBadRequest: ExitUsage, http.StatusNotFound: ExitNotFound, http.StatusConflict: ExitConflict} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"error":"x"}`))
+		}))
+		_, err := newTestClient(srv).GetFindingGroupIssueDraft(context.Background(), []string{"a", "b"})
+		srv.Close()
+		if got := ExitCodeFor(err); got != want {
+			t.Errorf("status %d: exit=%d err=%v", status, got, err)
+		}
 	}
 }
 
