@@ -1,0 +1,98 @@
+# PRD #2169: Dedicated cross-check slots on workers
+
+**Status**: Draft. Child 2 of 5 under umbrella #2148 (Cross-check). Blocked by PRD #2149 (the `cross_check` kind). Naming follows PRD #2149 (D13, D14).
+
+Resolved facts below were read at `main` `c1543616`.
+
+## Problem
+
+A cross-check child (PRD #2149) is claimed on the ordinary run lane, so it competes with leads for run slots while its own lead holds a slot waiting for it (PRD #2149 D4). Hosted workers default to one run slot (`UZI_WORKER_MAX_CONCURRENT_RUNS`, `controller/internal/config/config.go`), so a lead can never be cross-checked on its own worker: the child needs another worker with a free slot, or an ephemeral worker, or the lead parks with `plan cross-check: timed out`. A sweep that fills every slot with leads parks all of them. Code cross-checks (PRD #2170) add a second child per run and make this worse.
+
+Raising the run cap does not fix it: new leads fill the extra slots too, a higher cap opens the two intra-user residuals ADR-0042 documents for concurrent runs, and #2127 recorded a hosted worker OOM-killed at its 12Gi limit during one Codex run with the consumer still unknown.
+
+## Outcome
+
+Every worker has a separate **cross-check lane**, next to the run lane and the chat lane, with its own cap `WORKER_CROSS_CHECK_SLOTS` (default 1). A cross-check child is claimed only on that lane, never on the run lane, and it prefers the lead's own worker. A lead whose worker can run the other family is therefore never waiting for a run slot to be checked. The lane is invisible in the Runs list (children are already unlisted, PRD #2149) but visible where capacity is shown.
+
+Acceptance examples:
+
+1. One persistent worker, run cap 1, cross-check slots 1, runs both families. A sweep run R occupies the run slot and submits its plan. R's child is claimed by the same worker's cross-check lane within one poll; R passes and implements. No other worker is online.
+2. Two leads on one worker (run cap 2, cross-check slots 1) submit plans together. One child runs, the other waits for the lane slot, then runs; neither lead's run slot is used by a child.
+3. The lead's worker cannot run Codex (it does not advertise `codex_harness_v1`). After `WORKER_AFFINITY_GRACE`, another of the user's workers that can run Codex claims the child on its own cross-check lane.
+4. The lead's worker is cordoned for a roll while its lead waits. The cordoned worker still claims that lead's child (it claims nothing else new), so the lead is not stranded by the roll.
+5. A lead on an ephemeral worker bound to it: the same pod's cross-check lane claims the lead's child. It never claims another run's child.
+6. The workers page shows "1/1 runs" and "1/1 cross-checks" for a worker busy with a lead and its child.
+
+## Out of scope
+
+- Raising run caps or changing pod presets. Lane capacity is measured in acceptance first.
+- A durable wait that releases the lead's run slot.
+- Placing a child on another user's worker. Workers are per-user, as today.
+- Chat-lane changes.
+
+## Modules and seams
+
+### Worker (agent)
+
+- `crossCheckClaimLoop` in `agent/src/worker.ts`, beside `claimLoop` and `chatClaimLoop` and started in the same `Promise.all`, with its own tracked pool (the `chatActive` pattern), shutdown drain, and the shared DinD-prune claim gate (`tryEnterClaim`). It claims only while its pool is below `WORKER_CROSS_CHECK_SLOTS`, and routes every claim to `CrossCheckRunner`; a non-`cross_check` claim on this lane is refused loudly and never executed. `isIdle` counts the new pool.
+- Config: `crossCheckSlots: nonNegativeInt(env, "WORKER_CROSS_CHECK_SLOTS", 1)` in `agent/src/config.ts`, max 16; 0 turns the lane off.
+- The worker advertises the new protocol capability `cross_check_lane_v1` (`api/internal/capability`: add to `protocolVocabulary` and `protocolOrder`) only when the lane is on, and its slot count on register (`max_cross_check_slots`, next to `max_concurrent_runs` in `client.register()`).
+- `agent/src/client.ts`: `claimCrossCheck()` posts `/api/worker/runs/claim?lane=cross_check`, 204 = idle.
+
+### Claim (api)
+
+- `WorkerClaim` (`api/internal/handler/worker_protocol.go`) gains `case "cross_check"` in its lane switch; the default case's 400 lists the new lane. `laneWorkerRouteGuard` (`worker_lane_routes.go`) answers an isolated-lane worker 204 on it, as it does for `?lane=chat`.
+- `workers.max_cross_check_slots INT NULL`, written by `RegisterWorker` like `max_concurrent_runs`, accepted in [0, 16], else NULL.
+- **The lane reuses the run claim and finish machinery.** `ClaimRun` (`runtime.sql`) gains a `@lane` parameter that changes only *which* runs are selected; everything else a run claim does today applies unchanged to a cross-check child: docker-repo eligibility, the active-snapshot and overflow exclusions, the claim-generation increment and released-fence clearing, credential finishing (`finishRunClaim`), custody admission and the post-claim re-checks. `ClaimChatRun` is deliberately not the model: it skips several of these (it does not increment the claim generation). Each guard the lane inherits gets a lane-side regression test; dropping one needs a written reason in this PRD, not the child being read-only.
+- **One eligibility predicate for a child**, defined once and used by `ClaimRun`, `CountOnlineWorkersClaimableForRun`, the health rungs and the provisioning queries alike. A queued `cross_check` child is claimable by:
+  - (a) on `@lane = 'cross_check'`: a worker advertising `cross_check_lane_v1`, `cross_check_v1` and the child harness's capability set as `ClaimRun` already requires it, with a free lane slot (`active cross-checks < max_cross_check_slots`), subject to affinity and draining below; or
+  - (b) on the run lane, **plan-stage children only**: a worker advertising `cross_check_v1` but not `cross_check_lane_v1` (an older image during a roll), consuming an ordinary run slot exactly as PRD #2149 ships. A lane-aware claimant never takes a child on the run lane. Code-stage children (PRD #2170) are never claimable through (b).
+- **Affinity.** The child is created (PRD #2149's create closure) with `runs.worker_id` set to the lead's current worker, the column resume affinity already uses on queued runs. A plan-stage child admits that worker, or any eligible worker once `updated_at < now() - WORKER_AFFINITY_GRACE` (the chat lane's grace, 2 min), ordered own-first, then `fn_run_priority`, then `created_at`. A code-stage child admits only that worker, with no grace, because its snapshot exists only there. ADR-216 spread deferral does not apply on the lane; affinity replaces it.
+- **Draining.** The run lane's rule, `NOT @claimant_draining OR worker_id = @worker_id`: a cordoned worker claims only children pinned to it.
+- **Ephemeral.** A non-ephemeral claimant passes; an ephemeral claimant admits only a child whose lead is its `ephemeral_run_id`, or the child it was itself provisioned for (`r.id = @ephemeral_run_id`).
+- **Queued `worker_id` readers.** The implementation audits every reader that treats a queued run's `worker_id` as "previously claimed" (sweeper requeue, `health.go`'s `ReleasedWorkerID` rung, custody holds) and either excludes `kind = 'cross_check'` there or proves the reading harmless, with a test per reader.
+- **Run-lane load.** Every run-lane load and active-run count that excludes `chat` (about sixty predicate sites in `runtime.sql`, plus `credential_disabled.sql`) is audited: a child claimed on the lane (a) is excluded from run-lane load; a child claimed through (b) still counts as a run slot. A parity test, in the style of `runkind_sql_test.go`, enumerates those sites and fails if one excludes `chat` but not lane-claimed `cross_check` without an allowlisted reason.
+
+### Ephemeral workers and provisioning
+
+- `ListUnplaceableQueuedRunsForEphemeral` and `ListSaturationQueuedRunsForEphemeral` (`runtime.sql`, called from `api/internal/hostedsvc/ephemeral.go`) use the same eligibility predicate, lane capacity included. A code-stage child never triggers provisioning. A plan-stage child triggers it only when no worker can claim it through (a) or (b), and keeps PRD #2149's saturation behaviour otherwise; a child does not trigger provisioning while its lead's own worker (ephemeral or not) is eligible for it and has a free cross-check slot; otherwise a plan-stage child follows the existing capability-gap and saturation provisioning policy, and a code-stage child stays strictly local and never provisions. A pod provisioned for a plan-stage child claims it through its lane (`r.id = @ephemeral_run_id`).
+- The controller renders `WORKER_CROSS_CHECK_SLOTS` from a new `UZI_WORKER_CROSS_CHECK_SLOTS` (default 1, range [0, 16]) next to `WORKER_MAX_CONCURRENT_RUNS` in `controller/internal/kube/render.go`, and the chart exposes it as `workers.crossCheckSlots`. Compose sets the agent default.
+
+### Health and visibility
+
+- `health.go`'s `queuedReason` gains rungs for a `cross_check` run computed from the same predicate: no worker can ever claim it through (a) or (b) (`reasonNoCrossCheckWorker`), or every such worker is full (`reasonCrossCheckSlotsBusy`), shown on the lead as "waiting for a cross-check slot". A pre-lane worker that can take a plan-stage child through (b) counts as capable.
+- API: `apitypes.Worker` gains `active_cross_checks` and `max_cross_check_slots`. `active_runs` keeps counting the run lane, including children claimed through (b).
+- Web: `workerRunBadge()` (`web/src/lib/workerRuns.ts`) renders a second "N/M cross-checks" badge when the lane is on (via `WorkerRunBadge.tsx`, where `RunsList.tsx` and the Dashboard show worker capacity). CLI: `uzi worker list` gains a cross-checks column.
+
+### Isolation
+
+A cross-check child is read-only by construction (PRD #2149 D3, PRD #2150 D4): no `Bash`, no write tools, the Codex checker under Landlock rooted at its checkout, the Claude checker under the path guard. ADR-0042's two concurrent-run residuals therefore narrow for this lane: the child cannot write into the lead's worktree, and its tools cannot read the lead's `/proc/<pid>/environ` during the push window. It is still a live same-uid process beside the lead; on hosted k8s the uid split applies. `docs/worker-setup.md` states this where `WORKER_CROSS_CHECK_SLOTS` is documented.
+
+## Testing decisions
+
+- **Claim (LiveDB via `./e2e/run-store-it.sh`):** a lane claimant gets only `cross_check` runs; the run lane never hands a child to a lane-advertising worker; a pre-lane worker still claims plan-stage children on the run lane and each one consumes a run slot; a code-stage child is never claimed on the run lane or by another worker; a full lane is not counted as capacity by any mirror; the inherited run-claim guards (docker eligibility, overflow exclusions, claim-generation increment and released-fence clearing, credential finishing, custody admission) each hold on the lane; affinity: own worker first, another worker only after the grace; a cordoned worker claims its pinned child and nothing else; an ephemeral worker claims its own lead's child and refuses every other child; capability mirrors for Codex and custom models agree with ClaimRun. Each predicate has a mutation that removes it and reddens a case.
+- **Parity:** the `chat`/`cross_check` exclusion parity test; the queued-`worker_id` reader audit, one test per reader.
+- **Worker:** the lane pool never exceeds its cap; a non-`cross_check` claim on the lane is refused and not executed; lane off (0) advertises nothing and never polls; shutdown drains the pool.
+- **Provisioning:** a child does not trigger provisioning while its lead's own (ephemeral) worker is eligible with a free slot, and a plan-stage child does when that worker lacks the other family or its lane stays full; a child with no capable lane anywhere does.
+- **Health and UI:** both new reasons; worker badges; `uzi worker list` column.
+
+## Milestones
+
+- [ ] **M1: A worker cross-checks its own leads on a dedicated lane.** Agent loop, config and advertisement; `max_cross_check_slots` column and register; the lane route and the `@lane` parameter on `ClaimRun` with the shared child-eligibility predicate (affinity per stage, draining, capability and lane-capacity mirrors); the affinity hint at child creation with the reader audit; run-lane load exclusion with the parity test and the plan-stage pre-lane fallback; health rungs; API, web and CLI capacity display; `docs/worker-setup.md`, `docs/cross-check.md`, `docs/configuration.md`, `docs/cli.md` then `task docs:sync`; `ARCHITECTURE.md` (worker lanes); an ADR for the lane seam (adr/2169-cross-check-lane.md); CHANGELOG. Blocked by: PRD #2149 M2. Gates: `task gate:api`, `task gate:agent`, `task gate:web`, LiveDB via `./e2e/run-store-it.sh`, `task gate:repo`.
+- [ ] **M2: Ephemeral and hosted.** The ephemeral lane predicate, provisioning placeability, controller env and chart value, `deploy/` docs, CHANGELOG. Blocked by: M1. Gates: as M1, plus `task gate:controller`.
+
+No `.github/workflows/**` change in implementation or validation.
+
+## Acceptance (hosted k8s, maintainer-owned)
+
+On the hosted fleet with ephemeral workers off: a cap-1 persistent worker cross-checks its own lead's plan with no other worker online; two leads on one worker are checked one after the other; a cordoned worker finishes its lead's check. With ephemeral workers on: a lead's own pod checks it and no extra pod is provisioned. Record the worker pod's peak memory with a lead and a Codex checker running together, as the evidence for keeping or raising the default of 1. Implementation may merge before acceptance; the PRD moves to `prds/done/` only after it.
+
+## Decision Log
+
+- **D1. A separate lane with its own cap, not a higher run cap.** User decision 2026-10-03. The chat lane is the precedent (`chatClaimLoop`, `ClaimChatRun`, `WORKER_CHAT_SESSIONS`); judge and task-review claims take ordinary run slots and are not a lane precedent. A higher run cap lets leads fill the new slots, opens ADR-0042's residuals for write-capable siblings, and adds memory pressure with #2127 unexplained.
+- **D2. Default one slot.** User decision 2026-10-03. A lead has at most one pending child per stage, a check takes minutes against a 30-minute deadline, and the pod's memory headroom with a concurrent Codex checker is unmeasured. Acceptance records it before any raise.
+- **D3. Prefer the lead's own worker through `runs.worker_id`.** Reuses resume affinity and the draining rule (a cordoned worker re-claims only runs pinned to it) instead of a new placement column; the grace is the chat lane's, since a waiting lead needs a fast fallback, not the run lane's two-hour ceiling.
+- **D4. Off the run lane only for lane-aware claimants.** A mixed fleet during a roll keeps PRD #2149's behaviour on older workers, so nothing strands while the worker image catches up (the worker pin is decoupled from app releases).
+- **D5. An ephemeral worker serves its own lead's child.** Without it every ephemeral lead would provision a second pod for each check. The exception is limited to children whose lead is the pod's bound run.
+- **D6. The lane is a selection parameter on `ClaimRun`, not a separate chat-style query.** A child must keep every guarantee a run claim gives today (docker eligibility, overflow exclusions, claim generation and fences, credential finishing, custody); `ClaimChatRun` skips several, so copying its shape would silently drop them.
+- **D7. One child-eligibility predicate shared by claim, health and provisioning.** Separate mirrors drifted in the first draft (provisioning ignored a full lane, health ignored the pre-lane fallback); one definition, used everywhere, keeps "can this child run?" answered the same way.
