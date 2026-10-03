@@ -22,90 +22,6 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
-### Added
-
-- **Review a terminal run's incidental findings and preview filing text in the CLI.**
-  Terminal run pages link to their filtered to-triage findings for grouped filing; `uzi findings draft <finding-id> [<finding-id>...]` previews the server's single or grouped issue draft without filing. Group previews omit the filing-time operation marker, so filing may trim evidence at a UTF-8-safe boundary to fit it; draft labels are suggestions, while unedited CLI filing sends explicit ids and the server applies its mandatory marker label.
-
-- **Stored credentials have an explicit Test action, and a rejected Anthropic token is remembered ([#1988](https://github.com/vtmocanu/uzi/issues/1988)).**
-  Settings and `uzi token test <label> [--kind anthropic|codex|openai-key]` check one enabled credential without exposing it and answer `ok`, `rejected`, `permission_denied` or `inconclusive`: Anthropic tries Usage first and may send a small Messages request when probing is enabled, a linked Codex login gets a show-only usage read, and an OpenAI API key is checked against `GET /v1/models` (endpoint access only, not inference or billing). An Anthropic probe 401/403 now records the token as `rejected` until a successful usage reading, a successful Test (including a Messages check that returns no usage meters), a replaced value, or a disable/re-enable clears it; a rejected token is excluded from auto-selection, including the last-resort pooled-token floor, and `uzi token list` and the web show it.
-
-- **A repo's `.codex/agents/*.toml` agents are now offered at the plan gate, alongside `.claude/agents/*.md` ([#2085](https://github.com/vtmocanu/uzi/issues/2085)).**
-  The worker reads the run's native folder (Claude runs prefer `.claude/agents`, Codex runs prefer `.codex/agents`) and falls back to the other only when the native folder is absent; a present native folder is final even if empty or invalid, and the two are never merged. A TOML agent needs a string `name`, `description` and `developer_instructions` (the prompt) and takes no tools or model; files declaring `features`, `skills`, `sandbox_mode` or `tools` are skipped with a note because uzi cannot honour those restrictions yet. Files are read through a no-symlink, handle-checked path, so on a platform without Linux `/proc` nothing is read. The gate card, run view and feed show the source folder; an API older than the worker does not record it and the UI shows `.claude/agents`. `.codex/config.toml` `[agents]` and other tools' folders are not read.
-
-- **PR descriptions uzi writes can include a small Mermaid diagram where the change warrants one ([#1840](https://github.com/vtmocanu/uzi/issues/1840)).**
-  The worker renders a flowchart or sequence diagram from structured fields (at most 1,500 bytes, after "What changed"); the api validates the structure and sanitizes every label, and drops the diagram when a label carries an issue-closing directive or a mention. A description that would exceed the region or body cap is retried without the diagram first. The run page and `uzi run get` show the diagram as a plain-text outline only when one was published.
-
-- **A Claude run that opens a PR can now leave a private decisions memo that the next MR rework on that PR starts from, behind a new admin setting that is off by default ([#2083](https://github.com/vtmocanu/uzi/issues/2083)).**
-  With `decisions_memo_enabled` set to `true` (through `PUT /api/admin/settings`; there is no Admin Settings control), a run that publishes its merge request may save a memo of at most 8 KiB (decisions and rejected alternatives, relevant files, validation commands and results, open risks), stored with the run and scoped to its owner; it never goes into the PR description, and uzi never logs the stored memo or the tool call that saves it (the lead can still quote an injected memo in its own messages). A later MR rework on the same PR (same owner, repo, branch and MR) gets the latest memo in its planning prompt as untrusted, advisory, possibly stale context, so current review comments and the code win, and the activity shows `decisions memo injected (N bytes)` when the memo is actually placed in the lead's prompt and `decisions memo saved (N bytes)` when a memo is saved. A failed, held or unpublished round never replaces the prior memo, no memo or any fetch problem means a normal fresh rework, turning the setting off stops new writes and injection but keeps stored memos, and Codex runs neither write nor receive one. This is an experiment to decide the next step of PRD #1214, not a shipped benefit: the measurement runbook is in [MR review rework](docs/mr-review-watcher.md#decisions-memo-experiment).
-
-### Fixed
-
-- **A completion `continue` decision whose guidance contains a NUL byte no longer fails ([#1728](https://github.com/vtmocanu/uzi/issues/1728)).**
-  The guidance is NUL-stripped before it is stored, as the partial/accept reason already was, so the decision applies instead of erroring with SQLSTATE 22021 (which, on a paused run, left it blocked); web and CLI both benefit.
-
-- **The TUI run detail no longer overflows the terminal by a row when a pause line is shown ([#1791](https://github.com/vtmocanu/uzi/issues/1791)).**
-  A paused run, a run with a pending pause request, or a credential-disabled hold draws its pause line in its own row, but the transcript height budget did not count it, so the frame came out one row taller than the terminal (a usage-limit park that also carried a pending pause drew both lines); the budget now charges the pause row.
-
-- **A Codex run whose owner's vault locks during a long turn now parks instead of failing ([#1789](https://github.com/vtmocanu/uzi/issues/1789)).**
-  When the Codex app-server asks for a credential refresh mid-turn and the api answers that the owner's vault is locked, the worker now recognises that answer, ends the turn, and parks the run as `recovery_wait` with cause `vault_locked`, with its work captured and custody kept, exactly like a lock hit at a checkpoint or finalize. After the lock the refresh bridge and the checkpoint and finalize reconciles make no further credential call, so the single-use refresh token is not spent twice, and the run resumes on the ordinary recovery timer once the vault is unlocked. A cancel or shutdown still takes precedence. Other refresh failures behave as before. While a plan is awaiting approval the run cannot park, so a lock reached by a plan revise turn does not defer the run: that turn fails only if the turn itself fails, and if it still completes the run continues (later refreshes in that same plan round are refused without an api call) and a lock after approval parks as above.
-
-- **A refused Codex wall-clock park no longer re-drives the turn on a reaped provider root ([#1782](https://github.com/vtmocanu/uzi/issues/1782)).**
-  When a Codex run's wall-clock park is refused because the owner extended, the runner's capture may already have reaped the provider root and closed its registry, so the re-driven turn (including one that follows a declined completion hold and then a refused wall park) now runs on a freshly recreated provider epoch that resumes the same thread instead of failing at provider admission. Until that fresh epoch has launched its provider, it saves nothing, so a pause or park that stops the run first keeps the session saved before the park.
-
-- **Codex launches exclude the writable worker toolchain from PATH ([#2129](https://github.com/vtmocanu/uzi/issues/2129)).**
-  The provider launch uses only system directories, keeping runner-owned toolchain entries out of credentialed executable lookup; Codex commands retain their GNU toolchain precedence.
-
-- **Failed delegated Codex children now report their provider error category ([#2121](https://github.com/vtmocanu/uzi/issues/2121)).**
-  The lead and run feed show a closed category such as `transport` for `serverOverloaded` instead of only a generic failure; no provider text is exposed.
-
-- **Work after a declined pause is again captured by time-based checkpoints ([#1785](https://github.com/vtmocanu/uzi/issues/1785)).**
-  Declining a pause leaves subsequent work eligible for the next time-based checkpoint.
-
-- **A resumed Codex run no longer fails when an earlier, crashed attempt left its provider directory behind ([#2126](https://github.com/vtmocanu/uzi/issues/2126)).**
-  Each run attempt now names its provider directories with its own random prefix, so a directory left by an attempt that was killed (for example by an out-of-memory kill) can no longer collide with a later attempt's `codex-data/epoch-N` and fail it with `File exists`. The directory is still created exclusively, and leftover directories are kept for inspection until the run's home is removed.
-
-- **Codex commands resolve the worker's GNU toolchain before BusyBox ([#2122](https://github.com/vtmocanu/uzi/issues/2122)).**
-  A Codex run's command PATH now puts `/opt/uzi-toolchain/bin` first, so `stat`, `timeout` and the other coreutils are the GNU ones, matching Claude commands; the Codex launch PATH is deliberately unchanged (#2129).
-
-- **A job input download torn before the worker started reading it no longer crashes the worker ([#2019](https://github.com/vtmocanu/uzi/issues/2019)).**
-  The torn stream is now reported as an integrity failure instead of an uncaught exception.
-
-- **Codex runs now honour “Apply model also to agents” ([#2115](https://github.com/vtmocanu/uzi/issues/2115)).**
-  When enabled, plan agents and selected owner or repo subagents follow the resolved run model instead of their pinned model; with it off, their model pins still apply.
-
-- **Lead text follows frame origin across Claude and Codex harnesses ([#2116](https://github.com/vtmocanu/uzi/issues/2116)).**
-  Child frames displayed as lead no longer enter either harness's finalText; Claude also uses origin to request lead context only for main frames and to count subagent frames as no-progress activity, while emitted attribution and signal handling stay the same.
-
-- **A short database outage no longer signs web users out or rejects a good CLI token ([#1991](https://github.com/vtmocanu/uzi/issues/1991)).**
-  Session and CLI-token authentication now answer 503 instead of 401 when the user or token lookup fails for a reason other than a missing row, so the CLI exits 6 (retry) rather than 3 (re-authenticate). On initial load the web app shows a "Can't reach the server" panel that retries every 5 seconds and on demand, instead of redirecting to /login.
-
-- **Codex transient retry backoff respects the remaining wall budget, and agent CI reruns select fresh shard reports ([#2111](https://github.com/vtmocanu/uzi/issues/2111)).**
-  Early timer wakes no longer finish a wall-capped backoff with budget left for an extra provider turn. CI stores reports separately for each attempt and checks the latest available report independently for each shard, so partial reruns cannot use a stale M4 completion marker.
-
-- **Fetch credentials are now scrubbed from API text and CI failure log tails ([#2035](https://github.com/vtmocanu/uzi/issues/2035)).**
-  The outbound text and issue draft scrubbers replace recognized `uzf_` credentials, and the CI failure snapshot scrubber replaces them in log tails.
-
-- **A lost wall-park response no longer fails or discards a resumable Codex run ([#2042](https://github.com/vtmocanu/uzi/issues/2042)).**
-  The worker retries an uncertain park and checks claim ownership before finalizing; late failure reports cannot end a wall or completion hold, and an abandoned timed run remains eligible for server wall parking even at the requeue cap.
-
-- **Admin Health no longer expects a controller when chart hosting is disabled ([#1982](https://github.com/vtmocanu/uzi/issues/1982)).**
-  The chart emits HOSTED_WORKER_VERSION only when workers.enabled is true, so an installation with no hosted workers does not show a false controller-report Danger banner after startup. External worker upgrade targets are unaffected.
-
-- **The standalone worker setup command now supports hardened startup ([#1987](https://github.com/vtmocanu/uzi/issues/1987)).**
-  The documented build uses the repository root as its context, and the run command grants only the five capabilities required by the entrypoint while retaining no-new-privileges. The join token is delivered through a file instead of the worker's environment.
-
-### Changed
-
-- **Feature-bingo and refactor-scout schedules now default to issues ([#2145](https://github.com/vtmocanu/uzi/issues/2145)).**
-  New enablements, catalog resets, and `uzi schedule reset` use issues; existing schedules with a NULL mode inherit that default on their next fire, while schedules with a stored `mr` or `issues` mode keep their choice. No migration is needed, and both proposal prompt bodies are unchanged.
-
-- **The lead agent now triages validator notes before reworking ([#2012](https://github.com/vtmocanu/uzi/issues/2012)).**
-  Only blocking findings, security findings graded Medium or above, and demonstrated correctness, acceptance-criterion, data-integrity or safety-invariant violations are reworked; fixes stay minimal, a new design is re-planned instead of folded into a rework, and re-review is scoped to the fix range. Other notes are recorded as grouped `deferred` scope notes rather than incidental findings. Pristine installs pick it up on the next boot; customized lead templates are untouched.
-
-- **Admin product-token inventory filters by owner and product ([#1935](https://github.com/vtmocanu/uzi/issues/1935)).**
-  The admin Products page and `GET /api/admin/product-tokens` accept an owner and a product filter, applied before the 1000-row bound, so an older active token cut from the unfiltered inventory can still be found and revoked.
-
 ## [0.85.0] - 2026-09-26
 
 ### Added
@@ -187,6 +103,21 @@ through `[0.52.0]`.)
 
 - **The OAuth token endpoint has its own rate limit ([#1910](https://github.com/vtmocanu/uzi/issues/1910)).**
   `OAUTH_RATE_LIMIT_MAX` requests per `OAUTH_RATE_LIMIT_WINDOW` (default 60 per minute) apply to `POST /api/oauth/token` and `POST /api/oauth/revoke`, once per client IP on every request and once per product after its client authentication succeeds (failed authentication spends only the per-IP budget). The per-product budget is a single bucket shared by all of that product's users, so raise `OAUTH_RATE_LIMIT_MAX` for a busy multi-user product. An over-limit request is answered 429 `temporarily_unavailable` with `Retry-After`.
+
+- **Review a terminal run's incidental findings and preview filing text in the CLI.**
+  Terminal run pages link to their filtered to-triage findings for grouped filing; `uzi findings draft <finding-id> [<finding-id>...]` previews the server's single or grouped issue draft without filing. Group previews omit the filing-time operation marker, so filing may trim evidence at a UTF-8-safe boundary to fit it; draft labels are suggestions, while unedited CLI filing sends explicit ids and the server applies its mandatory marker label.
+
+- **Stored credentials have an explicit Test action, and a rejected Anthropic token is remembered ([#1988](https://github.com/vtmocanu/uzi/issues/1988)).**
+  Settings and `uzi token test <label> [--kind anthropic|codex|openai-key]` check one enabled credential without exposing it and answer `ok`, `rejected`, `permission_denied` or `inconclusive`: Anthropic tries Usage first and may send a small Messages request when probing is enabled, a linked Codex login gets a show-only usage read, and an OpenAI API key is checked against `GET /v1/models` (endpoint access only, not inference or billing). An Anthropic probe 401/403 now records the token as `rejected` until a successful usage reading, a successful Test (including a Messages check that returns no usage meters), a replaced value, or a disable/re-enable clears it; a rejected token is excluded from auto-selection, including the last-resort pooled-token floor, and `uzi token list` and the web show it.
+
+- **A repo's `.codex/agents/*.toml` agents are now offered at the plan gate, alongside `.claude/agents/*.md` ([#2085](https://github.com/vtmocanu/uzi/issues/2085)).**
+  The worker reads the run's native folder (Claude runs prefer `.claude/agents`, Codex runs prefer `.codex/agents`) and falls back to the other only when the native folder is absent; a present native folder is final even if empty or invalid, and the two are never merged. A TOML agent needs a string `name`, `description` and `developer_instructions` (the prompt) and takes no tools or model; files declaring `features`, `skills`, `sandbox_mode` or `tools` are skipped with a note because uzi cannot honour those restrictions yet. Files are read through a no-symlink, handle-checked path, so on a platform without Linux `/proc` nothing is read. The gate card, run view and feed show the source folder; an API older than the worker does not record it and the UI shows `.claude/agents`. `.codex/config.toml` `[agents]` and other tools' folders are not read.
+
+- **PR descriptions uzi writes can include a small Mermaid diagram where the change warrants one ([#1840](https://github.com/vtmocanu/uzi/issues/1840)).**
+  The worker renders a flowchart or sequence diagram from structured fields (at most 1,500 bytes, after "What changed"); the api validates the structure and sanitizes every label, and drops the diagram when a label carries an issue-closing directive or a mention. A description that would exceed the region or body cap is retried without the diagram first. The run page and `uzi run get` show the diagram as a plain-text outline only when one was published.
+
+- **A Claude run that opens a PR can now leave a private decisions memo that the next MR rework on that PR starts from, behind a new admin setting that is off by default ([#2083](https://github.com/vtmocanu/uzi/issues/2083)).**
+  With `decisions_memo_enabled` set to `true` (through `PUT /api/admin/settings`; there is no Admin Settings control), a run that publishes its merge request may save a memo of at most 8 KiB (decisions and rejected alternatives, relevant files, validation commands and results, open risks), stored with the run and scoped to its owner; it never goes into the PR description, and uzi never logs the stored memo or the tool call that saves it (the lead can still quote an injected memo in its own messages). A later MR rework on the same PR (same owner, repo, branch and MR) gets the latest memo in its planning prompt as untrusted, advisory, possibly stale context, so current review comments and the code win, and the activity shows `decisions memo injected (N bytes)` when the memo is actually placed in the lead's prompt and `decisions memo saved (N bytes)` when a memo is saved. A failed, held or unpublished round never replaces the prior memo, no memo or any fetch problem means a normal fresh rework, turning the setting off stops new writes and injection but keeps stored memos, and Codex runs neither write nor receive one. This is an experiment to decide the next step of PRD #1214, not a shipped benefit: the measurement runbook is in [MR review rework](docs/mr-review-watcher.md#decisions-memo-experiment).
 
 ### Changed
 
@@ -270,6 +201,15 @@ through `[0.52.0]`.)
 - **Built-in agents synced to skills v0.44.0** ([#2086](https://github.com/vtmocanu/uzi/pull/2086)). The architect (v12) consults a `dba` database specialist on schema, index, transaction and migration decisions when the team has one, and the reviewer (v19) asks for it when correctness depends on database behaviour instead of certifying that behaviour without evidence.
 - **Routine dependency bumps: `gitlab.com/gitlab-org/api/client-go/v3` to v3.14.0 ([#2000](https://github.com/vtmocanu/uzi/pull/2000)) and the Kubernetes client libraries (`k8s.io/api`, `apimachinery`, `client-go`) to v0.37.1 in the controller ([#1996](https://github.com/vtmocanu/uzi/pull/1996)), and `charm.land/bubbletea/v2` to v2.0.10 for the CLI ([#2161](https://github.com/vtmocanu/uzi/pull/2161)).**
   No uzi code change required.
+
+- **Feature-bingo and refactor-scout schedules now default to issues ([#2145](https://github.com/vtmocanu/uzi/issues/2145)).**
+  New enablements, catalog resets, and `uzi schedule reset` use issues; existing schedules with a NULL mode inherit that default on their next fire, while schedules with a stored `mr` or `issues` mode keep their choice. No migration is needed, and both proposal prompt bodies are unchanged.
+
+- **The lead agent now triages validator notes before reworking ([#2012](https://github.com/vtmocanu/uzi/issues/2012)).**
+  Only blocking findings, security findings graded Medium or above, and demonstrated correctness, acceptance-criterion, data-integrity or safety-invariant violations are reworked; fixes stay minimal, a new design is re-planned instead of folded into a rework, and re-review is scoped to the fix range. Other notes are recorded as grouped `deferred` scope notes rather than incidental findings. Pristine installs pick it up on the next boot; customized lead templates are untouched.
+
+- **Admin product-token inventory filters by owner and product ([#1935](https://github.com/vtmocanu/uzi/issues/1935)).**
+  The admin Products page and `GET /api/admin/product-tokens` accept an owner and a product filter, applied before the 1000-row bound, so an older active token cut from the unfiltered inventory can still be found and revoked.
 
 ### Fixed
 
@@ -456,6 +396,60 @@ through `[0.52.0]`.)
   CI now uses semgrep 1.172.0, matching the worker toolchain lock. The repository gate rejects version drift and fails closed when either pin cannot be resolved, so an independent CI update cannot silently change the SAST engine.
 - **A CI auto-fix or MR rework halt DM that Slack failed to take is now retried until it reaches you, instead of being lost ([#1675](https://github.com/vtmocanu/uzi/issues/1675)).**
   The "CI auto-fix stopped" and "MR rework stopped" DMs were sent once, best-effort, so a full Slack queue or a Slack error dropped them silently; this mattered most for a scheduled prompt MR with no backing issue, where the DM is the only signal. The notification now stores its rendered DM and is marked delivered on a successful post (or when you have no confirmed Slack link); an undelivered one is re-queued every 5 minutes for up to about 24 hours, after which uzi gives up. The forge halt comment is still posted at most once. A rare duplicate DM is possible, and a DM delayed by a Slack outage can arrive after the halt no longer applies. Other notification kinds are unchanged.
+
+- **A completion `continue` decision whose guidance contains a NUL byte no longer fails ([#1728](https://github.com/vtmocanu/uzi/issues/1728)).**
+  The guidance is NUL-stripped before it is stored, as the partial/accept reason already was, so the decision applies instead of erroring with SQLSTATE 22021 (which, on a paused run, left it blocked); web and CLI both benefit.
+
+- **The TUI run detail no longer overflows the terminal by a row when a pause line is shown ([#1791](https://github.com/vtmocanu/uzi/issues/1791)).**
+  A paused run, a run with a pending pause request, or a credential-disabled hold draws its pause line in its own row, but the transcript height budget did not count it, so the frame came out one row taller than the terminal (a usage-limit park that also carried a pending pause drew both lines); the budget now charges the pause row.
+
+- **A Codex run whose owner's vault locks during a long turn now parks instead of failing ([#1789](https://github.com/vtmocanu/uzi/issues/1789)).**
+  When the Codex app-server asks for a credential refresh mid-turn and the api answers that the owner's vault is locked, the worker now recognises that answer, ends the turn, and parks the run as `recovery_wait` with cause `vault_locked`, with its work captured and custody kept, exactly like a lock hit at a checkpoint or finalize. After the lock the refresh bridge and the checkpoint and finalize reconciles make no further credential call, so the single-use refresh token is not spent twice, and the run resumes on the ordinary recovery timer once the vault is unlocked. A cancel or shutdown still takes precedence. Other refresh failures behave as before. While a plan is awaiting approval the run cannot park, so a lock reached by a plan revise turn does not defer the run: that turn fails only if the turn itself fails, and if it still completes the run continues (later refreshes in that same plan round are refused without an api call) and a lock after approval parks as above.
+
+- **A refused Codex wall-clock park no longer re-drives the turn on a reaped provider root ([#1782](https://github.com/vtmocanu/uzi/issues/1782)).**
+  When a Codex run's wall-clock park is refused because the owner extended, the runner's capture may already have reaped the provider root and closed its registry, so the re-driven turn (including one that follows a declined completion hold and then a refused wall park) now runs on a freshly recreated provider epoch that resumes the same thread instead of failing at provider admission. Until that fresh epoch has launched its provider, it saves nothing, so a pause or park that stops the run first keeps the session saved before the park.
+
+- **Codex launches exclude the writable worker toolchain from PATH ([#2129](https://github.com/vtmocanu/uzi/issues/2129)).**
+  The provider launch uses only system directories, keeping runner-owned toolchain entries out of credentialed executable lookup; Codex commands retain their GNU toolchain precedence.
+
+- **Failed delegated Codex children now report their provider error category ([#2121](https://github.com/vtmocanu/uzi/issues/2121)).**
+  The lead and run feed show a closed category such as `transport` for `serverOverloaded` instead of only a generic failure; no provider text is exposed.
+
+- **Work after a declined pause is again captured by time-based checkpoints ([#1785](https://github.com/vtmocanu/uzi/issues/1785)).**
+  Declining a pause leaves subsequent work eligible for the next time-based checkpoint.
+
+- **A resumed Codex run no longer fails when an earlier, crashed attempt left its provider directory behind ([#2126](https://github.com/vtmocanu/uzi/issues/2126)).**
+  Each run attempt now names its provider directories with its own random prefix, so a directory left by an attempt that was killed (for example by an out-of-memory kill) can no longer collide with a later attempt's `codex-data/epoch-N` and fail it with `File exists`. The directory is still created exclusively, and leftover directories are kept for inspection until the run's home is removed.
+
+- **Codex commands resolve the worker's GNU toolchain before BusyBox ([#2122](https://github.com/vtmocanu/uzi/issues/2122)).**
+  A Codex run's command PATH now puts `/opt/uzi-toolchain/bin` first, so `stat`, `timeout` and the other coreutils are the GNU ones, matching Claude commands; the Codex launch PATH is deliberately unchanged ([#2129](https://github.com/vtmocanu/uzi/pull/2129)).
+
+- **A job input download torn before the worker started reading it no longer crashes the worker ([#2019](https://github.com/vtmocanu/uzi/issues/2019)).**
+  The torn stream is now reported as an integrity failure instead of an uncaught exception.
+
+- **Codex runs now honour “Apply model also to agents” ([#2115](https://github.com/vtmocanu/uzi/issues/2115)).**
+  When enabled, plan agents and selected owner or repo subagents follow the resolved run model instead of their pinned model; with it off, their model pins still apply.
+
+- **Lead text follows frame origin across Claude and Codex harnesses ([#2116](https://github.com/vtmocanu/uzi/issues/2116)).**
+  Child frames displayed as lead no longer enter either harness's finalText; Claude also uses origin to request lead context only for main frames and to count subagent frames as no-progress activity, while emitted attribution and signal handling stay the same.
+
+- **A short database outage no longer signs web users out or rejects a good CLI token ([#1991](https://github.com/vtmocanu/uzi/issues/1991)).**
+  Session and CLI-token authentication now answer 503 instead of 401 when the user or token lookup fails for a reason other than a missing row, so the CLI exits 6 (retry) rather than 3 (re-authenticate). On initial load the web app shows a "Can't reach the server" panel that retries every 5 seconds and on demand, instead of redirecting to /login.
+
+- **Codex transient retry backoff respects the remaining wall budget, and agent CI reruns select fresh shard reports ([#2111](https://github.com/vtmocanu/uzi/issues/2111)).**
+  Early timer wakes no longer finish a wall-capped backoff with budget left for an extra provider turn. CI stores reports separately for each attempt and checks the latest available report independently for each shard, so partial reruns cannot use a stale M4 completion marker.
+
+- **Fetch credentials are now scrubbed from API text and CI failure log tails ([#2035](https://github.com/vtmocanu/uzi/issues/2035)).**
+  The outbound text and issue draft scrubbers replace recognized `uzf_` credentials, and the CI failure snapshot scrubber replaces them in log tails.
+
+- **A lost wall-park response no longer fails or discards a resumable Codex run ([#2042](https://github.com/vtmocanu/uzi/issues/2042)).**
+  The worker retries an uncertain park and checks claim ownership before finalizing; late failure reports cannot end a wall or completion hold, and an abandoned timed run remains eligible for server wall parking even at the requeue cap.
+
+- **Admin Health no longer expects a controller when chart hosting is disabled ([#1982](https://github.com/vtmocanu/uzi/issues/1982)).**
+  The chart emits HOSTED_WORKER_VERSION only when workers.enabled is true, so an installation with no hosted workers does not show a false controller-report Danger banner after startup. External worker upgrade targets are unaffected.
+
+- **The standalone worker setup command now supports hardened startup ([#1987](https://github.com/vtmocanu/uzi/issues/1987)).**
+  The documented build uses the repository root as its context, and the run command grants only the five capabilities required by the entrypoint while retaining no-new-privileges. The join token is delivered through a file instead of the worker's environment.
 
 ## [0.84.0] - 2026-09-26
 
