@@ -2845,6 +2845,377 @@ describe("mid-turn checkpoint round 4: deferred publish vs shutdown (issue #1597
   });
 });
 
+describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", () => {
+  it("publishes a later tick after a real pause input aborted the shared controller", async () => {
+    const tmp = scratchDir("pause-rearm");
+    const shim = writeShim(tmp, "detect");
+    const ctl = control();
+    const claim = gitlabClaim(1785_201);
+    const pub = stubPublish(async (n, _tip, pack) => {
+      await drain(pack);
+      return n === 0 ? { ok: false, httpStatus: 500 } : LANDED;
+    });
+    let laterTip = "";
+    try {
+      await mkRunner(
+        mkGit(fx.dataDir, shim),
+        turn(async (ctx) => {
+          commitIn(ctx.worktreePath, "before.txt", "before\n");
+          api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
+          await waitAbort(ctx.signal!);
+          assert.equal(ctx.signal!.aborted, true);
+          assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+          laterTip = commitIn(ctx.worktreePath, "after.txt", "after\n");
+          ctl.advance(INTERVAL_MS + 1);
+          assert.equal(await ctl.fire(), "published");
+        }),
+        ctl,
+      ).execute(claim);
+      assert.equal(finalStatus(claim.run_id), "completed");
+      assert.equal(pub.tips.at(-1), laterTip);
+      assert.equal(pub.count(), 2);
+    } finally {
+      pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("captures a new Codex commit on a tick after a real pause is declined", async () => {
+    const tmp = scratchDir("codex-pause-rearm");
+    const codex = fakeCodex();
+    const ctl = control();
+    const claim = gitlabClaim(1785_203);
+    const pub = stubPublish(async (n, _tip, pack) => {
+      await drain(pack);
+      return n === 0 ? { ok: false, httpStatus: 500 } : LANDED;
+    });
+    let sha = "";
+    try {
+      await mkRunner(mkGit(fx.dataDir, writeShim(tmp, "detect")), () => ({
+        executor: {
+          run: async (ctx: RunContext) => {
+            await recordingTurnErrors(async () => {
+              commitIn(ctx.worktreePath, "before-codex-pause.txt", "before\\n");
+              api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
+              await waitAbort(ctx.signal!);
+              assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+              sha = commitIn(ctx.worktreePath, "codex-after.txt", "after\\n");
+              assert.equal(pub.count(), 1, "the post-pause commit has not been published");
+              ctl.advance(INTERVAL_MS + 1);
+              assert.equal(await ctl.fire(), "published");
+            });
+            return { branch: ctx.branch };
+          },
+          safety: codex.safety,
+        },
+      }), ctl).execute(claim);
+      assert.equal(finalStatus(claim.run_id), "completed", JSON.stringify(turnErrors.map(String)));
+      assert.deepEqual(codex.boundaryErrors, []);
+      assert.equal(pub.tips.at(-1), sha);
+    } finally {
+      pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("publishes a deferred Codex milestone immediately after a declined pause with no ticker", async () => {
+    const tmp = scratchDir("codex-pause-notick");
+    const codex = fakeCodex();
+    const claim = gitlabClaim(1785_204);
+    const outsidePermit: boolean[] = [];
+    const pub = stubPublish(async (n, _tip, pack) => {
+      outsidePermit.push(!codex.inPermit());
+      await drain(pack);
+      return n === 0 ? { ok: false, httpStatus: 500 } : LANDED;
+    });
+    let sha = "";
+    let atReturn = -1;
+    try {
+      await mkRunner(mkGit(fx.dataDir, writeShim(tmp, "detect")), () => ({
+        executor: {
+          run: async (ctx: RunContext) => {
+            await recordingTurnErrors(async () => {
+              commitIn(ctx.worktreePath, "before-codex-notick.txt", "before\\n");
+              api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
+              await waitAbort(ctx.signal!);
+              assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+              sha = commitIn(ctx.worktreePath, "codex-notick.txt", "after\\n");
+              await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+              atReturn = pub.count();
+            });
+            return { branch: ctx.branch };
+          },
+          safety: codex.safety,
+        },
+      }), undefined, { checkpointTickIntervalMs: 0 }).execute(claim);
+      assert.equal(finalStatus(claim.run_id), "completed");
+      assert.equal(atReturn, 2);
+      assert.equal(pub.tips.at(-1), sha);
+      assert.deepEqual(outsidePermit, [true, true]);
+    } finally {
+      pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  for (const stop of ["cancel", "shutdown"] as const) {
+    it(`${stop === "cancel" ? "exposes sticky cancel to the executor" : "honors shutdown"} after a spent pause and aborts an entered restarted tick`, async () => {
+      const tmp = scratchDir(`pause-${stop}-sticky`);
+      const ctl = control();
+      const codex = fakeCodex();
+      const claim = gitlabClaim(stop === "cancel" ? 1785_207 : 1785_208);
+      const entered = deferred();
+      const landedTips: string[] = [];
+      let owedSha = "";
+      const pub = stubPublish(async (n, tip, pack, signal) => {
+        if (n === 1) {
+          entered.resolve();
+          return hangUntilAborted(pack, signal);
+        }
+        await drain(pack);
+        if (n > 0) landedTips.push(tip);
+        return n === 0 ? { ok: false, httpStatus: 500 } : LANDED;
+      });
+      let runner: RunRunner | undefined;
+      try {
+        runner = mkRunner(mkGit(fx.dataDir, writeShim(tmp, "detect")), () => ({
+          executor: {
+            run: async (ctx: RunContext) => {
+              await recordingTurnErrors(async () => {
+                commitIn(ctx.worktreePath, "before-sticky.txt", "before\\n");
+                api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
+                await waitAbort(ctx.signal!);
+                assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+                owedSha = commitIn(ctx.worktreePath, "after-sticky.txt", "after\\n");
+                await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+                assert.equal(pub.count(), 1, "the Codex milestone still owes its publish");
+                ctl.fireNoWait();
+                await bounded(entered.promise, TEARDOWN_MS, "restarted tick publish entry");
+                const outcome = ctl.nextOutcome();
+                if (stop === "cancel") {
+                  api.setInputs(claim.run_id, [{ id: 2, kind: "cancel" }]);
+                } else {
+                  runner!.shutdown();
+                }
+                assert.equal(await bounded(outcome, TEARDOWN_MS, "restarted tick abort"), "aborted");
+                if (stop === "cancel") {
+                  assert.equal(ctx.cancelRequested?.(), true, "the executor sees the sticky cancel after the spent abort");
+                }
+                assert.equal(pub.count(), 2, "the owed publish was aborted, with no later delivery");
+              });
+              return { branch: ctx.branch };
+            },
+            safety: codex.safety,
+          },
+        }), ctl);
+        await runner.execute(claim);
+        if (stop === "cancel") {
+          // This stub returns normally; the SDK, not this stub, turns the sticky flag into a cancel.
+          assert.equal(finalStatus(claim.run_id), "completed", "the stub's normal return completes the run");
+        }
+        assert.equal(pub.count(), 2);
+        assert.ok(!landedTips.includes(owedSha), "the aborted deferred milestone never landed");
+      } finally {
+        await settleAndClean({ ctl, runners: runner ? [runner] : [], restore: pub.restore, paths: [tmp] });
+      }
+    });
+  }
+
+  for (const interrupt of ["now", "switch"] as const) {
+    it(`aborts an entered restarted tick on a second ${interrupt} interrupt${interrupt === "switch" ? " and gives up the switch in place" : ""}`, async () => {
+      const tmp = scratchDir(`pause-repeat-${interrupt}`);
+      const ctl = control();
+      const claim = gitlabClaim(interrupt === "now" ? 1785_209 : 1785_210, { claim_generation: 1 });
+      const entered = deferred();
+      const landedTips: string[] = [];
+      const pub = stubPublish(async (n, tip, pack, signal) => {
+        if (n === 1) {
+          entered.resolve();
+          return hangUntilAborted(pack, signal);
+        }
+        await drain(pack);
+        if (n > 1) landedTips.push(tip);
+        return n > 1 ? LANDED : { ok: false, httpStatus: 500 };
+      });
+      let owedSha = "";
+      const g = mkGit(fx.dataDir, writeShim(tmp, "detect"));
+      const worktreeStatus = g.worktreeStatus.bind(g);
+      let switchOutcome: "gave_up" | "released" | undefined;
+      let runner: RunRunner | undefined;
+      try {
+        runner = mkRunner(g, turn(async (ctx) => {
+          commitIn(ctx.worktreePath, "before-repeat.txt", "before\n");
+          api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
+          await waitAbort(ctx.signal!);
+          assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+          owedSha = commitIn(ctx.worktreePath, "after-repeat.txt", "after\n");
+          ctl.advance(INTERVAL_MS + 1);
+          ctl.fireNoWait();
+          await bounded(entered.promise, TEARDOWN_MS, "restarted tick publish entry");
+          const outcome = ctl.nextOutcome();
+          if (interrupt === "now") {
+            api.setInputs(claim.run_id, [{ id: 2, kind: "pause", body: "now" }]);
+          } else {
+            api.requestCredentialSwitch(claim.run_id, 1);
+          }
+          assert.equal(await bounded(outcome, TEARDOWN_MS, "restarted tick interruption"), "aborted");
+          assert.equal(pub.count(), 2);
+          if (interrupt === "switch") {
+            // An unreadable capture cannot verify a restore point. The fake API confirms the
+            // failed-switch report, so this in-place attempt must give up and keep the claim.
+            g.worktreeStatus = async () => null;
+            try {
+              switchOutcome = await ctx.attemptCredentialSwitch!();
+            } finally {
+              g.worktreeStatus = worktreeStatus;
+            }
+            assert.equal(switchOutcome, "gave_up");
+          }
+        }), ctl, { recoveryRetryMs: 1 });
+        await runner.execute(claim);
+        assert.equal(ctl.outcomes[0], "aborted");
+        assert.equal(pub.tips[1], owedSha, "the restarted tick entered publish for the deferred commit");
+        assert.ok(!landedTips.includes(owedSha), "the interrupted deferred commit did not land");
+        if (interrupt === "switch") {
+          assert.equal(switchOutcome, "gave_up", "the executor handled the switch in place");
+          assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "credential_switch_failed"),
+            "the API acknowledged the switch give-up");
+          assert.equal(finalStatus(claim.run_id), "completed", "the old claim continued after give-up");
+        }
+      } finally {
+        await settleAndClean({ ctl, runners: runner ? [runner] : [], restore: pub.restore, paths: [tmp] });
+      }
+    });
+  }
+
+  it("settles an active tick before pause capture, then publishes a later tick", async () => {
+    const tmp = scratchDir("pause-active-tick");
+    const ctl = control();
+    const claim = gitlabClaim(1785_205);
+    const entered = deferred();
+    const order: string[] = [];
+    const g = mkGit(fx.dataDir, writeShim(tmp, "detect"));
+    let pauseRequested = false;
+    const pub = stubPublish(async (n, _tip, pack, signal) => {
+      if (n === 0) {
+        entered.resolve();
+        try { return await hangUntilAborted(pack, signal); }
+        finally { order.push("tick publish aborted"); }
+      }
+      order.push(n === 1 ? "pause publish" : "later tick publish");
+      await drain(pack);
+      return n === 1 ? { ok: false, httpStatus: 500 } : LANDED;
+    });
+    let sha = "";
+    try {
+      await mkRunner(g, turn(async (ctx) => {
+        commitIn(ctx.worktreePath, "before-active.txt", "before\\n");
+        ctl.advance(INTERVAL_MS + 1);
+        ctl.fireNoWait();
+        await bounded(entered.promise, TEARDOWN_MS, "tick publish entry");
+        api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
+        await waitAbort(ctx.signal!);
+        pauseRequested = true;
+        assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+        assert.equal(ctl.outcomes[0], "aborted", "the tick settled before the park acquired the sink");
+        sha = commitIn(ctx.worktreePath, "after-active.txt", "after\\n");
+        ctl.advance(INTERVAL_MS + 1);
+        assert.equal(await ctl.fire(), "published");
+      }), ctl, {
+        quiesceRun: async (req) => {
+          if (req.site === "pause_park" && pauseRequested) {
+            assert.equal(ctl.outcomes[0], "aborted", "the tick settled before park quiescence");
+            order.push("pause quiesce");
+          }
+          return { process: undefined, docker: { state: "not_wired", removed: [], detail: "test quiescence" } };
+        },
+      }).execute(claim);
+      assert.equal(finalStatus(claim.run_id), "completed");
+      assert.deepEqual(order, ["tick publish aborted", "pause quiesce", "pause publish", "later tick publish"]);
+      assert.equal(pub.tips.at(-1), sha);
+    } finally {
+      pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("mid-turn checkpoint lifecycle after a refused wall park (issue #1785)", () => {
+  it("publishes a later tick after real wall input and a refused park", async () => {
+    const tmp = scratchDir("wall-rearm");
+    const ctl = control();
+    const claim = gitlabClaim(1785_206, { claim_generation: 1 });
+    // A refused park finalizes only after an ownership probe proves this generation (#2042).
+    api.setOwnershipStatus(claim.run_id, "running", claim.claim_generation);
+    api.setWallParkResponse("running", 409, { total: 7200, used: 3600 });
+    const pub = stubPublish(async (_n, _tip, pack) => {
+      await drain(pack);
+      return LANDED;
+    });
+    let sha = "";
+    try {
+      await mkRunner(mkGit(fx.dataDir, writeShim(tmp, "detect")), turn(async (ctx) => {
+        commitIn(ctx.worktreePath, "before-wall.txt", "before\\n");
+        api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "wall" }]);
+        await waitAbort(ctx.signal!);
+        assert.equal(await ctx.parkForWall!({ completedCount: 0 }), "refused");
+        ctx.clearWallMode!();
+        sha = commitIn(ctx.worktreePath, "after-wall.txt", "after\\n");
+        ctl.advance(INTERVAL_MS + 1);
+        assert.equal(await ctl.fire(), "published");
+      }), ctl).execute(claim);
+      assert.equal(finalStatus(claim.run_id), "completed");
+      assert.equal(pub.tips.at(-1), sha);
+    } finally {
+      api.setWallParkResponse("paused", 200);
+      pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("mid-turn checkpoint lifecycle after a confirmed switch give-up (issue #1785)", () => {
+  it("publishes a later tick after the switch stamp clears and the in-place attempt returns", async () => {
+    const tmp = scratchDir("switch-rearm");
+    const shim = writeShim(tmp, "detect");
+    const ctl = control();
+    const claim = gitlabClaim(1785_202, { claim_generation: 1 });
+    const g = mkGit(fx.dataDir, shim);
+    const status = g.worktreeStatus.bind(g);
+    const pub = stubPublish(async (_n, _tip, pack) => {
+      await drain(pack);
+      return LANDED;
+    });
+    let laterTip = "";
+    try {
+      await mkRunner(
+        g,
+        turn(async (ctx) => {
+          commitIn(ctx.worktreePath, "before.txt", "before\n");
+          // An unreadable capture cannot verify a restore point, so the applied failed-switch
+          // report confirms give-up without releasing this claim.
+          g.worktreeStatus = async () => null;
+          api.requestCredentialSwitch(claim.run_id, 1);
+          await waitAbort(ctx.signal!);
+          assert.equal(await ctx.attemptCredentialSwitch!(), "gave_up");
+          g.worktreeStatus = status;
+          laterTip = commitIn(ctx.worktreePath, "after.txt", "after\n");
+          ctl.advance(INTERVAL_MS + 1);
+          assert.equal(await ctl.fire(), "published");
+        }),
+        ctl,
+        { recoveryRetryMs: 1 },
+      ).execute(claim);
+      assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "credential_switch_failed"));
+      assert.equal(finalStatus(claim.run_id), "completed");
+      assert.equal(pub.tips.at(-1), laterTip);
+    } finally {
+      pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("mid-turn checkpoint round 4: gate_busy quick retry (issue #1597 M2)", () => {
   it("(r4 5) an owed publish whose tick finds the sink gate busy arms ONE quick retry; a second miss waits for the normal cadence", async () => {
     const tmp = scratchDir("gateretry");
