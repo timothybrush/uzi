@@ -44,6 +44,9 @@ through `[0.52.0]`.)
 - **A completion `continue` decision whose guidance contains a NUL byte no longer fails ([#1728](https://github.com/vtmocanu/uzi/issues/1728)).**
   The guidance is NUL-stripped before it is stored, as the partial/accept reason already was, so the decision applies instead of erroring with SQLSTATE 22021 (which, on a paused run, left it blocked); web and CLI both benefit.
 
+- **The TUI run detail no longer overflows the terminal by a row when a pause line is shown ([#1791](https://github.com/vtmocanu/uzi/issues/1791)).**
+  A paused run, a run with a pending pause request, or a credential-disabled hold draws its pause line in its own row, but the transcript height budget did not count it, so the frame came out one row taller than the terminal (a usage-limit park that also carried a pending pause drew both lines); the budget now charges the pause row.
+
 - **Codex launches exclude the writable worker toolchain from PATH ([#2129](https://github.com/vtmocanu/uzi/issues/2129)).**
   The provider launch uses only system directories, keeping runner-owned toolchain entries out of credentialed executable lookup; Codex commands retain their GNU toolchain precedence.
 
