@@ -47,6 +47,8 @@
 #   8  head mismatch vs --expect-head
 #   9  the merge command returned but the PR is not MERGED (auto-merge deferred / async
 #      mergeability lag) — poll `gh pr view --json state` yourself before the CI watch
+#  10  a `chore(release):` commit's CI is still running on main: merging now would supersede
+#      it and force the release to re-cut. Wait for it (or ask its releaser), then re-run
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -206,6 +208,39 @@ if [ "$(printf '%s' "$blk" | jq 'length')" -gt 0 ]; then
   print_items "$blk"
   echo "BLOCKED: open_threads=$(printf '%s' "$ot" | jq length) code_scanning=$(printf '%s' "$cs_items" | jq length) unacknowledged=$(printf '%s' "$ua" | jq length) on #$PR — resolve each thread, fix or dismiss each alert, read each comment in full (ack-comments.sh $REPO $PR --show ID) and ack that version (ID@DIGEST); not merging"
   exit 5
+fi
+
+# ---- a release cut waiting on main CI — FAIL CLOSED -----------------------------------------
+# A merge supersedes main's in-flight runs (concurrency), so landing while a
+# `chore(release):` commit's CI runs cancels it and forces the release to re-cut (exit 10).
+# Ordinary in-flight main CI does not block. Every non-completed run is enumerated (one
+# paginated Actions query per active status, no recency window). Refuses (exit 2) on a failed
+# or empty page set, a record missing the fields the decision reads, or an incomplete listing:
+# every page's total_count must agree and equal the records fetched, and GitHub caps filtered
+# run searches at 1,000 results, so a total_count above 1000 cannot be enumerated.
+rel=""
+for st in queued in_progress waiting requested pending; do
+  pg=$(gh api --paginate --slurp "repos/$REPO/actions/runs?branch=main&status=$st&per_page=100" 2>/dev/null) \
+    || { echo "cannot read main's $st workflow runs; not merging"; exit 2; }
+  hit=$(printf '%s' "$pg" | jq -r '
+    if type != "array" or length == 0 then error("pages") else . end
+    | if all(.[]; type == "object" and (.workflow_runs|type) == "array" and (.total_count|type) == "number")
+      then . else error("page") end
+    | (.[0].total_count) as $total
+    | if all(.[]; .total_count == $total) and $total <= 1000 and ([.[].workflow_runs|length]|add) == $total
+      then . else error("incomplete") end
+    | [.[].workflow_runs[]]
+    | map(if type == "object" and (.status|type) == "string" and (.display_title|type) == "string"
+            and (.head_sha|type) == "string" and (.id|type) == "number" then . else error("record") end)
+    | [.[] | select(.status != "completed" and (.display_title|startswith("chore(release):")))
+        | "\(.name // "?") #\(.id) \(.head_sha[0:8]) \(.display_title)"] | join("\n")' 2>/dev/null) \
+    || { echo "cannot parse main's $st workflow runs; not merging"; exit 2; }
+  [ -n "$hit" ] && rel="${rel:+$rel
+}$hit"
+done
+if [ -n "$rel" ]; then
+  printf '%s\n' "$rel" | sed 's/^/  in flight on main: /'
+  echo "a release cut is waiting on main CI; wait for it (or ask its releaser), then re-run"; exit 10
 fi
 
 # ---- merge lock (repo-wide, 10-min TTL) ----------------------------------------------------
