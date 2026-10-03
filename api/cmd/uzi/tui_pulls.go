@@ -351,8 +351,10 @@ func (m *tuiModel) startPullsReq() tea.Cmd {
 // default repo (once) and, when a repo is ready and no poll is in flight, issues an immediate
 // fetch so the screen is not stuck on "loading…" until the next tick.
 func (m tuiModel) gotoPulls() (tea.Model, tea.Cmd) {
-	m.view = viewPulls
-	(&m).resolveDefaultRepo()
+	m.setListView(viewPulls)
+	if !m.splitDrawn() || m.boardReplied || m.repoChosen {
+		(&m).resolveDefaultRepo()
+	}
 	if m.pulls.waitID == 0 && m.pullsRepoReady() {
 		return m, (&m).startPullsReq()
 	}
@@ -384,14 +386,14 @@ func (m tuiModel) pullsKey(k string) (tea.Model, tea.Cmd) {
 				m.pulls.clampCursor()
 			}
 		}
-		m.pulls.scroll = m.pullsSyncedScroll()
+		m.pulls.scroll = m.pullsSyncedScrollAt(m.pullsScrollCapacity())
 		return m, nil
 	}
 
 	if d := motionDelta(k); d != 0 {
 		m.pulls.cursor += d
 		m.pulls.clampCursor()
-		m.pulls.scroll = m.pullsSyncedScroll()
+		m.pulls.scroll = m.pullsSyncedScrollAt(m.pullsScrollCapacity())
 		return m, nil
 	}
 
@@ -409,6 +411,7 @@ func (m tuiModel) pullsKey(k string) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.pr = newPRState(repo.ID, pr.IID)
+		m.fromSplit = m.splitDrawn()
 		m.view = viewPR
 		m.prReturn = viewPulls
 		m.forgeNotice = ""
@@ -477,7 +480,7 @@ func (m tuiModel) pullsKey(k string) (tea.Model, tea.Cmd) {
 		return m.gotoCI()
 	case keyViewFloor:
 		// 1 jumps to the floor directly.
-		m.view = viewBoard
+		m.setListView(viewBoard)
 		return m, nil
 	case keyViewPulls:
 		return m, nil // already here
@@ -486,7 +489,7 @@ func (m tuiModel) pullsKey(k string) (tea.Model, tea.Cmd) {
 		return m.gotoCI()
 	case keyEsc:
 		// esc on a list returns to the floor (D1).
-		m.view = viewBoard
+		m.setListView(viewBoard)
 		return m, nil
 	}
 	return m, nil
@@ -517,11 +520,18 @@ func pullRowPrefixWidth(branch bool) int {
 }
 
 func (m tuiModel) renderPulls() string {
+	return m.renderPullsBody(m.height, true)
+}
+
+func (m tuiModel) renderPullsBody(height int, fullScreen bool) string {
 	var sb strings.Builder
 	rows := m.pulls.visible()
 
-	brand := m.tabStrip()
-	if m.pulls.filter != "" || m.pulls.filtering {
+	brand := ""
+	if fullScreen {
+		brand = m.tabStrip(m.board.admin && m.view == viewBoard, m.view, true)
+	}
+	if fullScreen && (m.pulls.filter != "" || m.pulls.filtering) {
 		brand += m.pal.faint.Render("   /" + cellText(m.pulls.filter))
 		if m.pulls.filtering {
 			brand += m.pal.title.Render("▌")
@@ -529,12 +539,15 @@ func (m tuiModel) renderPulls() string {
 	}
 
 	items := buildPullItems(rows)
-	capacity := m.pullsCapacity()
+	capacity := m.pullsCapacityAt(height, fullScreen)
 	selItem := selectedBoardItem(items, m.pulls.cursor)
 	start, end := boardWindow(selItem, m.pulls.scroll, len(items), capacity)
 
 	summary := m.pullsSummary()
-	if len(rows) > 0 {
+	if !fullScreen {
+		summary = ""
+	}
+	if fullScreen && len(rows) > 0 {
 		lo, hi := windowRunSpan(items, start, end)
 		summary += m.pal.faint.Render(" · " + itoa(lo) + "–" + itoa(hi))
 	}
@@ -544,7 +557,9 @@ func (m tuiModel) renderPulls() string {
 	if note := m.pullsHeaderNote(); note != "" {
 		sb.WriteString(clampVisual(note, m.width) + "\n")
 	}
-	sb.WriteString("\n")
+	if fullScreen {
+		sb.WriteString("\n")
+	}
 
 	switch {
 	case !m.pullsRepoReady():
@@ -578,7 +593,9 @@ func (m tuiModel) renderPulls() string {
 		}
 	}
 
-	sb.WriteString(clampVisual(m.pullsFooter(), m.width))
+	if fullScreen {
+		sb.WriteString(clampVisual(m.pullsFooter(), m.width))
+	}
 	return sb.String()
 }
 
@@ -609,24 +626,31 @@ func buildPullItems(pulls []apitypes.PullDTO) []boardItem {
 // pulls twin of boardCapacity: tab strip + blank + footer (3), plus the optional sub-header
 // note, plus the selected row's reserved second line.
 func (m tuiModel) pullsCapacity() int {
-	chrome := 3
+	return m.pullsCapacityAt(m.height, true)
+}
+
+func (m tuiModel) pullsCapacityAt(height int, fullScreen bool) int {
+	chrome := 1 // pane title
+	if fullScreen {
+		chrome += 2 // blank line and footer
+	}
 	if m.pullsHeaderNote() != "" {
 		chrome++
 	}
 	if _, ok := m.pulls.selected(); ok {
 		chrome++
 	}
-	c := m.height - chrome
+	c := height - chrome
 	if c < 1 {
 		c = 1
 	}
 	return c
 }
 
-func (m tuiModel) pullsSyncedScroll() int {
+func (m tuiModel) pullsSyncedScrollAt(capacity int) int {
 	items := buildPullItems(m.pulls.visible())
 	sel := selectedBoardItem(items, m.pulls.cursor)
-	start, _ := boardWindow(sel, m.pulls.scroll, len(items), m.pullsCapacity())
+	start, _ := boardWindow(sel, m.pulls.scroll, len(items), capacity)
 	return start
 }
 
@@ -645,6 +669,10 @@ func (m tuiModel) pullEyebrow(it boardItem) string {
 // and a `↳ <run>` link when a uzi run opened it. The list carries no checks cell by design (D4:
 // the cold list must not fan out a per-PR checks call — checks live only in the PR drill-in).
 func (m tuiModel) pullRow(pr apitypes.PullDTO, sel bool, runLinkW int) string {
+	unfocused := sel && m.splitDrawn() && m.view != viewPulls
+	if unfocused {
+		sel = false
+	}
 	band := pullBand(pr)
 	glyph, glyphC := m.pullGlyph(pr)
 
@@ -660,6 +688,8 @@ func (m tuiModel) pullRow(pr apitypes.PullDTO, sel bool, runLinkW int) string {
 	cursor := paintSeg(nil, bg, false, " ")
 	if sel {
 		cursor = paintSeg(m.pal.tungsten, bg, true, "▸")
+	} else if unfocused {
+		cursor = paintSeg(m.pal.faintC, nil, false, "›")
 	}
 	gap := paintSeg(nil, bg, false, "  ")
 
@@ -773,8 +803,13 @@ func (m tuiModel) pullTitleColor(band int, sel bool) color.Color {
 // when the forge reported mergeability, the conflicts note against the target branch.
 func (m tuiModel) pullSecondLine(pr apitypes.PullDTO) string {
 	bg := m.pal.selBg
+	prefix := paintSeg(m.pal.tungsten, bg, false, "  ▸ ")
+	if m.splitDrawn() && m.view != viewPulls {
+		bg = nil
+		prefix = paintSeg(m.pal.faintC, bg, false, "  › ")
+	}
 	var b strings.Builder
-	b.WriteString(paintSeg(m.pal.tungsten, bg, false, "  ▸ "))
+	b.WriteString(prefix)
 	b.WriteString(paintSeg(m.pal.faintC, bg, false, "updated "+relAge(pr.UpdatedAt)))
 	if pr.Conflicts != nil {
 		note := "no conflicts with "
@@ -886,7 +921,7 @@ func (m tuiModel) pullsFooter() string {
 	}
 	parts = append(parts, m.keyHint("tab", "views"), m.keyHint("r", "refresh"),
 		m.keyHint("?", "keys"), m.keyHint("q", "quit"))
-	return " " + strings.Join(parts, m.pal.faint.Render(" · "))
+	return m.withSplitNote(" " + strings.Join(parts, m.pal.faint.Render(" · ")))
 }
 
 // ---- links + errors -------------------------------------------------------

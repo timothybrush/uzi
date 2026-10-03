@@ -46,6 +46,12 @@ func (s *Store) credentialsPath() string { return filepath.Join(s.dir, "credenti
 type Config struct {
 	Current  string             `toml:"current,omitempty"`
 	Contexts map[string]Context `toml:"contexts"`
+	TUI      TUIConfig          `toml:"tui,omitempty"`
+}
+
+// TUIConfig holds the CLI's non-secret TUI preferences.
+type TUIConfig struct {
+	Split string `toml:"split,omitempty"`
 }
 
 // Context is one named endpoint's non-secret settings.
@@ -191,13 +197,13 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 		return err
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	defer func() { _ = os.Remove(tmpName) }()
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Chmod(perm); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {

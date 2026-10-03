@@ -1,6 +1,6 @@
 # PRD #2171: TUI split view, floor on top and CI or pulls below on tall terminals
 
-**Status**: Draft. Resolved facts below were read at `main` `43161ccf`.
+**Status**: Done. Resolved facts below were read at `main` `43161ccf`; implementation and automated checks completed on issue #2171.
 
 ## Problem
 
@@ -15,6 +15,8 @@ Acceptance examples:
 1. A 60×120 terminal, no config: `uzi tui` opens with one shared header (wordmark, floor tab, rate-limit meters), the floor in the top pane with focus, a separator line naming the bottom pane's tabs and scoped repo, the CI list in the bottom pane, and one footer. Both lists refresh on their own. `tab` focuses the bottom pane on CI, `tab` again switches it to pulls, `tab` again returns focus to the floor; `shift+tab` walks the same cycle backwards.
 2. With the split showing and the floor focused, `enter` on a run opens run detail full-screen; `esc` returns to the split with the floor focused and its cursor where it was. Same for `enter` on a CI run or a PR from the focused bottom pane: `esc` returns to the split with the bottom pane focused on the same tab, cursor and repo.
 3. The window shrinks below the split threshold while the bottom pane has focus: the TUI shows the floor full-screen. Growing back restores the split with the bottom pane on the tab, cursor and repo it had, floor focused. `s` collapses the split the same way and keeps it collapsed through later resizes until `s` is pressed again; while collapsed on a tall-enough terminal the footer shows a faint `s split` hint. With `[tui] split = "off"` in `~/.config/uzi/config.toml` the TUI behaves exactly as today at any size.
+
+Collapsed restore hints and size notes yield to the existing footer when they do not fit; they never truncate keys or the version readout.
 
 ## Out of scope
 
@@ -41,8 +43,8 @@ Acceptance examples:
 
 ### Threshold and pane sizes
 
-- Worst-case chrome, from named per-band constants rather than live state: shared header = wordmark/tab line + meters (2 lines max, `boardMeterLayout`) + vault hint (1) + admin-denied (1) + board error (1); floor pane chrome = section heading + selected-row second line (1); bottom pane chrome = forge header note (1) + section heading + selected-row second line (1); plus separator (1) and footer (1).
-- `minHeight = sharedChrome + separator + footer + 2 × (max(floorPaneChrome, bottomPaneChrome) + 8)`. The split needs at least 8 list rows per pane in the worst case.
+- Worst-case chrome, from named per-band constants rather than live state: shared header = wordmark/tab line + meters (2 lines max, `boardMeterLayout`) + vault hint (1) + admin-denied (1) + board error (1); floor pane chrome = pane heading + selected-row second line (1) + three band headings + two band spacers; bottom pane chrome = forge header note (1) + pane heading + selected-row second line (1) + three band headings + two band spacers; plus separator (1) and footer (1). The band allowance is threshold-only: live list capacities still count band headings and spacers as display items.
+- `minHeight = sharedChrome + separator + footer + 2 × (max(floorPaneChrome, bottomPaneChrome) + 8)`. The split leaves at least 8 actual list rows per pane in the worst case.
 - Hysteresis: the latch turns on when height ≥ `minHeight + 2` and off when height < `minHeight`. It also needs width ≥ 80 (the board footer's width). The latch updates only in the `tea.WindowSizeMsg` case (`tui.go:884`), never in `View`, so a cursor move, a new error line or a meter tick can never flip the layout.
 - Pane sizes come from the rows left after shared chrome, separator and footer: each pane gets its worst-case chrome + 8, the rest is halved, the odd row to the floor. Each pane's live chrome is subtracted inside its own fixed pane height.
 
@@ -80,7 +82,7 @@ The split keys are handled in `handleKey` after the modal and `filtering()` chec
 
 - with the split drawn: session-off, collapse to the floor full-screen;
 - session-off: clear it; the split returns if eligible;
-- latch off (too short or narrow) and session-off unset: no state change, one-line footer note `terminal too small to split` until the next key;
+- latch off (too short or narrow) and session-off unset: no state change, footer note `terminal too small to split` until the next key, when it fits alongside the existing keys and version readout;
 - config `off`: no effect at all (config wins).
 
 When the split is not drawn, every other key behaves exactly as today.
@@ -140,28 +142,28 @@ All automated gates are at the `Update→msg` / `View()→string` seam (`tui_mod
 
 ### M1: lists and the tab strip render at a given pane height (prefactor)
 
-- [ ] Board, CI and pulls bodies and capacity functions take a pane height; the scroll helpers take the pane capacity; zero-arg full-screen wrappers remain.
-- [ ] `tabStrip` takes its admin-relabel, marked-tab and repo-suffix inputs explicitly.
-- [ ] Capacity-parity tests at a smaller-than-screen height; existing TUI tests pass untouched.
+- [x] Board, CI and pulls bodies and capacity functions take a pane height; the scroll helpers take the pane capacity; zero-arg full-screen wrappers remain.
+- [x] `tabStrip` takes its admin-relabel, marked-tab and repo-suffix inputs explicitly.
+- [x] Capacity-parity tests at a smaller-than-screen height; existing TUI tests pass untouched.
 
 Blocked by: none. Acceptance: `task gate:api` green; full-screen frames unchanged (the existing render tests are the oracle).
 
 ### M2: the split, with CI and pulls in the bottom pane
 
-- [ ] Split state, the bottom-tab/`m.view` invariant and its setter, `splitEligible` / `splitDrawn`, worst-case threshold with the `WindowSizeMsg`-only latch, pane sizing.
-- [ ] Shared header, separator, bottom pane, footer with the version readout, focus marker, unfocused-pane rendering.
-- [ ] Keys `tab` / `shift+tab` / `ctrl+w` / `esc` / `1` / `2` / `3` / `R`; collapse to the floor with filter commit; drill-in `fromSplit` return.
-- [ ] Repo resolution on activation; `reposMsg`, tick and self-heal gates on "displayed"; modals pause the forge polls.
-- [ ] Help overlay entries; the tests above for threshold, parity, keys, collapse/return, polling, header/footer, monochrome, D7; uxlab scenes.
-- [ ] `docs/cli.md` section, `task docs:sync`, CHANGELOG line.
+- [x] Split state, the bottom-tab/`m.view` invariant and its setter, `splitEligible` / `splitDrawn`, worst-case threshold with the `WindowSizeMsg`-only latch, pane sizing.
+- [x] Shared header, separator, bottom pane, footer with the version readout, focus marker, unfocused-pane rendering.
+- [x] Keys `tab` / `shift+tab` / `ctrl+w` / `esc` / `1` / `2` / `3` / `R`; collapse to the floor with filter commit; drill-in `fromSplit` return.
+- [x] Repo resolution on activation; `reposMsg`, tick and self-heal gates on "displayed"; modals pause the forge polls.
+- [x] Help overlay entries; the tests above for threshold, parity, keys, collapse/return, polling, header/footer, monochrome, D7; uxlab scenes.
+- [x] `docs/cli.md` section, `task docs:sync`, CHANGELOG line.
 
 Blocked by: M1. Acceptance: examples 1 and 2 and the resize half of example 3 hold under tests.
 
 ### M3: turning the split off
 
-- [ ] `s` with the behaviour above; `[tui] split = "auto" | "off"` on `Config`, round-trip, exit-2 validation in `uzi tui`.
-- [ ] The `s` and config tests above.
-- [ ] `docs/cli.md` config key and `s`, `task docs:sync`.
+- [x] `s` with the behaviour above; `[tui] split = "auto" | "off"` on `Config`, round-trip, exit-2 validation in `uzi tui`.
+- [x] The `s` and config tests above.
+- [x] `docs/cli.md` config key and `s`, `task docs:sync`.
 
 Blocked by: M2. Acceptance: example 3 in full.
 
@@ -177,10 +179,11 @@ A linked `acceptance` issue: on a real terminal against the hosted server, check
 - **D4: collapse always lands on the floor.** User decision: the floor is the TUI's home, so a shrink or `s` is predictable. Bottom state is kept for when the split returns. Applies to a split-origin drill-in's `esc` after a collapse too. Rejected: keep the focused pane full-screen.
 - **D5: config values `auto` and `off` only.** An `on` value could not split a short terminal either, so it would equal `auto`. Rejected: `auto | on | off`.
 - **D6: the displayed bottom tab polls at today's cadence even with the floor focused.** User decision: accept the added idle forge traffic and measure it before building another cadence. Today an idle floor makes no forge list calls (PRD #1255 D4). The server memoises forge reads and charges them to the connection budget (`api/internal/handler/forgeview.go`), so client polls do not map one-to-one to forge calls. Rejected: a slower unfocused cadence now (unmeasured), polling only on focus (a stale pane).
-- **D7: the threshold uses worst-case chrome, ≥ 8 list rows per pane, latch on at `minHeight + 2`, off below `minHeight`, updated only on resize.** Live chrome changes with the cursor, errors and meter ticks; a threshold built from it would flip the layout without a resize. The exit bound keeps the 8-row minimum; the 2-row entry margin stops one-row resizes from flapping. Width ≥ 80 keeps the footer intact.
+- **D7: the threshold charges three band headings and two band spacers per pane, leaving ≥ 8 actual list rows per pane, latch on at `minHeight + 2`, off below `minHeight`, updated only on resize.** Live chrome changes with the cursor, errors and meter ticks; a threshold built from it would flip the layout without a resize. The exit bound keeps the 8-row minimum; the 2-row entry margin stops one-row resizes from flapping. Width ≥ 80 keeps the footer intact.
 - **D8: `s` toggles the split per session, only on list screens, and is a no-op with a note when the split cannot be drawn.** Free today and mnemonic. A global key would eat text in run detail's steer input. Silently recording "off" on a short terminal would leave a user wondering why growing it does nothing. Rejected: `|`.
 - **D9: the bottom pane keeps the single scoped repo, resolved once from the newest board run after both the repos reply and the first board reply land.** `resolveDefaultRepo` marks the choice final, so resolving before the board reply would lock in the first enabled repo; waiting one reply is simpler than a provisional choice plus a correction that must invalidate both list caches. The floor is cross-repo; following the floor cursor would refetch the forge on every cursor move. The separator names the repo.
 - **D10: focus is a bracketed pane label, the unfocused cursor is `›`.** `▸` already means row cursor in every list, and a colour-only cue disappears under the Ascii profile (`.claude/rules/tui.md`). Unfocused rows keep full colour so NEEDS YOU stays loud on the floor.
 - **D11: the separator carries the bottom list's tabs, filter, summary and repo; the header carries only the floor tab.** Two bold tabs in one strip could not say which has focus; the list brand line those readouts used to sit on does not exist in a pane.
 - **D12: no sketch-harness milestone; uxlab scenes plus a visual review gate at landing.** The uxlab generator drives the shipped `tuiModel`, so its scenes preview the real thing; a sketch would be thrown away (`.claude/rules/tui.md`). The PNG review runs in the landing session because it needs the devbox render toolchain.
 - **D13: pulls ships with the split, not as its own milestone.** Without it `2` in the split has no defined meaning and the pulls poll gate stays focus-only; it has no value on its own.
+- **D14: collapsed split notes never cost existing footer content.** Drop a note when it cannot fit alongside the complete footer. With no room for the note, the frame matches config `off` at the same size. Pre-existing full-screen hint clipping is separate work.

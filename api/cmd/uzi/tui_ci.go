@@ -346,11 +346,18 @@ func ciRowPrefixWidth(c ciCols) int {
 }
 
 func (m tuiModel) renderCI() string {
+	return m.renderCIBody(m.height, true)
+}
+
+func (m tuiModel) renderCIBody(height int, fullScreen bool) string {
 	var sb strings.Builder
 	rows := m.ci.visible()
 
-	brand := m.tabStrip()
-	if m.ci.filter != "" || m.ci.filtering {
+	brand := ""
+	if fullScreen {
+		brand = m.tabStrip(m.board.admin && m.view == viewBoard, m.view, true)
+	}
+	if fullScreen && (m.ci.filter != "" || m.ci.filtering) {
 		brand += m.pal.faint.Render("   /" + cellText(m.ci.filter))
 		if m.ci.filtering {
 			brand += m.pal.title.Render("▌")
@@ -358,12 +365,15 @@ func (m tuiModel) renderCI() string {
 	}
 
 	items := buildCIItems(rows)
-	capacity := m.ciCapacity()
+	capacity := m.ciCapacityAt(height, fullScreen)
 	selItem := selectedBoardItem(items, m.ci.cursor)
 	start, end := boardWindow(selItem, m.ci.scroll, len(items), capacity)
 
 	summary := m.ciSummary()
-	if len(rows) > 0 {
+	if !fullScreen {
+		summary = ""
+	}
+	if fullScreen && len(rows) > 0 {
 		lo, hi := windowRunSpan(items, start, end)
 		summary += m.pal.faint.Render(" · " + itoa(lo) + "–" + itoa(hi))
 	}
@@ -373,7 +383,9 @@ func (m tuiModel) renderCI() string {
 	if note := m.ciHeaderNote(); note != "" {
 		sb.WriteString(clampVisual(note, m.width) + "\n")
 	}
-	sb.WriteString("\n")
+	if fullScreen {
+		sb.WriteString("\n")
+	}
 
 	switch {
 	case !m.pullsRepoReady():
@@ -402,7 +414,9 @@ func (m tuiModel) renderCI() string {
 		}
 	}
 
-	sb.WriteString(clampVisual(m.ciFooter(), m.width))
+	if fullScreen {
+		sb.WriteString(clampVisual(m.ciFooter(), m.width))
+	}
 	return sb.String()
 }
 
@@ -433,24 +447,31 @@ func buildCIItems(runs []apitypes.CIRunDTO) []boardItem {
 // of pullsCapacity: tab strip + blank + footer (3), plus the optional sub-header note, plus the
 // selected row's reserved second line.
 func (m tuiModel) ciCapacity() int {
-	chrome := 3
+	return m.ciCapacityAt(m.height, true)
+}
+
+func (m tuiModel) ciCapacityAt(height int, fullScreen bool) int {
+	chrome := 1 // pane title
+	if fullScreen {
+		chrome += 2 // blank line and footer
+	}
 	if m.ciHeaderNote() != "" {
 		chrome++
 	}
 	if _, ok := m.ci.selected(); ok {
 		chrome++
 	}
-	c := m.height - chrome
+	c := height - chrome
 	if c < 1 {
 		c = 1
 	}
 	return c
 }
 
-func (m tuiModel) ciSyncedScroll() int {
+func (m tuiModel) ciSyncedScrollAt(capacity int) int {
 	items := buildCIItems(m.ci.visible())
 	sel := selectedBoardItem(items, m.ci.cursor)
-	start, _ := boardWindow(sel, m.ci.scroll, len(items), m.ciCapacity())
+	start, _ := boardWindow(sel, m.ci.scroll, len(items), capacity)
 	return start
 }
 
@@ -469,6 +490,10 @@ func (m tuiModel) ciEyebrow(it boardItem) string {
 // the elapsed, the title, and a right cell: the `▰▱ done/total` jobs micro-bar for a RUNNING row
 // with jobs, else the run's age.
 func (m tuiModel) ciRow(r apitypes.CIRunDTO, sel bool) string {
+	unfocused := sel && m.splitDrawn() && m.view != viewCI
+	if unfocused {
+		sel = false
+	}
 	band := ciBand(r)
 	t := ciTextOf(r)
 	glyph, glyphC := m.ciGlyph(r)
@@ -486,6 +511,8 @@ func (m tuiModel) ciRow(r apitypes.CIRunDTO, sel bool) string {
 	cursor := paintSeg(nil, bg, false, " ")
 	if sel {
 		cursor = paintSeg(m.pal.tungsten, bg, true, "▸")
+	} else if unfocused {
+		cursor = paintSeg(m.pal.faintC, nil, false, "›")
 	}
 	gap := paintSeg(nil, bg, false, "  ")
 
@@ -630,8 +657,13 @@ func (m tuiModel) ciJobBar(done, total int, bg color.Color) string {
 func (m tuiModel) ciSecondLine(r apitypes.CIRunDTO) string {
 	t := ciTextOf(r)
 	bg := m.pal.selBg
+	prefix := paintSeg(m.pal.tungsten, bg, false, "  ▸ ")
+	if m.splitDrawn() && m.view != viewCI {
+		bg = nil
+		prefix = paintSeg(m.pal.faintC, bg, false, "  › ")
+	}
 	var b strings.Builder
-	b.WriteString(paintSeg(m.pal.tungsten, bg, false, "  ▸ "))
+	b.WriteString(prefix)
 	b.WriteString(paintSeg(m.pal.faintC, bg, false, m.renderer.Plain(t.runSHA, ciSHAWidth)))
 	b.WriteString(paintSeg(m.pal.faintC, bg, false, " · "))
 	b.WriteString(paintSeg(m.pal.sage, bg, false, m.renderer.Plain(t.actorLogin, 20)))
@@ -738,7 +770,7 @@ func (m tuiModel) ciFooter() string {
 	}
 	parts = append(parts, m.keyHint("tab", "views"), m.keyHint("r", "refresh"),
 		m.keyHint("?", "keys"), m.keyHint("q", "quit"))
-	return " " + strings.Join(parts, m.pal.faint.Render(" · "))
+	return m.withSplitNote(" " + strings.Join(parts, m.pal.faint.Render(" · ")))
 }
 
 // ciLink wraps an already-styled `<Name> #<Number>` segment in an OSC-8 hyperlink to the run's
@@ -762,8 +794,10 @@ func (m tuiModel) ciLink(r apitypes.CIRunDTO, styled string) string {
 // (once) and, when a repo is ready and no poll is in flight, issues an immediate fetch so the
 // screen is not stuck on "loading…" until the next tick — the ci twin of gotoPulls.
 func (m tuiModel) gotoCI() (tea.Model, tea.Cmd) {
-	m.view = viewCI
-	(&m).resolveDefaultRepo()
+	m.setListView(viewCI)
+	if !m.splitDrawn() || m.boardReplied || m.repoChosen {
+		(&m).resolveDefaultRepo()
+	}
 	if m.ci.waitID == 0 && m.pullsRepoReady() {
 		return m, (&m).startCIReq()
 	}
@@ -795,14 +829,14 @@ func (m tuiModel) ciKey(k string) (tea.Model, tea.Cmd) {
 				m.ci.clampCursor()
 			}
 		}
-		m.ci.scroll = m.ciSyncedScroll()
+		m.ci.scroll = m.ciSyncedScrollAt(m.ciScrollCapacity())
 		return m, nil
 	}
 
 	if d := motionDelta(k); d != 0 {
 		m.ci.cursor += d
 		m.ci.clampCursor()
-		m.ci.scroll = m.ciSyncedScroll()
+		m.ci.scroll = m.ciSyncedScrollAt(m.ciScrollCapacity())
 		return m, nil
 	}
 
@@ -829,6 +863,7 @@ func (m tuiModel) ciKey(k string) (tea.Model, tea.Cmd) {
 		// false, so the body still reads "loading…"; the first reply replaces this with the full
 		// jobs/steps.
 		m.cirun.detail.CIRunDTO = run
+		m.fromSplit = m.splitDrawn()
 		m.view = viewCIRun
 		m.forgeNotice = ""
 		return m, (&m).startCIRunReq()
@@ -866,7 +901,7 @@ func (m tuiModel) ciKey(k string) (tea.Model, tea.Cmd) {
 		return m, nil
 	case keyTab, keyViewFloor:
 		// tab advances the cycle ci → floor; 1 jumps to the floor directly (D1).
-		m.view = viewBoard
+		m.setListView(viewBoard)
 		return m, nil
 	case keyViewPulls:
 		return m.gotoPulls()
@@ -874,7 +909,7 @@ func (m tuiModel) ciKey(k string) (tea.Model, tea.Cmd) {
 		return m, nil // already here
 	case keyEsc:
 		// esc on a list returns to the floor (D1).
-		m.view = viewBoard
+		m.setListView(viewBoard)
 		return m, nil
 	}
 	return m, nil
