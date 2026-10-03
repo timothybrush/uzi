@@ -22,30 +22,32 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.85.1] - 2026-10-03
+
 ### Added
 
-- **Watch the floor and forge activity together in the TUI on tall terminals ([#2171](https://github.com/vtmocanu/uzi/issues/2171)).**
+- **Watch the floor and forge activity together in the TUI on tall terminals ([#2171](https://github.com/vtmocanu/uzi/issues/2171), [#2189](https://github.com/vtmocanu/uzi/pull/2189)).**
   At 80 columns and sufficient height, `uzi tui` shows the floor above a CI list that can switch to pulls, with keyboard focus and full-screen drill-ins; resizing or `s` collapses to the floor, while `[tui] split = "off"` in `~/.config/uzi/config.toml` keeps the full-screen layout. The split reserves eight list rows per pane and uses a two-row resize margin to avoid layout flapping; demo and sketch use the automatic layout.
 
 ### Changed
 
-- **Admin tabs group Site lists and Products after Branding, before Health.**
+- **Admin tabs group Site lists and Products after Branding, before Health ([#2179](https://github.com/vtmocanu/uzi/pull/2179)).**
   Instance and Branding stay together; Site lists precedes Products to follow setup order, and Health remains last.
 
 ### Fixed
 
-- **Codex session restoration works under long provider epoch paths ([#2187](https://github.com/vtmocanu/uzi/issues/2187)).**
+- **Codex session restoration works under long provider epoch paths ([#2190](https://github.com/vtmocanu/uzi/pull/2190), [#2187](https://github.com/vtmocanu/uzi/issues/2187)).**
   The runner-owned session seed loads TypeScript through Node directly, avoiding the tsx CLI's Unix socket path limit after plan approval.
-- **The opt-in RC Homebrew channel follows stable when it is newest ([#2180](https://github.com/vtmocanu/uzi/issues/2180)).**
+- **The opt-in RC Homebrew channel follows stable when it is newest ([#2181](https://github.com/vtmocanu/uzi/pull/2181), [#2180](https://github.com/vtmocanu/uzi/issues/2180)).**
   Stable tags also advance `uzi-cli-rc`, and delayed or repeated publishes cannot downgrade either formula. The TUI offers the newer of stable and RC releases to RC-channel installs, while the CLI skew warning names the formula that owns the binary even when its version is stable. Unknown-owner prompts remain notes-only. Existing rc.10/rc.11 users should run `brew upgrade uzi-cli-rc` once after the tap is refreshed; upgrading to v0.85.0 clears the warning against a 0.85.0 server, but v0.85.0 does not contain the new prompt or remedy logic, which arrives in the first release containing this fix.
 - **Codex resumes keep their saved session when a run parks before the provider starts ([#2175](https://github.com/vtmocanu/uzi/issues/2175)).**
   A fresh provider epoch now waits until launch before saving its session, so an owner pause or wall park cannot replace the previously saved thread with an empty session.
-- **Owner run inputs and chat messages containing NUL bytes now save successfully.**
+- **Owner run inputs and chat messages containing NUL bytes now save successfully ([#2176](https://github.com/vtmocanu/uzi/issues/2176)).**
   The API removes NUL bytes before writing plan revisions, gate approvals, plain inputs, and chat messages to PostgreSQL TEXT columns, while retaining each path's whitespace handling, validation, and limits.
 - **Codex provisioning failures name their cause ([#2187](https://github.com/vtmocanu/uzi/issues/2187)).**
   When a runner-owned provisioning step (including the session seed) fails, the run's failure reason and the worker log now carry its exit status, signal, spawn-error code and a bounded tail of its stderr, redacted for the run's secrets before it is cut; where no redactor is available (the advice lane) stderr is withheld, and the seed helper now names why it exited 2.
 
-## [0.85.0] - 2026-09-26
+## [0.85.0] - 2026-10-03
 
 ### Added
 
@@ -4738,7 +4740,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.85.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.85.1...HEAD
+[0.85.1]: https://github.com/vtmocanu/uzi/compare/v0.85.0...v0.85.1
 [0.85.0]: https://github.com/vtmocanu/uzi/compare/v0.84.0...v0.85.0
 [0.84.0]: https://github.com/vtmocanu/uzi/compare/v0.83.1...v0.84.0
 [0.83.1]: https://github.com/vtmocanu/uzi/compare/v0.83.0...v0.83.1
