@@ -14,13 +14,25 @@
 # module.enableCompileCache() at startup (npm 11, lib/cli.js), so `npm test` makes it
 # before any test runs. Nothing else is allowed.
 #
+# Every leftover is reported with evidence (issue #2020: a leftover `uzi-agent-test-*`
+# dir was seen with 0 failing tests and nothing but its bare name to go on). The guard
+# creates a LEDGER file outside the scratch dir and exports its path to the command as
+# UZI_TMPDIR_GUARD_LEDGER; agent/test/fixture-repo.ts appends one JSON line per fixture
+# created and per fixture removed. For each leftover the guard prints the ledger lines
+# naming it (`"entry":"<name>"`), a verdict, and a bounded listing of its contents:
+#   cleanup ran; the directory was recreated afterwards   (a removed line exists)
+#   no successful cleanup recorded                        (created line(s) only; ledger
+#     writes are best-effort, so this does not prove cleanup never ran)
+#   no creator recorded in the ledger                     (no line names it)
+# This is evidence only: the exit codes below do not depend on the ledger.
+#
 # Usage: scripts/tmpdir-leak-guard.sh <command> [args...]
 #
 # EXIT CODES:
 #   the command's own non-zero status, when it failed (the leak report still
 #     prints, and the scratch dir is still removed)
 #   1 = the command passed but left something in the scratch dir
-#   2 = usage / could not create the scratch dir
+#   2 = usage / could not create the scratch dir or the ledger file
 #   0 = the command passed and the scratch dir holds nothing but the two tool caches
 # POSIX sh on purpose: runs under busybox sh, dash and macOS /bin/sh alike.
 set -u
@@ -36,8 +48,16 @@ scratch="$(mktemp -d "${TMPDIR:-/tmp}/uzi-tmpdir-guard.XXXXXX")" || {
   exit 2
 }
 
+# Outside the scratch dir, so it is never itself reported as a leftover.
+ledger="$(mktemp "${TMPDIR:-/tmp}/uzi-tmpdir-guard-ledger.XXXXXX")" || {
+  rm -rf "$scratch"
+  echo "tmpdir-leak-guard: cannot create a ledger file" >&2
+  exit 2
+}
+
 # shellcheck disable=SC2329 # invoked by the EXIT trap below
 cleanup() {
+  rm -f "$ledger"
   # Tests may leave read-only trees (git objects, chmod'ed fixtures): make them
   # writable first so the removal cannot fail on permissions.
   chmod -R u+rwx "$scratch" 2>/dev/null
@@ -49,7 +69,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 rc=0
-TMPDIR="$scratch" "$@" || rc=$?
+TMPDIR="$scratch" UZI_TMPDIR_GUARD_LEDGER="$ledger" "$@" || rc=$?
 
 tsx_cache="tsx-$(id -u)"
 leftover=0
@@ -64,7 +84,24 @@ for entry in "$scratch"/* "$scratch"/.[!.]* "$scratch"/..?*; do
     echo "tmpdir-leak-guard: the command left these entries in its TMPDIR ($scratch):" >&2
   fi
   leftover=$((leftover + 1))
-  echo "  $name" >&2
+  # printf, not echo: dash and macOS sh echo interpret backslashes in untrusted text.
+  printf '  %s\n' "$name" >&2
+  matched="$(grep -F "\"entry\":\"$name\"" "$ledger" 2>/dev/null)"
+  if [ -n "$matched" ]; then
+    printf '%s\n' "$matched" | while IFS= read -r line; do
+      printf '    ledger: %s\n' "$line" >&2
+    done
+    case "$matched" in
+      *'"event":"removed"'*) echo "    verdict: cleanup ran; the directory was recreated afterwards" >&2 ;;
+      *) echo "    verdict: no successful cleanup recorded" >&2 ;;
+    esac
+  else
+    echo "    verdict: no creator recorded in the ledger" >&2
+  fi
+  echo "    contents (bounded):" >&2
+  find "$entry" -maxdepth 4 2>/dev/null | head -n 40 | while IFS= read -r p; do
+    printf '      %s\n' "${p#"$scratch"/}" >&2
+  done
 done
 
 if [ "$leftover" -gt 0 ]; then
