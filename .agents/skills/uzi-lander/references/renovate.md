@@ -42,8 +42,8 @@ anything the rules below do not settle.
   package pins exactly): hold until upstream moves. Fix on our own branch (below) only
   when the change belongs in our code; overriding a transitive pin (npm `overrides`) is a
   buddy decision.
-- **Red on a parity gate** (`check:semgrep-parity`: the CI semgrep pin must equal the worker
-  devbox lock): hold; the bump lands together with the worker lock.
+- **A semgrep CI-pin PR** predates CI deriving semgrep from the worker lock: close it;
+  the devbox refresh moves semgrep for CI and the worker together.
 - **Every hold goes in the batch report** (references/batch.md §6) with its reason, what
   unblocks it, and the buddy's view.
 
@@ -96,11 +96,12 @@ Treat it as Renovate-class, plus:
 
 - It tracks `nixpkgs-unstable`, so it can carry MAJOR tool bumps: read the lock delta. This
   is intended (workers should get current, patched tools).
-- The check that validates it is **`build-agent` (base + jvm)**, which builds the worker
-  image and runs the toolchain guard; the other `ci.yml` jobs are unaffected by the lock.
+- The checks that validate it are **`build-agent` (base + jvm)**, which builds the worker
+  image and runs the toolchain guard, and **`lint-repo`**, which installs the lock's
+  semgrep and runs the SAST gate with it.
 - The workflow opens it with `GITHUB_TOKEN`, so the PR may not trigger its own CI
-  (GitHub's recursion guard). Push an empty commit with your own token, or rely on the
-  scheduled run's base-image build plus post-merge `main` CI.
+  (GitHub's recursion guard). Push an empty commit with your own token so both checks run
+  on the refresh head before merge; post-merge `main` CI alone is too late when semgrep moved.
 
 ## A Renovate PR red because the new version needs a code change
 
