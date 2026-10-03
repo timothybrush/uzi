@@ -494,6 +494,76 @@ describe("SdkExecutor — PRD #1809 D4 process attribution (BLOCKING 1)", () => 
     await exec.reapAttributedProcesses();
     assert.deepStrictEqual(reaps, [{ home: homeDir, worktree: ctx.worktreePath }]);
   });
+
+  it("reapAttributedProcesses returns the attribution reap's outcome verbatim", async () => {
+    const outcome = { killed: [7], left: [8], complete: false };
+    const exec = new SdkExecutor(nullLogger(), homeDir, {
+      runProcesses: { scan: async () => ({ pids: [], complete: true }), reap: async () => outcome },
+    });
+    assert.deepStrictEqual(await exec.reapAttributedProcesses(), outcome);
+  });
+
+  it("reapAttributedProcesses reads a rejecting attribution reap as incomplete", async () => {
+    const exec = new SdkExecutor(nullLogger(), homeDir, {
+      runProcesses: {
+        scan: async () => ({ pids: [], complete: true }),
+        reap: async () => {
+          throw new Error("boom");
+        },
+      },
+    });
+    assert.deepStrictEqual(await exec.reapAttributedProcesses(), { killed: [], left: [], complete: false });
+  });
+
+  it("reapAttributedProcesses aborts and awaits an unjoined deps install before the attribution reap", async () => {
+    const order: string[] = [];
+    const npm = path.join(homeDir, ".npm", "_cacache");
+    fs.mkdirSync(path.join(npm, "index-v5"), { recursive: true });
+    const installDeps: SdkExecutorOptions["installDeps"] = (_root, _env, opts) =>
+      new Promise((resolve) => {
+        // Settles on a later tick after the abort, so only an awaited install orders before the reap.
+        // The bounded timer lets a regression fail on the order assertion instead of hanging.
+        const finish = (label: string): void => {
+          clearTimeout(bound);
+          order.push(label);
+          resolve({ results: [], truncated: false });
+        };
+        const bound = setTimeout(() => finish("install-timer"), 10_000);
+        opts?.signal?.addEventListener("abort", () => {
+          order.push("install-aborted");
+          setTimeout(() => finish("install-settled"), 20);
+        });
+      });
+    const exec = new SdkExecutor(nullLogger(), homeDir, {
+      queryFn: spawningTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]),
+      spawn: () => ({ pid: 8300 }),
+      kill: () => true,
+      cliGroupPresent: () => false,
+      installDeps,
+      runProcesses: {
+        scan: async () => ({ pids: [], complete: true }),
+        reap: async () => {
+          order.push("reap");
+          return { killed: [], left: [], complete: true };
+        },
+      },
+    });
+    let npmKeptAfterReap: boolean | undefined;
+    const { ctx } = makeCtx({
+      gatePlan: async () => {
+        await exec.reapAttributedProcesses();
+        // The reap marks the install joined, so the in-place drop now takes the npm cache too.
+        if (fs.existsSync(path.join("/pro" + "c", "self", "fd"))) {
+          await exec.reclaimCachesInPlace();
+          npmKeptAfterReap = fs.existsSync(npm);
+        }
+        return { kind: "approve", selection: { status: "absent" } };
+      },
+    });
+    await exec.run(ctx);
+    assert.deepStrictEqual(order.slice(0, 3), ["install-aborted", "install-settled", "reap"]);
+    if (npmKeptAfterReap !== undefined) assert.strictEqual(npmKeptAfterReap, false, "reap marks the install joined: .npm/_cacache dropped");
+  });
 });
 
 /** A planning turn that asks the owner a question instead of submitting a plan. */
