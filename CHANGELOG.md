@@ -63,6 +63,9 @@ through `[0.52.0]`.)
 - **Slack plan gates show the detected repo agent folder ([#2113](https://github.com/vtmocanu/uzi/issues/2113)).**
   The gate message and repo approval confirmation now name `.codex/agents/` for a detected Codex roster, with `.claude/agents/` as the fallback for older or unsupported folder metadata; template and no-roster approvals keep their existing behavior.
 
+- **Permit already published GitHub workflow content ([#1869](https://github.com/vtmocanu/uzi/issues/1869)).**
+  Finalize compares workflow blobs per path against fresh default and target tips, and checks eligibility again before pushing when fresh tips are available. A workflow refusal preserves the original work for a human to land.
+
 - **Three more outbound clients use independent HTTP/2 health-ping pools ([#2211](https://github.com/vtmocanu/uzi/issues/2211)).**
   Pushbroker, agent-source fetches and release checks each own a persistent connection pool built by the shared transport constructor, configured to send a health ping after 30 seconds without received frames and close the connection after a further 15 seconds without a ping response. Detection takes about 45 seconds after the last received frame, so individual requests may still time out; existing operation budgets, redirect policies and response limits remain in place.
 - **MR rework keeps handled review history across temporary opt-outs and token replacement ([#1811](https://github.com/vtmocanu/uzi/issues/1811)).**

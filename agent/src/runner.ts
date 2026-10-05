@@ -715,6 +715,14 @@ class HistoryRewrittenError extends Error {
   }
 }
 
+/** A local workflow refusal was already terminally reported; unwind without another push. */
+class WorkflowScopeBlockedSignal extends Error {
+  constructor() {
+    super("workflow scope blocked");
+    this.name = "WorkflowScopeBlockedSignal";
+  }
+}
+
 /** PRD #1416 (MR-rework, finding 1) — a data-free unwind sentinel: the post-bridge secret scan
  *  found a trusted secret in the now-pushable `P..B` range and has ALREADY terminally reported
  *  push_secret_blocked (via reportPushSecretBlocked). Thrown from the ALIGN chain's fetchAndPush so
@@ -5664,13 +5672,13 @@ export class RunRunner {
       }
     }
 
-    // PRD #377 M1: a GitHub run whose branch touches .github/workflows/** cannot be
-    // pushed by the bot's repo-only PAT (privcheck forbids the workflow scope by design).
+    // Issue #1869: a GitHub tip may carry workflow blobs from fresh default or target.
+    // Other workflow blobs cannot be pushed by the bot's repo-only PAT.
     // Detect it here, BEFORE the doomed push, and end the run in a typed `failed` outcome
     // that preserves the agent's diff for a human to land — instead of face-planting into
     // GitHub's opaque "without workflow scope" rejection and discarding the committed work.
     // Serves every forge-pushing kind (the failed path is not issue-gated).
-    // The precheck uses branch-only commits; the overlay keeps its separate conservative
+    // The precheck compares tip blobs per path; the overlay keeps its separate conservative
     // changedFiles guard below.
     // Every preserved_patch is stored and rendered on the run page, and redactText knows only the
     // run's OWN secrets, so a foreign credential in the diff would persist verbatim. Attach a patch
@@ -5690,64 +5698,70 @@ export class RunRunner {
       });
       return undefined;
     };
-    let changedForWf: string[] | null = null;
-    let freshDefaultTip: string | undefined;
+    const workflowBarePath = barePath;
+    const originalWorkflowTip = await this.git.trackingTip(workflowBarePath, result.branch);
+    const rethrowWorkflowAbort = (error: unknown) => {
+      if (boundarySignal?.aborted || error instanceof CheckpointSoftDeadlineError ||
+          (error instanceof Error && (error.name === "GitBoundaryAbortError" || error.name === "AbortError"))) throw error;
+    };
+    let workflowUnavailable = false;
+    let workflowPermitted = false;
+    let workflowOverlayForbidden = false;
+    let workflowBranchChanges: string[] | null = null;
+    let workflowReported = false;
+    const failWorkflowScope = async (paths: string[]) => {
+      if (workflowReported) return;
+      await this.git.scratchPublicationPreflight(workflowBarePath, result.branch);
+      workflowReported = true;
+      const patch = await scanGatedPatch(
+        originalWorkflowTip ? await this.git.workflowScopeDiff(workflowBarePath, originalWorkflowTip) : null,
+        "workflow_scope_missing",
+      );
+      batcher.emit({ kind: "status", agent: "worker", payload: {
+        text: patch !== undefined
+          ? "branch changes .github/workflows, which the bot token cannot push; preserving the diff for a human to land"
+          : "branch changes .github/workflows, which the bot token cannot push; the diff is withheld",
+      } });
+      await closeBatcher();
+      await journalTerminalReport({ status: "failed", fail_origin: "workflow_scope_missing",
+        failure_reason: composeWorkflowScopeReason(paths, patch !== undefined).slice(0, MAX_FAILURE_REASON_LEN),
+        preserved_patch: patch });
+    };
+    const freshWorkflowFiles = async (
+      tip: string, latchUnavailable = false, fetchedDefault?: string,
+    ): Promise<string[] | null> => {
+      let freshDefault = fetchedDefault;
+      if (freshDefault === undefined) {
+        const defaultBranch = claim.repo.default_branch?.trim() ||
+          (await this.git.defaultBranchName(workflowBarePath)) || "main";
+        freshDefault = await this.git.fetchDefaultTip(workflowBarePath, defaultBranch,
+          claim.secrets.forge_pat, claim.repo.clone_url, claim.secrets.forge_username);
+      }
+      const target = await this.git.fetchWorkflowTargetTip(workflowBarePath, result.branch,
+        claim.secrets.forge_pat, claim.repo.clone_url, claim.secrets.forge_username);
+      if (target.kind === "unavailable") {
+        if (latchUnavailable) workflowUnavailable = true;
+        return null;
+      }
+      return this.git.branchWorkflowFiles(workflowBarePath, freshDefault, tip,
+        target.kind === "present" ? target.sha : undefined);
+    };
     if (claim.repo.forge_type === "github") {
-      // Capture the narrowed bare path in a const the SAME way the push block does
-      // (barePath is an outer `let string | undefined` and TS drops the narrowing here).
-      const wfBarePath = barePath;
-      // Fetch before the precheck so commit classification sees the current default tip.
+      let hits: string[] | null = null;
       try {
         steps?.enter("default_fetch");
-        const defaultBranch = claim.repo.default_branch?.trim() ||
-          (await this.git.defaultBranchName(wfBarePath)) || "main";
-        freshDefaultTip = await this.git.fetchDefaultTip(
-          wfBarePath, defaultBranch, claim.secrets.forge_pat,
-          claim.repo.clone_url, claim.secrets.forge_username,
-        );
-        changedForWf = await this.git.branchWorkflowFiles(wfBarePath, freshDefaultTip, trackingRef);
-      } catch (e) {
-        runLog.warn("workflow precheck: could not fetch default tip; pushing normally", {
-          run_id: runId, error: errMessage(e),
-        });
+        hits = await freshWorkflowFiles(trackingRef);
+        workflowPermitted = hits !== null && hits.length === 0;
+        if (hits !== null) {
+          workflowBranchChanges = await this.git.changedFiles(workflowBarePath, trackingRef);
+          workflowOverlayForbidden = hits.length > 0 && workflowBranchChanges === null;
+        }
+      } catch (error) {
+        rethrowWorkflowAbort(error);
+        runLog.warn("workflow precheck unavailable; deferring to fresh alignment eligibility", { run_id: runId, error: errMessage(error) });
       }
-      // D6: a null diff (diff-computation failure) fails OPEN to the normal push — do not
-      // fail a possibly-legitimate non-workflow run on an inability to compute the diff.
-      const wfHits = changedForWf === null
-        ? null
-        : changedForWf.filter((file) => file.startsWith(".github/workflows/"));
-      if (wfHits && wfHits.length > 0) {
-        // Preserve the agent's diff so a human can land it without re-deriving it from the
-        // transcript, behind scanGatedPatch (redacted, then secret-scanned as stored); a null diff
-        // (best-effort failure) or a withheld one just omits the patch — the typed failure still lands.
-        const patch = await scanGatedPatch(
-          await this.git.workflowScopeDiff(wfBarePath, trackingRef),
-          "workflow_scope_missing",
-        );
-        // Compose an actionable, capped failure_reason that names the offending path(s)
-        // (truncating the path LIST if needed, never the doc link) and points at
-        // docs/github-bot-setup.md; it promises the diff only when one is attached.
-        const reason = composeWorkflowScopeReason(wfHits, patch !== undefined);
-        batcher.emit({
-          kind: "status",
-          agent: "worker",
-          payload: {
-            text: patch !== undefined
-              ? "branch changes .github/workflows, which the bot token cannot push; failing early and preserving the diff for a human to land"
-              : "branch changes .github/workflows, which the bot token cannot push; failing early (the diff is withheld: it could not be preserved or did not scan clean)",
-          },
-        });
-        runLog.info(
-          "run failed: branch touches .github/workflows which the bot PAT cannot push; preserving diff",
-          { run_id: runId, paths: wfHits },
-        );
-        await closeBatcher();
-        await journalTerminalReport({
-          status: "failed",
-          failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
-          fail_origin: "workflow_scope_missing",
-          preserved_patch: patch,
-        });
+      if (hits && hits.length > 0 && workflowBranchChanges?.some((file) => file.startsWith(".github/workflows/"))) {
+        await failWorkflowScope(hits);
         return;
       }
     }
@@ -5831,6 +5845,19 @@ export class RunRunner {
     const pushToOrigin = () =>
       withForgeRetry(
         async () => {
+          if (claim.repo.forge_type === "github" && !workflowUnavailable) {
+            let hits: string[] | null = null;
+            try {
+              hits = await freshWorkflowFiles(trackingRef);
+            } catch (error) {
+              rethrowWorkflowAbort(error);
+              runLog.warn("final workflow check unavailable; pushing normally", { run_id: runId, error: errMessage(error) });
+            }
+            if (hits && hits.length > 0) {
+              await failWorkflowScope(hits);
+              throw new WorkflowScopeBlockedSignal();
+            }
+          }
           await this.git.pushBranch(
             finalizeBarePath,
             result.branch,
@@ -5842,7 +5869,7 @@ export class RunRunner {
         {
           log: runLog,
           signal: boundarySignal,
-          classify: (error) => error instanceof ScratchPublicationError ? "permanent" : classifyForgeError(error),
+          classify: (error) => (error instanceof ScratchPublicationError || error instanceof WorkflowScopeBlockedSignal) ? "permanent" : classifyForgeError(error),
         },
       );
 
@@ -6123,6 +6150,9 @@ export class RunRunner {
             claim.repo.clone_url, claim.secrets.forge_username,
           );
         } catch (e) {
+          rethrowWorkflowAbort(e);
+          if (e instanceof WorkflowScopeBlockedSignal) throw e;
+          workflowUnavailable = true;
           runLog.warn("finalize base-align: could not refresh default tip; pushing without aligning", {
             run_id: runId, error: errMessage(e),
           });
@@ -6135,12 +6165,36 @@ export class RunRunner {
             defaultTip,
           );
         } catch (e) {
+          rethrowWorkflowAbort(e);
+          if (e instanceof WorkflowScopeBlockedSignal) throw e;
+          workflowUnavailable = true;
           runLog.warn(
             "finalize base-align: could not compute the align target; pushing without aligning",
             { run_id: runId, error: errMessage(e) },
           );
         }
-        if (defaultTip && differs) {
+        if (defaultTip && differs && !workflowUnavailable) {
+          try {
+            const hits = await freshWorkflowFiles(trackingRef, true, defaultTip);
+            if (hits === null) {
+              workflowUnavailable = true;
+            } else {
+              workflowPermitted = hits.length === 0;
+              workflowBranchChanges = await this.git.changedFiles(alignBarePath, trackingRef);
+              workflowOverlayForbidden = hits.length > 0 && workflowBranchChanges === null;
+            }
+          } catch (e) {
+            rethrowWorkflowAbort(e);
+            if (e instanceof WorkflowScopeBlockedSignal) throw e;
+            workflowUnavailable = true;
+            runLog.warn("finalize base-align: workflow eligibility unavailable; pushing without aligning", {
+              run_id: runId, error: errMessage(e),
+            });
+          }
+        }
+        const bypassAlignment = workflowPermitted && (workflowBranchChanges === null ||
+          workflowBranchChanges.some((file) => file.startsWith(".github/workflows/")));
+        if (defaultTip && differs && !workflowUnavailable && !bypassAlignment) {
           // The pre-align committed agent tip — the base every align strategy starts from, so
           // a rebase FALLBACK after a clean merge replays the ORIGINAL commits, not the merge.
           const originalAgentTip = await this.git.branchTip(
@@ -6226,6 +6280,8 @@ export class RunRunner {
                   strategy,
                 );
               } catch (e) {
+                rethrowWorkflowAbort(e);
+                if (e instanceof WorkflowScopeBlockedSignal) throw e;
                 runLog.warn(
                   "finalize base-align: unexpected error during align; preserving diff and failing typed",
                   { run_id: runId, strategy, error: errMessage(e) },
@@ -6294,6 +6350,8 @@ export class RunRunner {
                 await fetchAndPush();
                 return false;
               } catch (e) {
+                rethrowWorkflowAbort(e);
+                if (e instanceof WorkflowScopeBlockedSignal) throw e;
                 if (e instanceof ScratchPublicationError || e instanceof RunResidueBlockedError) throw e;
                 if (await reportMovedBranchIfVerified(e)) return true;
                 // PRD #974 M2: an aligned push rejected by GitHub Push Protection (GH013) is a
@@ -6333,7 +6391,7 @@ export class RunRunner {
             // allowed ONLY when the diff succeeded AND the branch provably modified NO workflow
             // file. Any other case (null diff, or a real workflow edit) falls straight into the
             // EXISTING merge → rebase → preserve chain, unchanged.
-            // Keep the overlay's tree-diff guard independent of the commit-based precheck.
+            // Keep the overlay's changed-file guard independent of tip blob eligibility.
             const alignChanged = await this.git.changedFiles(alignBarePath, trackingRef);
             const alignWfHits = alignChanged === null
               ? null
@@ -6363,6 +6421,8 @@ export class RunRunner {
                 [runnerClone.baseCommit, runnerClone.defaultBranchCommit ?? ""],
               );
             } catch (e) {
+              rethrowWorkflowAbort(e);
+              if (e instanceof WorkflowScopeBlockedSignal) throw e;
               runLog.warn(
                 "finalize base-align: could not import the default tip into the runner clone; preserving diff and failing typed",
                 { run_id: runId, error: errMessage(e) },
@@ -6380,7 +6440,7 @@ export class RunRunner {
             // WRONG for the overlay — an overlay error must fall back to merge/rebase, not
             // preserve-and-fail. So the overlay gets its own try/catch here.
             let overlayHandled = false;
-            if (canOverlay) {
+            if (canOverlay && !workflowOverlayForbidden) {
               let overlayAligned = false;
               try {
                 const res = await this.git.alignBranchWithDefault(
@@ -6392,6 +6452,8 @@ export class RunRunner {
                 );
                 overlayAligned = res === "aligned"; // the overlay never returns "conflict"
               } catch (e) {
+                rethrowWorkflowAbort(e);
+                if (e instanceof WorkflowScopeBlockedSignal) throw e;
                 // (b) the overlay git op threw (a GENUINE unexpected git error) → fall back to
                 // merge/rebase, NOT preserve-and-fail. Distinct message from (c) below.
                 runLog.warn(
@@ -6404,6 +6466,8 @@ export class RunRunner {
                   await fetchAndPush(); // sets alignPushed = true on success
                   overlayHandled = true;
                 } catch (e) {
+                  rethrowWorkflowAbort(e);
+                  if (e instanceof WorkflowScopeBlockedSignal) throw e;
                   if (e instanceof RunResidueBlockedError) throw e;
                   // PRD #974 M2: an overlay push rejected by GitHub Push Protection (GH013) is a
                   // secret gitleaks missed — typed push_secret_blocked fail (NO preserved diff:
@@ -6437,6 +6501,8 @@ export class RunRunner {
                 try {
                   await fetchAndPush();
                 } catch (e) {
+                  rethrowWorkflowAbort(e);
+                  if (e instanceof WorkflowScopeBlockedSignal) throw e;
                   if (e instanceof RunResidueBlockedError) throw e;
                   // PRD #974 M2: a merge push rejected by GitHub Push Protection (GH013) is a secret
                   // gitleaks missed — typed push_secret_blocked fail (NO preserved diff: it may
@@ -6503,6 +6569,8 @@ export class RunRunner {
         }
       }
     } catch (e) {
+      rethrowWorkflowAbort(e);
+      if (e instanceof WorkflowScopeBlockedSignal) return;
       if (e instanceof ScratchPublicationError) throw e;
       // PRD #1416 M4 (SC3): a bridge that could not be built/validated at a finalize push site was
       // thrown as HistoryRewrittenError; type it history_rewritten — never the generic catch
@@ -6579,6 +6647,8 @@ export class RunRunner {
       try {
         await pushToOrigin();
       } catch (e) {
+        rethrowWorkflowAbort(e);
+        if (e instanceof WorkflowScopeBlockedSignal) return;
         if (e instanceof ScratchPublicationError) throw e;
         // PRD #974 M2 backstop: a GitHub Push Protection (GH013) rejection here means a secret
         // the pre-push gitleaks scan missed — route it to the typed push_secret_blocked fail
@@ -6593,6 +6663,10 @@ export class RunRunner {
         // advanced the MR branch under the run; route that distinct case to the branch_moved
         // disposition instead of letting it rethrow into the generic agent_failure catch.
         if (await reportMovedBranchIfVerified(e)) return;
+        if (isWorkflowScopeRejection(e)) {
+          await failWorkflowScope([".github/workflows/"]);
+          return;
+        }
         throw e;
       }
     }
