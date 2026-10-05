@@ -4,6 +4,9 @@ import type { Logger } from "./log.js";
 import type { UsageWireRequest } from "./usage-recorder.js";
 import {
   WORKER_API_PREFIX,
+  type TerminalRejectionsRequest,
+  type TerminalRejectionsResponse,
+  type TerminalRejectionCustodyResponse,
   type ActiveSnapshot,
   type PrDescriptionAckRequest,
   type PrDescriptionAckResponse,
@@ -1094,15 +1097,21 @@ export class WorkerClient {
    *  api's pre-claim dedupe sees the runs this worker is already executing BEFORE the first
    *  post-outage heartbeat lands. If not negotiated the claim posts an empty body `{}`, which
    *  an old api ignores (harmless — the run-lane claim was bodyless before this). */
-  async claimRun(activeSnapshot?: ActiveSnapshot): Promise<ClaimResponse | null> {
+  async claimRun(activeSnapshot?: ActiveSnapshot, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<ClaimResponse | null> {
+    // The same deadline reaches fetch AND its body. Await the real request rather than a race:
+    // admission must remain held until a late transport has definitively stopped.
+    const deadline = AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]);
+    deadline.throwIfAborted();
     const body: ClaimRequest = {};
     if (this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined) {
       body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
     }
-    const res = await this.fetchRaw("POST", `${WORKER_API_PREFIX}/runs/claim`, body);
+    const res = await this.fetchRaw("POST", `${WORKER_API_PREFIX}/runs/claim`, body, timeoutMs, deadline);
+    deadline.throwIfAborted();
     if (res.status === 204) return null;
     if (res.status >= 400) throw await this.toError("POST", `${WORKER_API_PREFIX}/runs/claim`, res);
     const claim = (await res.json()) as ClaimResponse;
+    deadline.throwIfAborted();
     // PRD #1798 D9: the pr_description is validated or dropped, never cast (decodePrState, the
     // same check as the bind / lookup / ack responses). The warning carries the run id only,
     // never the value (untrusted text). The isRecord guard keeps a `null` (or other non-object)
@@ -2579,6 +2588,82 @@ export class WorkerClient {
     }
   }
 
+  /** No retries or feature cache: check the shared negotiated set at each transport. */
+  async reportTerminalRejections(request: TerminalRejectionsRequest, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<TerminalRejectionsResponse | undefined> {
+    if (!this.hasFeature("terminal_rejection_report")) return undefined;
+    if (!request || !Array.isArray(request.rejections) || request.rejections.length > 256 ||
+        request.rejections.some(r => !terminalUUID(r.run_id) || !terminalGeneration(r.claim_generation) || r.reason !== "mac_failure")) throw terminalResponseError();
+    const body = { rejections: request.rejections.map(r => ({ run_id: r.run_id.toLowerCase(), claim_generation: r.claim_generation, reason: r.reason })) };
+    if (Buffer.byteLength(JSON.stringify(body)) > TERMINAL_REJECTION_RESPONSE_MAX_BYTES) throw terminalResponseError();
+    const response = await this.terminalRejectionJSON("POST", `${WORKER_API_PREFIX}/terminal-rejections`, body, signal, timeoutMs);
+    if (response === undefined) return undefined;
+    const obj = terminalObject(response);
+    if (!Array.isArray(obj.dispositions) || obj.dispositions.length !== body.rejections.length || obj.dispositions.length > 256) throw terminalResponseError();
+    // Compare the whole ordered batch; duplicates, if requested, retain their exact slots.
+    for (const [i, value] of obj.dispositions.entries()) {
+      const d = terminalObject(value);
+      const requested = body.rejections[i]!;
+      if (d.run_id !== requested.run_id || d.claim_generation !== requested.claim_generation || d.reason !== "mac_failure" ||
+          (d.disposition !== "recorded" && d.disposition !== "skipped")) throw terminalResponseError();
+    }
+    return response as TerminalRejectionsResponse;
+  }
+
+  async getTerminalRejectionCustody(runId: string, generation: number, workerId: string, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<TerminalRejectionCustodyResponse | undefined> {
+    if (!this.hasFeature("terminal_rejection_report")) return undefined;
+    if (!terminalUUID(runId) || !terminalUUID(workerId) || !terminalGeneration(generation)) throw terminalResponseError();
+    runId = runId.toLowerCase();
+    workerId = workerId.toLowerCase();
+    const response = await this.terminalRejectionJSON("GET", `${WORKER_API_PREFIX}/runs/${runId}/terminal-rejection-custody?generation=${generation}`, undefined, signal, timeoutMs);
+    if (response === undefined) return undefined;
+    const obj = terminalObject(response);
+    if (obj.run_id !== runId || obj.worker_id !== workerId || obj.generation !== generation ||
+        !Array.isArray(obj.exact_holds) || !Array.isArray(obj.sibling_holds) ||
+        !terminalGeneration(obj.exact_count) || !terminalGeneration(obj.sibling_count) ||
+        typeof obj.exact_complete !== "boolean" || typeof obj.sibling_complete !== "boolean" || typeof obj.complete !== "boolean" ||
+        (typeof obj.outcome !== "string" || !["retained", "settled", "unknown"].includes(obj.outcome))) throw terminalResponseError();
+    const exactCount = obj.exact_count as number;
+    const siblingCount = obj.sibling_count as number;
+    if (obj.exact_holds.length !== Math.min(exactCount, 256) || obj.sibling_holds.length !== Math.min(siblingCount, 256) ||
+        obj.exact_complete !== (exactCount <= 256) || obj.sibling_complete !== (siblingCount <= 256) ||
+        obj.complete !== (obj.exact_complete && obj.sibling_complete)) throw terminalResponseError();
+    const ids = new Set<string>();
+    let open = false;
+    let closed = true;
+    for (const value of obj.exact_holds) {
+      const hold = terminalObject(value);
+      if (!terminalUUID(hold.id) || ids.has(hold.id.toLowerCase()) || (typeof hold.state !== "string" || !["open", "released", "discarded"].includes(hold.state))) throw terminalResponseError();
+      ids.add(hold.id.toLowerCase());
+      open ||= hold.state === "open";
+      closed &&= hold.state === "released" || hold.state === "discarded";
+    }
+    for (const value of obj.sibling_holds) {
+      const hold = terminalObject(value);
+      if (!terminalUUID(hold.id) || ids.has(hold.id.toLowerCase()) || !terminalGeneration(hold.generation) || hold.generation === generation) throw terminalResponseError();
+      ids.add(hold.id.toLowerCase());
+    }
+    const settled = obj.complete && exactCount >= 1 && closed && siblingCount === 0;
+    if ((obj.outcome === "settled" && !settled) || (obj.outcome === "retained" && obj.exact_complete && !open) ||
+        (obj.complete && obj.outcome !== (open ? "retained" : settled ? "settled" : "unknown"))) throw terminalResponseError();
+    return response as TerminalRejectionCustodyResponse;
+  }
+
+  private async terminalRejectionJSON(method: "GET" | "POST", path: string, body: unknown, callerSignal: AbortSignal | undefined, timeoutMs: number): Promise<unknown> {
+    const abort = new AbortController();
+    const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(timeoutMs), ...(callerSignal ? [callerSignal] : [])]);
+    // This is the last operation before every actual transport, including a shared-client clear.
+    if (!this.hasFeature("terminal_rejection_report")) return undefined;
+    const res = await this.fetchRaw(method, path, body, timeoutMs, signal);
+    try {
+      const raw = await readTerminalRejectionBody(res, signal);
+      if (!res.ok) throw new RequestError(method, path, res.status, "");
+      try { return JSON.parse(raw) as unknown; } catch { throw terminalResponseError(); }
+    } catch (err) {
+      abort.abort();
+      throw err;
+    }
+  }
+
   private async getJSON(path: string, timeoutMs?: number): Promise<unknown> {
     const res = await this.fetchRaw("GET", path, undefined, timeoutMs);
     if (res.status >= 400) throw await this.toError("GET", path, res);
@@ -2918,4 +3003,49 @@ function abortableSleep(
       },
     );
   });
+}
+
+const TERMINAL_REJECTION_RESPONSE_MAX_BYTES = 128 * 1024;
+function terminalResponseError(): Error { return new Error("invalid terminal rejection response"); }
+function terminalUUID(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+function terminalGeneration(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+function terminalObject(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw terminalResponseError();
+  return value as Record<string, unknown>;
+}
+
+/** Count actual streamed bytes, including whitespace, before decoding any JSON.
+ * Each read is deadline/abort bound; EOF or 128 KiB+1 observed bytes ends the loop.
+ * Oversize and HTTP errors never use Response.text or retain raw error bodies. */
+async function readTerminalRejectionBody(res: Response, signal: AbortSignal): Promise<string> {
+  if (!res.body) throw terminalResponseError();
+  const reader = res.body.getReader();
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  const onAbort = () => { void reader.cancel().catch(() => undefined); };
+  signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    while (true) {
+      signal.throwIfAborted();
+      const { done, value } = await reader.read();
+      signal.throwIfAborted();
+      if (done) break;
+      if (!value.byteLength) continue;
+      if (value.byteLength > TERMINAL_REJECTION_RESPONSE_MAX_BYTES - total) throw terminalResponseError();
+      total += value.byteLength;
+      parts.push(value);
+    }
+    return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(parts, total));
+  } catch (err) {
+    // One best-effort cancellation; a stalled cancellation promise cannot extend the deadline.
+    void reader.cancel().catch(() => undefined);
+    throw err;
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+    reader.releaseLock();
+  }
 }
