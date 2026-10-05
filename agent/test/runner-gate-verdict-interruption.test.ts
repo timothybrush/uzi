@@ -23,6 +23,7 @@ import { getEventListeners } from "node:events";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
@@ -32,7 +33,9 @@ import type { RunRunner, RunnerOptions } from "../src/runner.js";
 import { StubExecutor, type Executor } from "../src/executor.js";
 import type { AgentTemplate, ClaimResponse, StateRequest, UserInput } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
-import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith, simulateCommittedWork } from "./runner-harness.js";
+import { forceIncompleteHomeHelper } from "./forced-home-helper.js";
+import { scanRunProcesses, reapRunProcesses } from "../src/run-procs.js";
+import { TOKEN, api, baseUrl, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith, simulateCommittedWork } from "./runner-harness.js";
 
 installHarness();
 
@@ -321,7 +324,9 @@ class Scenario {
     const { gitlab } = fakeGitlab();
     const runner = runnerWith(
       () => ({
-        executor: opts.executor?.() ?? new SdkExecutor(nullLogger(), this.home, { queryFn: this.model.queryFn() }),
+        executor: opts.executor?.() ?? new SdkExecutor(nullLogger(), this.home, {
+          queryFn: this.model.queryFn(),
+        }),
         homeDir: this.home,
       }),
       gitlab,
@@ -466,7 +471,7 @@ class Scenario {
   }
 }
 
-/** Only selected callback failures collect diagnostics, before Scenario.teardown changes the evidence. */
+/** Collect callback failures before Scenario.teardown changes the evidence; omit input and plan bodies. */
 function scenarioFailureDiagnostic(s: Scenario, label: string): string {
   const text = (value: string | undefined): string =>
     value === undefined ? "<absent>" : value.length > 400 ? value.slice(0, 400) + "...<truncated>" : value;
@@ -539,30 +544,129 @@ function scenarioFailureDiagnostic(s: Scenario, label: string): string {
     generationReports: bounded(generationReports, 12),
     arrivalWindowObservations: bounded(arrivalWindowObservations, 12),
     cancellationRows: s.rowsOf("cancel").length > 0 ? "present" : "<no cancellation row>",
+    // Keep the end of long timelines: the finalization immediately before failure matters most.
+    timeline: {
+      total: api.timeline.filter((entry) => entry.runId === s.runId).length,
+      items: api.timeline.map((entry, index) => ({ entry, index }))
+        .filter(({ entry }) => entry.runId === s.runId)
+        .map(({ entry, index }) => entry.type === "state"
+          ? { index, type: entry.type, status: entry.status, planPresent: entry.plan_md !== undefined }
+          : { index, ...entry }).slice(-200),
+    },
+    handlerExceptions: bounded(api.handlerExceptions.map((entry) => ({ ...entry, error: text(entry.error) })), 20),
+    recentFeed: s.texts().slice(-30).map(text),
+    modelTurns: bounded(s.model.turns.map(({ kind, resume }) => ({ kind, resumed: resume !== undefined })), 40),
   });
 }
 
 async function scenario(
   fn: (s: Scenario) => Promise<void>,
   overrides: Partial<ClaimResponse> = {},
-  diagnosticLabel?: string,
+  diagnosticLabel = "unlabelled scenario",
 ): Promise<void> {
   const s = new Scenario(overrides);
   try {
     await fn(s);
   } catch (error) {
-    if (diagnosticLabel !== undefined) {
-      try {
-        console.error(`#1604 scenario failure: ${scenarioFailureDiagnostic(s, diagnosticLabel)}`);
-      } catch {
-        // A diagnostic failure must not replace the callback's original error.
-      }
+    try {
+      console.error(`#1604 scenario failure: ${scenarioFailureDiagnostic(s, diagnosticLabel)}`);
+    } catch {
+      // A diagnostic failure must not replace the callback's original error.
     }
     throw error;
   } finally {
     await s.teardown();
   }
 }
+
+describe("#2230 scenario failure diagnostics", () => {
+  it("an unlabelled failure retains terminal reasons, receipt/state order and handler exceptions", async (t) => {
+    const output: string[] = [];
+    t.mock.method(console, "error", (line: string) => output.push(line));
+    const failure = new Error("intentional scenario assertion failure");
+    await assert.rejects(scenario(async (s) => {
+      const claim = s.claim();
+      client.protocolFeatures = ["claim_generation_fence"];
+      const [row] = s.send(s.input("revise_plan", "diagnostic input body must be omitted"));
+      await client.ackInputs(s.runId, [row!.id], claim.claim_generation!);
+      api.onState(s.runId, () => { throw new Error("intentional FakeApi handler failure"); });
+      const response = await fetch(`${baseUrl}/api/worker/runs/${s.runId}/state`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "running", claim_generation: claim.claim_generation }),
+      });
+      assert.equal(response.status, 500);
+      await response.text();
+      api.onState(s.runId, () => {});
+      await client.reportState(s.runId, { status: "failed", claim_generation: claim.claim_generation, failure_reason: "diagnostic terminal reason", fail_origin: "diagnostic_origin" });
+      throw failure;
+    }), (error: unknown) => error === failure);
+    assert.equal(output.length, 1, "every scenario failure emits one diagnostic before cleanup");
+    const diagnostic = JSON.parse(output[0]!.slice("#1604 scenario failure: ".length));
+    assert.equal(diagnostic.handlerExceptions.total, 1, "the HTTP 500 retained its handler exception");
+    const reports = diagnostic.generationReports.items[0];
+    assert.deepEqual(reports.statuses.items, ["running", "failed"]);
+    assert.deepEqual(reports.failedReports.items, [{ failure_reason: "diagnostic terminal reason", fail_origin: "diagnostic_origin" }]);
+    assert.deepEqual(diagnostic.timeline.items.map((entry: { type: string }) => entry.type), ["receipt_call", "receipt_reply", "state", "state"]);
+    assert.equal(diagnostic.handlerExceptions.items[0].method, "POST");
+    assert.match(diagnostic.handlerExceptions.items[0].path, /\/state$/);
+    assert.match(diagnostic.handlerExceptions.items[0].error, /intentional FakeApi handler failure/);
+    assert.ok(!output[0]!.includes("diagnostic input body must be omitted"));
+  });
+
+  it("a successful scenario emits no failure diagnostic", async (t) => {
+    const output: string[] = [];
+    t.mock.method(console, "error", (line: string) => output.push(line));
+    await scenario(async (s) => {
+      await client.reportState(s.runId, { status: "completed" });
+    });
+    assert.deepEqual(output, []);
+  });
+});
+
+describe("#2230 scripted model process isolation", () => {
+  it("a process-free gate scenario completes when an unrelated proc scan is incomplete", async (t) => {
+    const helper = forceIncompleteHomeHelper(t);
+    await scenario(async (s) => {
+      helper.enabled = true;
+      const control = new SdkExecutor(nullLogger(), s.home, {
+        queryFn: s.model.queryFn(),
+        runProcesses: { scan: scanRunProcesses, reap: reapRunProcesses },
+      });
+      assert.equal((await control.reapAttributedProcesses()).complete, false, "explicit real operations still fail closed");
+      assert.equal(helper.calls, 1, "the control used the actual HOME helper seam");
+      helper.enabled = false;
+      helper.calls = 0;
+      const block = s.model.block("implement");
+      const flight = await s.toFirstGate();
+      s.send(s.input("approve_plan"));
+      await block.entered;
+      helper.enabled = true;
+      block.release();
+      await s.finish(flight);
+      assert.ok(s.statuses(flight).includes("completed"), JSON.stringify(s.states(flight)));
+      assert.equal(helper.calls, 0, "the preloaded SDK default never scanned live host processes");
+    });
+  });
+});
+
+describe("#2230 binary checkpoint publication in FakeApi", () => {
+  it("a valid Git pack gets the missing-route response without a JSON handler exception", async () => {
+    const header = Buffer.alloc(12);
+    header.write("PACK");
+    header.writeUInt32BE(2, 4); // Git pack v2, zero objects, followed by its SHA-1 trailer.
+    const pack = Buffer.concat([header, createHash("sha1").update(header).digest()]);
+    const publishPath = "/api/worker/runs/binary-pack-fixture/publish";
+    const response = await fetch(baseUrl + publishPath, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/octet-stream" },
+      body: pack,
+    });
+    assert.equal(response.status, 404, "the fake does not claim it persisted a checkpoint");
+    assert.deepEqual(await response.json(), { error: "not found", path: publishPath });
+    assert.deepEqual(api.handlerExceptions, [], "binary routing did not throw a JSON decode error");
+  });
+});
 
 /** Assert a resumed claim revised the submitted plan with `feedback` instead of re-presenting it. */
 function assertRevisedOnResume(s: Scenario, flight: Flight, feedback: string, session: "kept" | "lost" | "none"): void {
