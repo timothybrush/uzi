@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **New hosted workers default to the large preset ([#2240](https://github.com/vtmocanu/uzi/issues/2240)).**
+  Ephemeral provisioning defaults and falls back to L, and the persistent provision form preselects L. Existing workers keep their sizes; new workers reserve more CPU and memory capacity.
+
 ## [0.85.2] - 2026-10-05
 
 ### Changed
