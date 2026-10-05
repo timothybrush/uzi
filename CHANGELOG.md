@@ -22,6 +22,8 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.85.2] - 2026-10-05
+
 ### Changed
 
 - **Findings stay in the backlog; admin health DMs cover instance danger ([#2271](https://github.com/vtmocanu/uzi/issues/2271)).**
@@ -105,7 +107,7 @@ through `[0.52.0]`.)
   Generic failure logs, feed events and stored reasons replace control and bidirectional formatting characters after secret redaction, while preserving the existing 512-character report limit.
 - **A run's forge token and caches stay protected when a leftover process survives the reap ([#1828](https://github.com/vtmocanu/uzi/issues/1828)).**
   On a Claude run, a process carrying the run's HOME that the worker could not kill, or a reap that could not finish, now blocks every step that publishes or settles the run (finalize push, failure settlement, pause, completion hold, wall park, credential switch, recovery and checkpoint publishes) the same way an unproven clone does: the run keeps custody, keeps running (a failed pause) or fails with `worker_residue_blocked`. A re-claimed run reaps its HOME before its clone fetch, and a park or the periodic disk reclaim drops the run's rebuildable caches only once no such process is left.
-- **Worker upgrade waits no longer trigger premature capacity alarms (#2184).**
+- **Worker upgrade waits no longer trigger premature capacity alarms ([#2184](https://github.com/vtmocanu/uzi/pull/2184)).**
   Run health identifies currently suitable draining workers; admin capacity confirms each upgrade wait, preserves genuine five-minute alarms, and reports overdue upgrade waits after 24 hours of overlap.
 - **Codex runs keep their work when a refresh response is lost ([#1770](https://github.com/vtmocanu/uzi/issues/1770)).**
   Updated workers reconcile the refresh once, then keep the work, session and custody while a vault lock or unknown outcome prevents safe recovery. Runs resume after unlock and recovery checks without spending the original refresh token again; no merge request opens before a successful resume. Deploy the API before the updated workers; older workers keep their first-request vault-lock reply but still need the worker update to survive a lost response.
@@ -4833,7 +4835,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.85.1...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.85.2...HEAD
+[0.85.2]: https://github.com/vtmocanu/uzi/compare/v0.85.1...v0.85.2
 [0.85.1]: https://github.com/vtmocanu/uzi/compare/v0.85.0...v0.85.1
 [0.85.0]: https://github.com/vtmocanu/uzi/compare/v0.84.0...v0.85.0
 [0.84.0]: https://github.com/vtmocanu/uzi/compare/v0.83.1...v0.84.0
