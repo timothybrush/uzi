@@ -1,6 +1,6 @@
 # PRD #2275: Workers in the TUI
 
-**Status**: Draft. Resolved facts below were read at `main` `10d18291`. Reviewed by an architect, a tui-ux reviewer and a Codex peer before landing.
+**Status**: Implemented with automated acceptance coverage. M1 and M2 are implemented; ANSI scenes are generated and asserted in both themes. D12 PNG rendering, the `tui-ux` screenshot review and the maintainer's `--demo` and live drive are done; the maintainer's review round is recorded as D14-D21. Resolved facts below were read at `main` `10d18291`. Reviewed by an architect, a tui-ux reviewer and a Codex peer before landing.
 
 **Design mock**: `prds/mockups/2275-workers-tui-mock.sh` (run `bash prds/mockups/2275-workers-tui-mock.sh` in a terminal; its header lists the keys). The mock is the agreed visual and navigation reference. It is a throwaway bash script with static fixture data. It is not shipped code and never a parallel model for the TUI (`.claude/rules/tui.md`). Where the mock and this PRD disagree, this PRD wins. The mock's `w` (width 80/120) and `z` (summary on/off) keys exist only for comparing layouts; they are not product keys (`w` is the shipped `keyRework`).
 
@@ -16,12 +16,12 @@
 
 ## Outcome
 
-`uzi tui` gains a `workers` view, second in the tab strip: `1 floor · 2 workers · 3 pulls · 4 ci`.
+`uzi tui` gains a `workers` view, second in the tab strip: `floor  workers  pulls  ci` (keys `1`-`4`; the digits appear only in the `?` help, D14).
 
 - **List.** Sorted so the workers needing attention come first, it answers "why can't this worker take work?" before it shows resource figures.
 - **Drill-in.** Explains one worker.
 - **Split view.** Workers is a top-pane view alongside the floor; pulls and ci stay in the bottom pane.
-- **Floor.** Shows a one-line fleet summary, and each run's worker on wide terminals.
+- **Floor.** The fleet status rides right-aligned on the title line (D15), and each run's worker shows on wide terminals.
 
 Acceptance examples (counts are from the `demo.go` seed this PRD adds, which mirrors the mock's fixtures):
 
@@ -32,17 +32,17 @@ Acceptance examples (counts are from the `demo.go` seed this PRD adds, which mir
      - info rows (lease, chat);
      - then workers with no attention item.
    - Within a row, items are listed worst first.
-   - **Summary line.** Reads `your workers · 9 · 8 online · 5/12 slots in use +1 ?cap · 1 holding · 1 draining · 6 need attention`; the count includes only workers with a danger or warn item (D11).
+   - **Fleet status.** Right-aligned on the title line (D15), narrowed to fit: `workers · 9 · 8 online · 5/12 slots in use +1 ?cap · 1 holding · 1 draining · 6 need attention` in full; the count includes only workers with a danger or warn item (D11).
    - **Detail.** `enter` on `forge-small` opens its detail. Attention comes first (blocking container `seed-nix`, reason `ImagePullBackOff`, target vs running version), then reported runs, resources (`stale, last-known` label, `?` for absent readings), then configuration. `esc` returns to the list with `forge-small` still selected, even after a poll reorders rows.
 2. A 60×120 terminal (above `splitMinHeight`) with the split drawn.
-   - **Workers on top.** Press `2`. The top pane shows the workers list in its 80-column layout with focus, and the bottom pane keeps CI.
+   - **Workers on top.** Press `2`. The top pane shows the workers list with focus, in the wide layout at ≥120 columns (D17), and the bottom pane keeps CI.
    - **Pane keys.** `ctrl+w` moves focus to CI and back. `4`/`3` switch the bottom pane between ci and pulls, and `1` returns the top pane to the floor.
    - **`tab` order.** `tab` cycles floor → workers → pulls → ci, each view landing in its own pane.
    - **Drill-in and back.** `enter` on a focused worker opens its detail full-screen; `esc` returns to the split with workers on top, the same worker selected and the top pane focused.
    - **Collapse.** `s` collapses to the top pane's view (workers), and `s` again restores both panes.
 3. **Floor, 120 columns, demo seed.**
    - Each run row ends with its worker name.
-   - The fleet summary line under the tab strip reads `workers 5/12 slots in use · 8/9 online · 6 need attention · 2 for detail`.
+   - The title line carries the fleet status right-aligned (D15), and the account-meter line carries the run summary right-aligned.
    - From the floor, open the run on `forge-large` and press `W`: that worker's detail opens, and `esc` returns to the run.
    - In worker detail, `enter` on a reported run opens that run, and `esc` returns to the worker.
    - **Unclaimed run.** On a queued run (no worker), `W` shows `no worker yet` in the footer and stays put.
@@ -102,17 +102,15 @@ Acceptance examples (counts are from the `demo.go` seed this PRD adds, which mir
   - the `[floor]` bracket in `splitHeader` (`tui_split.go:269`) brackets the top pane's tab;
   - `splitFooterLine` (`tui_split.go:222-230`) gets workers hints;
   - `splitSeparatorAt`'s focus test (`tui_split.go:151`) treats either top view as top-focused.
-- **Pane height.** The workers top pane uses the floor's height allocation and the 80-column layout regardless of terminal width.
+- **Pane height.** The workers top pane uses the floor's height allocation and the same width-driven layout as full screen: the wide table at ≥120 columns (D17).
 - **Drill-in from the top pane.** `enter` on a top-pane worker opens `viewWorker` full-screen through the existing `fromSplit` path (`tui_board.go:352`). `esc` restores the split with `topTab = viewWorkers`, the same selected worker ID and the top pane focused.
 
 ### Fleet summary line and height accounting (`tui_board.go`, `tui_split.go`)
 
-- **Placement.** The summary renders as one row directly under the tab strip on the floor (full-screen, and in split when `topTab = viewBoard`). The workers view renders its own fuller summary in the same slot.
-- **Height.** It is charged to the chrome:
-  - `splitSharedChrome` gains one row, so `splitMinHeight` grows by 1 (D4);
-  - the full-screen board chrome in `boardCapacityAt` (`tui_board.go:975-987`) also gains one row.
-- **Shown only when the viewer has at least one worker.** With zero workers, the row is not drawn and not charged.
-- **At 80 columns** the summary never wraps: it drops segments in priority order (unknown-cap note, then holding/draining/cordoned counts, then the online count) until it fits. It always keeps slots in use and the attention count.
+- **Placement.** Superseded by D15: the fleet status is right-aligned on the title line on the floor and the workers views, full screen and split, narrowed to the space left after the tabs; it takes its own row only when even its shortest form does not fit (full-screen 80 columns). The workers view has no separate summary line.
+- **Height.** Charged only when drawn: the fleet status's fallback row (when even its shortest form does not fit beside the tabs) and the run summary's fallback row (when it does not fit beside the account meters). `splitSharedChrome` counts the worst case of the shared header, so the split thresholds stay at 41/43 rows; tiny full-screen viewports crop the body and keep the footer.
+- **Shown only when the viewer has at least one worker.** With zero workers, the fleet status is not drawn.
+- **Narrowing.** The status never wraps: it drops, in order, the unknown-cap note, then the holding/draining/cordoned counts, then the worker count and the online count. It always keeps the scope, slots in use and the attention count.
 
 ### Workers fetch and polling (new `tui_workers.go`)
 
@@ -158,7 +156,7 @@ Acceptance examples (counts are from the `demo.go` seed this PRD adds, which mir
 - **Severity glyphs** are shown on every item, so severity survives without colour: `✕` danger, a state-specific glyph (`⚑`, `◷`, `⇡`, `◐`, `◌`, `↑`) or else `▲` warn, `·` info. `!` is not used: the floor already uses it for `awaiting`. "N need attention" counts workers with at least one danger or warn item (D11).
 - **Ordering.** Rows sort by worst severity (danger, warn, info, none), then name. The cursor is tracked by worker `ID`, so a poll that reorders rows keeps the selection, and `esc` from detail restores by ID. A worker that disappeared from the list selects the row at its old index.
 - **Occupancy.** Run slots render as `ActiveRuns/MaxConcurrentRuns`, with `?` for a null cap, never `0`. The summary reports occupancy ("N/M slots in use" over online workers, plus an unknown-cap count), never schedulable capacity. Holding, draining and cordoned counts are listed separately (D8).
-- **Phase and stage.** `ReportedRuns[i].Phase` (closed enum `running | awaiting_approval | awaiting_input | awaiting_followup`) is the worker's phase. The run's own status and stage come from the board cache and are labelled separately, falling back to the run id when the run is not cached (D9).
+- **Phase and stage.** `ReportedRuns[i].Phase` (closed enum `running | awaiting_approval | awaiting_input | awaiting_followup`) is the worker's phase. The run's stage comes from the board cache, shown as `run stage`, and the run id stands in when the run is not cached (D9).
 
 ### Rendering (`tui_workers.go`)
 
@@ -169,13 +167,13 @@ Acceptance examples (counts are from the `demo.go` seed this PRD adds, which mir
 - **Selected-row readout** under the list: every attention item, plus the owner in factory scope. One item per line at 80 columns.
 - **Detail sections, in order:**
   - **Attention.**
-  - **Reported runs:** worker phase, outcome pending, run stage and generation.
-    - `enter` opens the run by id through the existing run-detail entry, which fetches the run itself, so the run need not be cached.
+  - **Reported runs:** `#iid title engine`, then the worker phase, outcome pending, run stage and generation; `j`/`k` select a reported run.
+    - `enter` preflights the run by id with `GetRun`, so the run need not be cached. The successful DTO enters through the normal guarded detail handler, including input-fetch and blink side effects, then tail and stream loading start without a second initial `GetRun`.
     - A 404 shows `run not visible` in the footer and stays put.
   - **Resources:**
     - cpu; memory, labelled `process only` when `StatsSource == "process"`;
     - data, nix and dind disks with inodes, where dind and inodes are labelled display-only;
-    - largest runs from `RunDisk`, with `≥` when `Truncated` and the `SampledAt` age;
+    - the largest run's HOME from `RunDisk` (one line), with `≥` when `Truncated` and the `SampledAt` age;
     - a `stale, last-known` label when offline.
   - **Configuration:** version and `UpgradeTarget`; capabilities; template declared and reported; token mode (`default`, `auto`, or the pinned label); `ephemeral` with the lease remaining; owner in factory scope.
 - **Untrusted text (D7 guard).** The bare wire names `Name`, `Version` and friends collide with existing draws (`tui_d7_guard_test.go:179-213`). So, following `ciRowText` / `ciTextOf` (`tui_ci.go`):
@@ -198,7 +196,9 @@ Acceptance examples (counts are from the `demo.go` seed this PRD adds, which mir
 ### Floor additions (`tui_board_rows.go`, `tui_detail.go`)
 
 - **Worker cell.** At ≥120 columns each floor run row ends with `runWorkerName`; at 80 the cell is dropped.
-- **Run detail rail** shows the worker name. `W` (shift+w, unbound everywhere at `10d18291`) opens that worker's `viewWorker`; `esc` returns to the run.
+- **Run detail rail** shows the worker name. `W` (shift+w, unbound everywhere at `10d18291`) opens that worker's `viewWorker`; `esc` reopens the originating run in a fresh session with its original return target.
+  - One worker-origin context retains list selection, scroll and pane state, or the originating run ID and return target. Further cross-links update that context instead of accumulating history. A reported run returns to the current worker without overwriting its origin.
+  - Every departing run closes its stream, invalidates its session and discards loaded detail, transcript buffers, guards and fallback handles. Returning uses the normal newest-first entry and background history backfill; no loaded session is suspended or restored. PR round-trips from a run likewise retain only a run ID and return target.
   - If `WorkerID` is nil (queued, unclaimed or wall-parked), `W` shows `no worker yet` and stays put.
   - If the worker is not in the current list (for example the admin board while the shared list is own-scope, or a worker removed since), `W` refetches once. If the worker is still absent it shows `worker not in your list` and stays put.
 
@@ -264,7 +264,7 @@ Contents:
 - `workerRow`, state, attention, sort, and cursor by ID;
 - the list at both widths, in own and factory scope;
 - `topTab` and the split semantics, including collapse to `topTab` and every return-to-top site;
-- the fleet summary line and its height accounting;
+- the title-line fleet status, the meter-line run summary and their height accounting;
 - the stale `tui_keys.go` comment;
 - D7 projections and guard entries for list text;
 - the demo seed, the list, split and floor uxlab scenes, and `docs/cli.md` with `task docs:sync`.
@@ -286,6 +286,19 @@ Contents:
 
 - Blocked by: M1.
 - Acceptance: example 1 (detail half), example 2 (drill-in), and example 3. The test-plan items for M2 pass.
+
+## Implementation progress
+
+- [x] M1: list, shared polling and scope, split top pane, fleet summary, demo and docs.
+- [x] M2: four-section detail, single-origin cross-links and fresh run sessions, floor/rail worker names.
+- [x] Automated navigation, polling, untrusted text, resource and dimension acceptance tests.
+- [x] Nine feature ANSI scenes generated in dark and light themes; content and bounds asserted.
+- [x] D12: render uxlab PNGs.
+- [x] D12: `tui-ux` screenshot review against the mock.
+- [x] D12: drive `uzi tui --demo` manually (maintainer, live and demo, 2026-10-05).
+- [x] Maintainer review round: D14-D21 applied, mock updated to match.
+
+The factory-only demo worker is cordoned to cover all six primary states; the nine own workers and their acceptance totals remain unchanged. Nix shows no inode reading because the existing DTO carries no nix inode fields.
 
 ## Acceptance (live, maintainer)
 
@@ -312,3 +325,16 @@ The implementation run does not do this step (D12).
 - **D11, three attention severities, and only danger and warn count as "need attention".** An ephemeral lease or a lone chat is information, not a problem. Counting them would make a healthy fleet read as needing attention.
 - **D12, PNG rendering and the `tui-ux` visual review are a maintainer pre-merge step.** uxlab's PNG half needs devbox `charm-freeze` (`api/cmd/uzi/uxlab/devbox.json`), which an egress-restricted uzi worker cannot be relied on to fetch. The run still generates the scenes under `go test` and asserts on the frames.
 - **D13, collapse goes to the top pane's view.** With the floor on top, this is today's behaviour exactly. Rejected: collapsing to whichever pane has focus, which would change shipped behaviour for ci and pulls.
+- **D1 amended by D14** (strip text only; the key numbering stands).
+
+Maintainer review of the implementation (user decisions 2026-10-05, prototyped, rendered and reviewed by `tui-ux`; the mock was updated to match):
+
+- **D14, no digits in the strip or footers.** The strip reads `floor  workers  pulls  ci`, as before this PRD; `1`-`4` still select the tabs and are listed in the `?` help only. Rejected: D1's `1 floor · 2 workers …` labels, which the maintainer found noisy.
+- **D15, the fleet status lives on the title line, right-aligned,** on the floor and workers views in both layouts, with the fuller content (`workers · 9 · 8 online · 5/12 slots in use +1 ?cap · 1 holding · 1 draining · 6 need attention`, `factory workers` in factory scope). It narrows against the width left after the tabs and takes its own row only as a last resort. The floor's run summary (`$… 7d · N runs · a–b`) moves to the account-meter line, right-aligned. Rejected: a separate fleet row (costs a row on every screen) and the stats inside the `workers` tab label (blurs the tab boundaries).
+- **D16, split titles per pane.** The split's title line shows only the top pane's tabs, `floor · workers`, mirroring the bottom divider's `pulls · ci`; the focused pane's selected tab is bracketed (`[workers]`), the other pane's selected tab is plain. Worker detail opened from the split is full screen and shows the full four-tab strip. With workers on top, the floor's account meters and run summary are hidden.
+- **D17, the wide table in split.** The workers top pane follows the terminal width like full screen, replacing "80-column layout regardless of width". VERSION is sized to the longest visible version (cap 18), so `0.85.1+gba846d7` is not cut.
+- **D18, colour on the shared ANDON tokens.** busy sage (a running run), idle faint, holding/⚑ amber, warn items, offline, outdated, ◷, ⇡, drift and 75-89% stall, danger items and ≥90% alarm, draining/cordoned wait, healthy readings default ink. Every signal keeps its glyph or word for NO_COLOR.
+- **D19, the detail follows the mock.** One header line `worker › <name>  <state>  <kind>  up … · heartbeat …` (the uptime part drops when unknown and wraps below when narrow), lowercase tungsten section headings, an aligned key column, `▮▯` usage bars, coloured attention items, runs as `#iid title engine` with the worker phase, run stage and generation.
+- **D20, navigation and spacing like the other tabs.** `→` opens (list → detail, detail → run) and `←` goes back. Blank lines, not rules, separate the header and the `selected …` readout from the table. An empty attention cell reads `—`; the owner column reads `you` for the viewer's own workers.
+- **D21, the floor's worker cell never shows `?`.** `worker_name` is null for a run not yet claimed and for a finished run whose ephemeral worker was deleted (`runs.worker_id` is `ON DELETE SET NULL`). The cell reads `no worker yet` and `—` respectively. Rejected for this PRD: snapshotting the worker name on the run, which needs a migration.
+- **Bug found in review:** the hosted size arrives lowercase (`l`), so KIND showed `host·?` for every live hosted worker while the uppercase demo seed hid it. The size is matched case-insensitively and the demo seed is lowercase.
