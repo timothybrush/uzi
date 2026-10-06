@@ -37,6 +37,12 @@ import {
   type CodexCommittedGenerationCell,
 } from "../src/codex/codex-executor.js";
 import { WorkerClient, RequestError, CodexRequestFailure } from "../src/client.js";
+import { ProviderPolicyRefusal } from "../src/provider-policy-refusal.js";
+import { RunRunner } from "../src/runner.js";
+import { GitCache } from "../src/git.js";
+import { FakeApi } from "./fake-api.js";
+import { makeFixture } from "./fixture-repo.js";
+import { makeClaim, testGitCacheOptions } from "./helpers.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { WORKER_UID, RUNNER_UID } from "../src/runner-uid.js";
@@ -816,8 +822,196 @@ describe("CodexExecutor: dark selection seam (the makeExecutor decision)", () =>
   });
 });
 
+describe("approved actual CodexExecutor policy flow (#2321)", () => {
+  for (const phase of ["plan", "implement"] as const) for (const tag of ["cyberPolicy", "misalignmentPolicyViolation"] as const) it(`root ${phase} ${tag} refusal after delegated validators/work reaches RunRunner`, async () => {
+    const api = new FakeApi("policy-worker");
+    const url = await api.listen();
+    const fx = makeFixture();
+    let childSucceeded = false;
+    let worktree = "";
+    const diagnostics: Record<string, unknown>[] = [];
+    const log: Logger = { ...noopLog, error: (message, fields) => { if (message === "run failed") diagnostics.push(fields ?? {}); }, child: () => log };
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "validator-thread" } };
+      if (c.method === "turn/start") {
+        const th = String(rec(c.params).threadId);
+        if (th !== "th-1") {
+          c.transport.push(agentMessage("validation/work completed", th)).push(turnCompleted("completed", th, "validator-turn"));
+          childSucceeded = true;
+          return { turn: { id: "validator-turn" } };
+        }
+        if (phase === "implement") c.transport.push(toolCall(770, "Bash", { command: "echo implemented artifact" }, "th-1", "tn-1", "work-call"));
+        else c.transport.push(toolCall(771, "spawn_agent", { subagent_type: "validator", prompt: "Validate the plan" }, "th-1", "tn-1", "validation-call"));
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    rig.deps = { ...rig.deps, spawnCommand: async () => {
+      await fs.writeFile(path.join(worktree, "IMPLEMENTED.txt"), "observable implemented work\n");
+      return { code: 0, stdout: "artifact written", stderr: "" };
+    } };
+    const respond = rig.transport.respond.bind(rig.transport);
+    rig.transport.respond = (id, body) => {
+      respond(id, body);
+      if (id === 770) {
+        assert.equal(rec(rec(body).result).success, true, "work callback succeeded");
+        rig.transport.push(toolCall(771, "spawn_agent", { subagent_type: "validator", prompt: "Validate implemented work" }, "th-1", "tn-1", "validation-call"));
+      }
+      if (id === 771) {
+        assert.equal(rec(rec(body).result).success, true, "actual delegated validator settled successfully");
+        assert.equal(childSucceeded, true);
+        const terminal = { ...turnCompleted("failed"), params: { threadId: "th-1", turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: tag, message: "PRIVATE-PROVIDER-TEXT" } } } };
+        rig.transport.push(terminal);
+      }
+    };
+    const client = new WorkerClient(url, "policy-worker", "test", noopLog, { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const git = new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions());
+    const claim = makeClaim({
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+      agents: [{ name: "lead", description: "lead", prompt_body: "lead", tools: null, skills: [] },
+        { name: "validator", description: "validator", prompt_body: "validator", tools: null, skills: [] }],
+      ...(phase === "implement" ? { plan_approved: true, plan_source: "seeded", plan_md: "implement then validate" } : {}),
+    });
+    try {
+      await new RunRunner(client, git, () => ({ executor: { run: ctx => { worktree = ctx.worktreePath; return executor.run(ctx); } } }), log, 20, undefined, {
+        pollMs: 5,
+        quiesceRun: async req => ({ process: { state: req.site === "terminal_retire" ? "unverified" : "quiescent", processes: [], killed: [], detail: "retain fixture artifact" },
+          docker: { state: "not_wired", removed: [], detail: "not wired" } }),
+      }).execute(claim);
+      assert.equal(childSucceeded, true, "delegation ran before root refusal");
+      const failed = api.states.filter(s => s.body.status === "failed").at(-1)?.body;
+      assert.ok(failed);
+      assert.equal(failed.fail_origin, "provider_policy_refusal");
+      assert.equal(failed.failure_reason, `Codex provider safety-policy refusal (${tag})`);
+      const event = api.messages(claim.run_id).find(m => m.payload.event === "provider_policy_refusal" && m.payload.origin === "root");
+      assert.ok(event);
+      assert.equal(event.payload.policy_tag, tag);
+      assert.equal(event.payload.phase, phase === "plan" ? "planning" : "implementation");
+      assert.deepEqual(diagnostics.at(-1)?.policyRefusal, event.payload);
+      if (phase === "implement") assert.equal(await fs.readFile(path.join(worktree, "IMPLEMENTED.txt"), "utf8"), "observable implemented work\n");
+      assert.ok(!JSON.stringify(api.states).includes("PRIVATE-PROVIDER-TEXT"));
+    } finally {
+      await api.close();
+      fx.cleanup();
+    }
+  });
+});
+
 // ================================================================================
 describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
+  for (const control of ["cancel", "pause", "wall"] as const) it(`policy refusal (#2321) retains ${control} precedence during awaited root emission`, async () => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push({ ...turnCompleted("failed"), params: { turn: { status: "failed", error: { codexErrorInfo: "cyberPolicy" } } } });
+    const abort = new AbortController();
+    const { ctx, emitted } = makeCtx({ signal: abort.signal });
+    let parks = 0;
+    if (control === "pause") {
+      // Arm after the provider is active, rather than before turn admission.
+      ctx.pauseModeRequested = () => abort.signal.aborted ? "now" : null;
+      ctx.parkForPause = async () => { parks++; return true; };
+    }
+    if (control === "wall") {
+      ctx.pauseModeRequested = () => abort.signal.aborted ? "wall" : null;
+      ctx.parkForWall = async () => { parks++; return "parked"; };
+    }
+    ctx.emit = m => {
+      emitted.push(m);
+      if (m.payload.event === "provider_policy_refusal") abort.abort(control === "cancel" ? undefined : new PauseNowSignal());
+    };
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    if (control === "cancel") await assert.rejects(running, /run cancelled/);
+    else {
+      const result = await running;
+      assert.ok(control === "wall" ? result.walled : result.pausedAt);
+      assert.equal(parks, 1);
+    }
+    assert.equal(emitted.filter(m => m.payload.event === "provider_policy_refusal").length, 1);
+    assert.equal(rig.transport.turnStartCount, 1);
+  });
+
+  it("policy refusal (#2321) preserves an active pause-boundary quiescence failure", async () => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) {
+          c.transport.push(toolCall(1, "spawn_agent", { subagent_type: "coder", prompt: "help" }, "th-1", "tn-1", "c-spawn"));
+          return { turn: { id: "tn-1" } };
+        }
+        c.transport.push(toolCall(11, "uzi_bash", { command: "echo child work" }, "th-child", "tn-child", "c-bash"));
+        return { turn: { id: "tn-child" } };
+      }
+      return {};
+    } });
+    let shellStarted = false;
+    let releaseShell!: () => void;
+    const shellGate = new Promise<void>(resolve => { releaseShell = resolve; });
+    // Keep the real child callback unsettled through the boundary, even after its signal aborts.
+    rig.deps = { ...rig.deps, spawnCommand: async () => {
+      shellStarted = true;
+      await shellGate;
+      return { code: 0, stdout: "late", stderr: "" };
+    } };
+    const abort = new AbortController();
+    let executor!: CodexExecutor;
+    let parks = 0;
+    let sinkCalled = false;
+    const { ctx, emitted } = makeCtx({
+      signal: abort.signal,
+      agents: [
+        { name: "lead", description: "lead", prompt_body: "lead", tools: null, skills: [] },
+        { name: "coder", description: "coder", prompt_body: "coder", tools: null, skills: [] },
+      ],
+      pauseModeRequested: () => abort.signal.aborted ? "now" : null,
+      parkForPause: async () => {
+        parks++;
+        await executor.safety!.withBoundary({ boundary: "park", deadlineMs: 200 }, async () => { sinkCalled = true; });
+        return true;
+      },
+    });
+    ctx.emit = message => {
+      emitted.push(message);
+      if (message.payload.event === "provider_policy_refusal") abort.abort(new PauseNowSignal());
+    };
+    executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const running = executor.run(ctx);
+    // Attach the rejection assertion before delivering the competing terminal.
+    const rejected = assert.rejects(withTimeout(running, 4000, "policy refusal quiescence competition"), error => {
+      assert.ok(error instanceof CodexBoundaryError, `got ${String(error)}`);
+      assert.equal(error.stage, "quiesce");
+      assert.ok(error.errors.some(e => /callback\/child-turn reservation\(s\) unsettled/.test(e.message)), JSON.stringify(error.errors));
+      return true;
+    });
+    try {
+      await waitFor(() => shellStarted, "child callback before root refusal");
+      rig.transport.push({ ...turnCompleted("failed"), params: {
+        threadId: "th-1", turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "cyberPolicy" } },
+      } });
+      await rejected;
+      assert.equal(parks, 1, "the refusal competed with an active park boundary");
+      assert.equal(sinkCalled, false, "failed quiescence prevented the park sink");
+      const refusals = emitted.filter(message => message.payload.event === "provider_policy_refusal");
+      assert.equal(refusals.length, 1, "the refusal remains a separate observation");
+      assert.equal(refusals[0]!.payload.policy_tag, "cyberPolicy");
+      assert.equal(refusals[0]!.payload.origin, "root");
+      assert.equal(rig.providerLaunches(), 1, "no provider re-drive followed the failed boundary");
+    } finally {
+      releaseShell();
+      await running.catch(() => undefined);
+      await rejected;
+    }
+  });
+
+  it("policy refusal (#2321) also preserves a sticky cancellation without an AbortSignal", async () => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push({ ...turnCompleted("failed"), params: { turn: { status: "failed", error: { codexErrorInfo: "cyberPolicy" } } } });
+    let cancelled = false;
+    const { ctx, emitted } = makeCtx({ cancelRequested: () => cancelled });
+    ctx.emit = m => { emitted.push(m); if (m.payload.event === "provider_policy_refusal") cancelled = true; };
+    await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), /run cancelled/);
+    assert.equal(emitted.filter(m => m.payload.event === "provider_policy_refusal").length, 1);
+  });
+
   it("(9) a clean-EOF terminal returns and emits the accumulated result", async () => {
     const rig = makeRig();
     rig.transport.push(threadStarted()).push(agentMessage("working on it")).push(signalDone()).push(turnCompleted("completed")).end();
@@ -2142,6 +2336,59 @@ describe("CodexExecutor: delegation projection (issue #1583 m2)", () => {
     { name: "lead", description: "the lead", prompt_body: "lead body", tools: null, skills: [] },
     { name: "coder", description: "a coder", prompt_body: "coder body", tools: null, skills: [] },
   ];
+  for (const rootFails of [false, true]) it(`policy refusal (#2321): serialized child reply then ${rootFails ? "root refusal" : "parent success"}, beyond display caps`, async () => {
+    const rig = makeRig({ responder: delegationResponder((t, th, tn) => {
+      for (let i = 0; i < 2002; i++) t.push(agentMessage("bounded child display", th));
+      t.push({ ...turnCompleted("failed", th, tn), params: { threadId: th, turn: { id: tn, status: "failed",
+        error: { codexErrorInfo: "misalignmentPolicyViolation", message: "PRIVATE" } } } });
+    }) });
+    rig.transport.push(threadStarted()).push(spawn(31, "policy-call", { subagent_type: "coder", prompt: "work" }));
+    const { ctx, emitted } = makeCtx({ agents });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let entered!: () => void;
+    const entry = new Promise<void>(resolve => { entered = resolve; });
+    ctx.emit = async m => {
+      emitted.push(m);
+      if (m.payload.event === "provider_policy_refusal" && m.payload.origin === "child") { entered(); await gate; }
+    };
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    // Attach rejection before driving the root's final terminal.
+    const outcome = running.then(value => ({ value }), error => ({ error }));
+    await entry;
+    assert.equal(responsesFor(rig, 31), 0, "sink finishes before broker settlement/reply");
+    release();
+    await waitFor(() => responsesFor(rig, 31) === 1, "policy child reply");
+    const reply = rec(rec(rig.transport.responses.find(r => r.requestId === 31)!.response).result);
+    const serialized = JSON.parse(String(rec((reply.contentItems as unknown[])[0]).text));
+    assert.equal(reply.success, false);
+    assert.equal(serialized.code, "child_policy_refused");
+    const childEvent = emitted.find(m => m.payload.event === "provider_policy_refusal")!;
+    assert.equal(childEvent.kind, "status");
+    assert.equal(childEvent.agent, "worker");
+    assert.deepEqual(serialized.policyRefusal, childEvent.payload);
+    assert.equal(childEvent.payload.phase, "implementation");
+    assert.ok(emitted.some(m => m.payload.text === "[further subagent output not shown]"), "display cap actually fired");
+    if (rootFails) rig.transport.push({ ...turnCompleted("failed"), params: { threadId: "th-1", turn: { id: "tn-1", status: "failed",
+      error: { codexErrorInfo: "cyberPolicy", message: "PRIVATE" } } } });
+    else rig.transport.push(signalDone()).push(turnCompleted());
+    const result = await outcome;
+    const events = emitted.filter(m => m.payload.event === "provider_policy_refusal");
+    assert.equal(events.length, rootFails ? 2 : 1);
+    if (rootFails) {
+      assert.ok("error" in result);
+      const refusal = result.error as ProviderPolicyRefusal;
+      assert.ok(refusal instanceof ProviderPolicyRefusal);
+      assert.deepEqual(refusal.policyRefusal, events[1]!.payload);
+      assert.equal(childEvent.payload.parent_correlation_id, refusal.policyRefusal.correlation_id);
+      const frame = emitted.find(m => m.payload.event === "result" && m.kind === "error")!;
+      assert.deepEqual(frame.payload.policyRefusal, refusal.policyRefusal);
+      assert.ok(!("role" in refusal.policyRefusal) && !("parent_correlation_id" in refusal.policyRefusal));
+    } else assert.ok("value" in result && result.value.branch);
+    assert.ok(!JSON.stringify(emitted).includes("PRIVATE"));
+    assert.equal(rig.transport.turnStartCount, 2, "one root and one child, no policy retry");
+  });
+
   const DISPATCH_ID = /^cx-[0-9a-f]{12}-t\d+-/;
 
   /** Root th-1/tn-1; the k-th child thread is `th-child-k` and its turn `tn-<thread>`. On a
@@ -11338,6 +11585,44 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     assert.equal(threadIds[1], threadIds[0], "the retry runs in the same thread");
     assert.equal(errorResults(emitted).length, 1, "only the failed attempt published an error result");
   });
+
+  // #2321 review finding: a non-retrying transport error notification followed by a failed
+  // terminal that classifies as a provider policy refusal must stay a terminal policy refusal.
+  for (const tag of ["cyberPolicy", "misalignmentPolicyViolation"] as const) {
+    it(`(b0) a transport notification then a ${tag} terminal is NOT retried or recovery-parked`, async () => {
+      const responder: Responder = (c) => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount === 1) c.transport.push(threadStarted());
+          c.transport
+            .push({
+              kind: "codex_error", method: "error", threadId: "th-1", turnId: "tn-1", willRetry: false,
+              params: { error: { codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 503 } } } },
+            })
+            .push(turnCompletedWithError(tag));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      };
+      const rig = makeRig({ responder });
+      tinyBackoff(rig);
+      const { ctx, emitted } = makeCtx();
+      await assert.rejects(
+        withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "policy refusal not retried"),
+        (e: Error) => {
+          assert.ok(!(e instanceof TransientRecoveryError), `got ${e.name}: ${e.message}`);
+          assert.match(e.message, new RegExp(`${tag}`));
+          return true;
+        },
+      );
+      assert.equal(rig.transport.turnStartCount, 1, "exactly one provider turn");
+      assert.deepEqual(retryNotices(emitted), []);
+      const refusals = emitted.filter((m) => rec(m.payload).event === "provider_policy_refusal");
+      assert.equal(refusals.length, 1);
+      assert.equal(rec(refusals[0]!.payload).policy_tag, tag);
+      assert.equal(rec(refusals[0]!.payload).origin, "root");
+    });
+  }
 
   it("(b) every attempt serverOverloaded: TransientRecoveryError after exactly 1+N turn starts", async () => {
     const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });

@@ -32,6 +32,11 @@ through `[0.52.0]`.)
 - **Higher default resource requests for the api and the CNPG database.**
   The chart now requests 100m CPU / 320Mi for the api (was 50m / 128Mi) and 512Mi per CNPG instance (was 256Mi), matching what a live install actually uses, which reduces their eviction risk under node memory pressure. Limits are unchanged; override `api.resources` or `postgres.cluster.resources` to size differently.
 
+### Fixed
+
+- **Codex provider safety-policy refusals have a distinct failure origin ([#2321](https://github.com/vtmocanu/uzi/issues/2321)).**
+  Runs refused for `cyberPolicy` or `misalignmentPolicyViolation` now report `provider_policy_refusal` with a fixed, content-free reason. Run logs retain bounded root/child provenance with role, phase and opaque correlation IDs; the lead may continue after a child refusal. Refusals remain terminal execution failures, included in failure totals and eligible for retrospective judging.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed
