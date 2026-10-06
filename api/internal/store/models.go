@@ -961,9 +961,13 @@ type Run struct {
 	FinalizeResumeGeneration pgtype.Int8 `json:"finalize_resume_generation"`
 	JobProtocol              pgtype.Int2 `json:"job_protocol"`
 	// Issue #2004: when the run first reached running; stamped once by SetRunRunning and never reset (display anchor). started_at stays the budget/timeout anchor and is reset by resume paths that grant a fresh wall.
-	FirstStartedAt           pgtype.Timestamptz `json:"first_started_at"`
-	PlanCrossCheckRequired   bool               `json:"plan_cross_check_required"`
-	PlanCrossCheckGateReason pgtype.Text        `json:"plan_cross_check_gate_reason"`
+	FirstStartedAt            pgtype.Timestamptz `json:"first_started_at"`
+	PlanCrossCheckRequired    bool               `json:"plan_cross_check_required"`
+	PlanCrossCheckGateReason  pgtype.Text        `json:"plan_cross_check_gate_reason"`
+	IssueRawDigest            pgtype.Text        `json:"issue_raw_digest"`
+	IssueSavedBody            pgtype.Text        `json:"issue_saved_body"`
+	IssueInputReason          pgtype.Text        `json:"issue_input_reason"`
+	AutoApproveBlockedReasons []string           `json:"auto_approve_blocked_reasons"`
 }
 
 type RunCompletionAttempt struct {

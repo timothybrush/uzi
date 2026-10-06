@@ -154,6 +154,12 @@ func TestPlanCrossCheckDefaultBranchUpgradeLiveDB(t *testing.T) {
 		FROM cross_checks cc JOIN runs child ON child.id=cc.checker_run_id JOIN runs lead ON lead.id=cc.lead_run_id
 		WHERE cc.lead_run_id=$1`, lead)
 
+	// The recovery seams run the generated head-schema queries, so bring the upgraded
+	// database to head first (the stages above pin versions 298 and 302 on purpose).
+	if err := store.Migrate(ctx, upgradeDSN); err != nil {
+		t.Fatalf("Migrate to head: %v", err)
+	}
+
 	// All four public recovery seams must obey the claim assembler's lead -> child order.
 	// Each case has a 10-second deadline, one recovery attempt, and no sibling work;
 	// cancellation and transaction rollback precede joining the goroutine on every exit.

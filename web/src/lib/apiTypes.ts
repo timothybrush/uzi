@@ -743,6 +743,8 @@ export interface ToolAllowlistWriteInput {
 // issue has never run. Display-only: no secrets. is_mine gates the in-app run-view
 // link (a non-owner would 403 on the run); run_count drives the "×N" retry hint.
 export interface LatestRun {
+  /** Stored creation history; [] on a current API. Optional for older payloads. */
+  auto_approve_blocked_reasons?: string[];
   id: string;
   status: RunStatus;
   mr_iid: number | null;
@@ -2725,6 +2727,10 @@ export interface Run {
   /** PRD #19: an autopilot run (poller-started, plan auto-approved). Drives the
    *  "autopilot" badge; a manually-started run is false. */
   auto_approve: boolean;
+  /** Stored creation history, independent of current status or approval controls.
+   *  A current API sends [] / null; older payloads may omit these fields. */
+  auto_approve_blocked_reasons?: string[];
+  issue_input_reason?: string | null;
   /** The run's snapshot of the owner's plan cross-check setting. */
   plan_cross_check_required: boolean;
   /** Persisted forced-gate reason; optional for older server and mock responses. */

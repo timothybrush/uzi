@@ -186,8 +186,10 @@ type RunDTO struct {
 	// run is in its pre-approval PLANNING turn (status running, iteration_count 0, no
 	// persisted plan yet; chat/judge excluded). Derived, not stored — no new column or
 	// status value. A pre-feature api pod omits it; absent reads as not-planning.
-	IsPlanning  bool `json:"is_planning"`
-	AutoApprove bool `json:"auto_approve"`
+	IsPlanning                bool     `json:"is_planning"`
+	AutoApprove               bool     `json:"auto_approve"`
+	AutoApproveBlockedReasons []string `json:"auto_approve_blocked_reasons"`
+	IssueInputReason          *string  `json:"issue_input_reason"`
 	// PlanCrossCheckRequired is the run's snapshot of the owner's plan cross-check
 	// setting at creation. It remains true after the approval gate is decided.
 	PlanCrossCheckRequired   bool    `json:"plan_cross_check_required"`
