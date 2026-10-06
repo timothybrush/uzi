@@ -37,6 +37,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Runner-owned clone cleanup and executor advice fallback use pinned removal ([#2324](https://github.com/vtmocanu/uzi/issues/2324)).**
+  The clone remover and executor fallback pin directory identities and require their expected owner without opening private directories to other identities. Advice-data fallback removal requires positively confirmed clean disposal; unclean or unconfirmed disposal retains data and warns. Advice cwd cleanup still runs.
+
 - **Codex subagents prefer AGENTS.md repository instructions ([#2264](https://github.com/vtmocanu/uzi/issues/2264)).**
   Child prompts guide AGENTS.md reads first and bounded Git-index metadata fallback for inaccessible instruction symlinks when Bash is already granted, while preserving file-tool denial and permission limits.
 

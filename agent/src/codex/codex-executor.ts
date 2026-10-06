@@ -83,7 +83,7 @@ import { makeMemoryToolHandlers, memoryToolNames, type MemoryToolHandlers } from
 import { makeFindingsToolHandlers, reportIncidentalIssueToolName, type FindingsToolHandlers } from "../findings-tools.js";
 import { FORGE_SERVER_NAME, makeForgeToolHandlers, type ForgeToolHandlers } from "../forge-tools.js";
 import { provisionRunTools, removeProvisionDir } from "../provision-run.js";
-import { rmTeardownTree } from "../rmtree.js";
+import { rmTeardownTree, rmRunnerTeardownTree } from "../rmtree.js";
 import { asText } from "../tool-evidence.js";
 import { installJsDeps, type JsDepsInstall } from "../js-deps.js";
 import { startDepsInstall, reportDepsInstall } from "../js-deps-provision.js";
@@ -1116,12 +1116,21 @@ export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: Codex
       transport,
       cwd,
       dispose: async () => {
+        let cleanDisposal = false;
         try {
-          await handle.dispose();
+          const outcome = await handle.dispose();
+          cleanDisposal = outcome?.clean === true;
         } finally {
-          // Best-effort cleanup of the per-call trees; a failed rm never fails the advice call
-          // (mirrors model-pass.ts's ephemeral-HOME cleanup posture for the Claude lane).
-          await fs.rm(ownedDataRoot, { recursive: true, force: true }).catch(() => undefined);
+          // The launcher's normal removal and this fallback share the same forensic
+          // retention rule: only positively confirmed clean disposal permits deletion.
+          // False, unknown or thrown outcomes may leave a supervised writer alive.
+          if (cleanDisposal) {
+            await rmRunnerTeardownTree(ownedDataRoot).catch((error) =>
+              log.warn("Codex advice data cleanup failed", { error: errMessage(error) }),
+            );
+          } else {
+            log.warn("Codex advice data retained: disposal was not confirmed clean");
+          }
           await rmTeardownTree(cwd).catch((error) =>
             log.warn("Codex advice cwd cleanup failed", { error: errMessage(error) }),
           );
