@@ -22,7 +22,12 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+## [0.86.0] - 2026-10-06
+
 ### Changed
+
+- **Routine dependency bump: `gitlab.com/gitlab-org/api/client-go/v3` to v3.15.0 ([#2315](https://github.com/vtmocanu/uzi/pull/2315)).**
+  No uzi code change required.
 
 - **Ephemeral Docker preference on the Workers page ([#2278](https://github.com/vtmocanu/uzi/issues/2278)).**
   Persistent and ephemeral workers have separate sections. Instances offering the Docker tier show a saved Docker-capable checkbox beside auto-provision, usable even while auto-provision is off; writes share a pending lock and show local errors without changing confirmed preferences. Help text covers saturation, warm leases and the ephemeral cap, and qualifies Docker by the admin's repository allowlist. For eligible repositories, plain warm workers step aside so Docker-capable capacity can be provisioned immediately when no worker can claim the run; busy persistent workers retain the saturation debounce.
@@ -81,6 +86,7 @@ through `[0.52.0]`.)
 
 - **Recovery distinguishes a rejected terminal record from verified work ([#1974](https://github.com/vtmocanu/uzi/issues/1974)).**
   After restart, a MAC-rejected terminal record is identified in run recovery and retains source custody without authorizing completion, replay, or extra retries. Export still requires an independently verified archive. Negotiated reconciliation can remove the rejected file after exact-generation custody and sibling holds settle; unsupported servers leave local bytes retained.
+
 
 ## [0.85.2] - 2026-10-05
 
@@ -4895,7 +4901,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.85.2...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.86.0...HEAD
+[0.86.0]: https://github.com/vtmocanu/uzi/compare/v0.85.2...v0.86.0
 [0.85.2]: https://github.com/vtmocanu/uzi/compare/v0.85.1...v0.85.2
 [0.85.1]: https://github.com/vtmocanu/uzi/compare/v0.85.0...v0.85.1
 [0.85.0]: https://github.com/vtmocanu/uzi/compare/v0.84.0...v0.85.0
