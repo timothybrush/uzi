@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Added
 
+- **Plan cross-check opt-in establishes a required gate for auto-approved plans ([#2149](https://github.com/vtmocanu/uzi/issues/2149)).**
+  Settings → Run defaults offers a per-user Plan cross-check switch when Claude and Codex are usable. An opted-in auto-approved Claude run sends its plan to a Codex checker before implementing: a pass approves the exact checked plan, and any other outcome (changes requested, blocked, timed out, checker unavailable, submit failure) parks the run at the human plan gate with the reason. If its delivery receipts or the human-gate acknowledgement are irrecoverably lost, the run fails with a named reason instead of approving or retrying indefinitely. Run-page rendering of cross-check results follows in a later change.
+
 - **Capacity gates for scheduled sweeps**
   Recurring label sweeps can wait for room in the owner’s unfinished work and send batches within the available room, with API and CLI controls and recorded capacity outcomes.
 
@@ -39,6 +42,9 @@ through `[0.52.0]`.)
   Dependency installation overlaps planning, reports installed and failed projects before the first implementation turn, and settles before capture, credential reconciliation and teardown across provider epochs.
 
 ### Fixed
+
+- **Plan cross-check preserves worker custody during planning ([#2149](https://github.com/vtmocanu/uzi/issues/2149)).**
+  Confined planning captures read the immutable baseline without granting writes, and queued transport waits can be cancelled without discarding assigned records. Cross-check migrations now follow the current default schema while retaining worker maintenance and Docker preferences.
 
 - **Agent lockfile: MCP TypeScript SDK bumped past GHSA-6qxp-vccf-f47h.**
   `@modelcontextprotocol/sdk` (transitive via the Claude Agent SDK) moves from 1.30.0 to 1.32.1, clearing the high-severity advisory that reddened `validate-agent` on `main`.

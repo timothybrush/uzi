@@ -4228,6 +4228,31 @@ describe("CodexExecutor: per-turn phase-correct broker (plan write ban)", () => 
 // are fail-old/pass-fixed: without the signals frame planResult.plan is undefined and run()
 // throws "produced no plan" before the gate, so a resolving success test can only pass wired.
 describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
+  it("refuses checked plan approval before provider epoch recreation or implementation", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "submit_plan", { plan_md: "local plan" }, th, tn, "c-plan")).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    let iterations = 0;
+    const { ctx } = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      claimGeneration: 7,
+      reportIteration: async () => { iterations++; return undefined; },
+      gatePlan: async () => ({
+        kind: "approve", approval: "cross_check", selection: { status: "absent" },
+        canonical: { plan: "canonical", milestones: [], candidate_digest: "a".repeat(64), claimGeneration: 7 },
+      }),
+    });
+    await assert.rejects(
+      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "checked approval refusal"),
+      /codex cannot consume checked plan approval/,
+    );
+    assert.equal(iterations, 0);
+    assert.equal(rig.epochs.length, 1);
+    assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
+  });
   it("(m2-1) a folded submit_plan gates, approval recreates a fresh provider epoch, and a root signal_done on the NEW root resolves { branch }", async () => {
     // m4 change: plan approval now RECREATES the provider epoch (new-root resume), so the plan
     // turn and the implement turn run on DISTINCT provider roots/transports. Each epoch is scripted
@@ -5325,18 +5350,26 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
     assert.ok(!args.includes("best-effort"), "the tool env's best-effort value is nowhere in the sandbox argv");
   });
 
-  it("the worker Config best-effort mode flows into the emitted --mode token", async () => {
-    const rig = makeRig();
-    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
-    const { ctx } = makeCtx();
-    const executor = new CodexExecutor(
-      noopLog,
-      "/data/agent-home/run-1",
-      { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider, commandSandbox: "best-effort" },
-      rig.deps,
-    );
-    await withTimeout(executor.run(ctx), 3000, "best-effort mode run");
-    assert.equal(modeFlagOf(rig.fileopSpawns[0]!.args), "best-effort", "the worker's best-effort mode reaches the sandbox argv");
+  it("the fileop root uses required mode only for cross_check runs", async () => {
+    for (const { kind, configuredMode, expectedMode } of [
+      { kind: undefined, configuredMode: "best-effort", expectedMode: "best-effort" },
+      { kind: undefined, configuredMode: "off", expectedMode: "off" },
+      { kind: "cross_check", configuredMode: "best-effort", expectedMode: "required" },
+      { kind: "cross_check", configuredMode: "off", expectedMode: "required" },
+    ] as const) {
+      const rig = makeRig();
+      rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+      // M2 will add cross_check to RunKind; widen only this fixture until then.
+      const { ctx } = makeCtx({ kind: kind as RunContext["kind"] });
+      const executor = new CodexExecutor(
+        noopLog,
+        "/data/agent-home/run-1",
+        { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider, commandSandbox: configuredMode },
+        rig.deps,
+      );
+      await withTimeout(executor.run(ctx), 3000, `${kind ?? "ordinary"} ${configuredMode} mode run`);
+      assert.equal(modeFlagOf(rig.fileopSpawns[0]!.args), expectedMode, `${kind ?? "ordinary"} run with ${configuredMode} mode`);
+    }
   });
 
   it("writes ONE degraded-mode line into the run feed when commandSandboxDegraded is set, none otherwise", async () => {
