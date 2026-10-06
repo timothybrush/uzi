@@ -58,6 +58,8 @@
 
 import { renderCodexRun } from "./render.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
+import { DRAFT_PLAN_ACK } from "../draft-plan.js";
+import { emptyCounts, sanitizeText } from "../sanitize.js";
 import { CODEX_DELEGATE_TOOLS, CODEX_SIGNAL_TOOLS, canonicalizeCodexToolName } from "./broker.js";
 import {
   CodexTurnFailedError,
@@ -1514,7 +1516,9 @@ export class CodexHarness implements RunHarness {
       } catch {
         /* projection is best-effort (issue #1583): it never blocks the reply */
       }
-      this.safeRespond(transport, requestId, result);
+      const reply = canonical === "save_draft_plan" && result.ok
+        ? { ok: true as const, output: DRAFT_PLAN_ACK } : result;
+      this.safeRespond(transport, requestId, reply);
       return result;
     };
     const toolName = asString(p.tool);
@@ -1557,7 +1561,14 @@ export class CodexHarness implements RunHarness {
     // scanned}`), which the caller surfaces on a main-origin signals frame. A DENIED signal
     // (result.ok === false) folds nothing; a non-signal effect (shell/file/mcp) is undefined.
     if (isSignal && result.ok) {
-      return { signals: result.output as Readonly<Partial<TurnSignals>> };
+      const signals = result.output as Readonly<Partial<TurnSignals>>;
+      // Scrub accepted drafts with the live runtime-token/claim-secret projection
+      // seam before the reducer emits them. Sanitize the full text first so a
+      // control-split secret matches; MessageBatcher owns the later UTF8 cap.
+      return { signals: signals.draftPlans === undefined ? signals : {
+        ...signals,
+        draftPlans: signals.draftPlans.map((plan) => this.scrubProjected(sanitizeText(plan, emptyCounts()))),
+      } };
     }
     return undefined;
   }
