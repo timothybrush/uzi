@@ -24,7 +24,7 @@ import {
 import { useAuth } from "../auth/AuthContext";
 import { mergeRequestUrl } from "../lib/forgeUrls";
 import { errorMessage } from "../lib/apiError";
-import { canToggleWaitOnLimit, formatCountdown, runWindowLabel } from "../lib/limitWait";
+import { canToggleWaitOnLimit, formatCountdown, runWindowLabel, usageLimitPhrase } from "../lib/limitWait";
 import {
   budgetRightLabel,
   extendBudgetView,
@@ -940,14 +940,14 @@ export function LimitWaitPanel({
         onChange={(e) => onToggle(e.target.checked)}
       />
       <span className={parked ? "text-fg" : "text-muted"}>
-        Wait out future Anthropic usage limits on this run
+        Wait out future usage limits on this run
       </span>
     </label>
   ) : (
     <span className={cx("text-xs", parked ? "text-fg" : "text-muted")}>
       {run.wait_on_limit
-        ? "Waiting out future Anthropic usage limits on this run — only its owner can change this."
-        : "Not waiting out future Anthropic usage limits on this run — only its owner can change this."}
+        ? "Waiting out future usage limits on this run — only its owner can change this."
+        : "Not waiting out future usage limits on this run — only its owner can change this."}
     </span>
   );
 
@@ -1018,7 +1018,7 @@ export function LimitWaitPanel({
               which is the kind that stops the next person from checking.) */}
           <p role="status" className="text-sm font-semibold text-warn">
             <span aria-hidden="true">⏸ </span>
-            Paused on an Anthropic usage limit
+            {`Paused on ${usageLimitPhrase(run.harness)}`}
           </p>
           <p className="mt-0.5 text-xs text-muted">
             {countdown ? (
@@ -1038,11 +1038,10 @@ export function LimitWaitPanel({
             )}
             {attemptClause && ` ${attemptClause}`}
           </p>
-          {/* text-muted, not text-faint (web-ux F1): at 4.56 this was the faintest
-              text on the panel while being the only thing telling a stuck user that
-              nothing is lost. The pointer to Stop is now the button beside it. */}
+          {/* Keep the recovery limits legible alongside the Stop control. */}
           <p className="mt-1.5 text-xs text-muted">
-            Nothing is lost — the run keeps its branch and its history and picks up where it left off.
+            A successful recovery restores saved work. If saving the latest changes failed,
+            recovery on another worker may be incomplete.
           </p>
           {/* PRD #1809 M6: checkpoint durability and the run's size on its worker. */}
           <RunParkDiskFacts run={run} />
@@ -1499,7 +1498,7 @@ function PoolWaitPanel({
               count down to — resumption is event-driven (a token is pooled), not
               time-driven. */}
           <p className="mt-1.5 text-xs text-muted">
-            Nothing is lost — the run keeps its branch and its history and picks up where it left off.
+            The run continues when a token is available, using any saved work it can recover.
           </p>
           {/* Always mounted (sr-only when empty) so the 409 note is announced when it
               arrives — a region created in the same tick as its first content is
@@ -1732,14 +1731,14 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
         )}
         <p className="mt-1.5 text-xs text-muted">
           {vaultPark
-            ? "Nothing is lost: the run's work was saved before it parked, and it picks up where it left off."
+            ? "The run saved its work before parking; resume uses that recovery data."
             : diskPark
               ? // PRD #1809: a disk park frees space on the worker, so the generic "keeps its
                 // branch and its history" line is not the claim to make. A first-claim park may
                 // have no branch or checkpoint yet, so only what the run already has is kept,
                 // plus the run's work the worker keeps until it resumes.
                 "Any branch or pushed checkpoint the run already has is kept, and the worker keeps the run's work until it resumes."
-              : "Nothing is lost — the run keeps its branch and its history and picks up where it left off."}
+              : "A successful recovery restores saved work. If saving the latest changes failed, recovery on another worker may be incomplete."}
         </p>
         {/* PRD #1809 M6: checkpoint durability and the run's size on its worker. */}
         <RunParkDiskFacts run={run} />
@@ -2673,8 +2672,8 @@ export function RunView() {
 
       {/* Issue #754: the pool-empty hold + Resume-now. Ordered ABOVE the usage-limit
           strip deliberately (web-ux should-fix): on a pool_wait run the strip below
-          renders its NON-parked "Wait out future Anthropic usage limits" toggle, and
-          two Anthropic controls stacked let a user read that usage-limit checkbox as
+          renders its NON-parked "Wait out future usage limits" toggle, and
+          two recovery controls stacked let a user read that usage-limit checkbox as
           the way to un-wait the pool hold, which it is not. Putting the pool panel
           first makes the hold read as one self-contained unit (its own Resume-now is
           the action), with the unrelated future-limit toggle clearly beneath it. This
@@ -2685,8 +2684,8 @@ export function RunView() {
 
       {/* Issue #1197: the transient-recovery hold. Ordered here beside PoolWaitPanel and
           above the usage-limit strip for the SAME reason (web-ux): on a recovery_wait run
-          the strip below renders its NON-parked "Wait out future Anthropic usage limits"
-          toggle, and two Anthropic-adjacent controls stacked let a user misread that
+          the strip below renders its NON-parked "Wait out future usage limits"
+          toggle, and two recovery controls stacked let a user misread that
           usage-limit checkbox as the way to un-wait the recovery hold, which it is not.
           RecoveryWaitPanel self-hides on every status but recovery_wait, so it does not
           disturb the limit_wait/pool_wait layouts. It carries no control of its own — the
