@@ -37,6 +37,9 @@ through `[0.52.0]`.)
 - **Codex provider safety-policy refusals have a distinct failure origin ([#2321](https://github.com/vtmocanu/uzi/issues/2321)).**
   Runs refused for `cyberPolicy` or `misalignmentPolicyViolation` now report `provider_policy_refusal` with a fixed, content-free reason. Run logs retain bounded root/child provenance with role, phase and opaque correlation IDs; the lead may continue after a child refusal. Refusals remain terminal execution failures, included in failure totals and eligible for retrospective judging.
 
+- **Additional worker-owned cleanup resists directory swaps ([#2324](https://github.com/vtmocanu/uzi/issues/2324)).**
+  Leftover job replacement, terminal skills-plugin cleanup, Codex advice working directories and session staging use descriptor-pinned removal. Refused leftovers are never reused for a job or adopted as session state; disposable cleanup warns and retains refused trees.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed

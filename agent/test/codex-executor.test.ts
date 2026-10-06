@@ -4,6 +4,7 @@ import { PassThrough } from "node:stream";
 import { randomUUID } from "node:crypto";
 import { getEventListeners } from "node:events";
 import fs from "node:fs/promises";
+import { symlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -45,7 +46,7 @@ import { makeFixture } from "./fixture-repo.js";
 import { makeClaim, testGitCacheOptions } from "./helpers.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
-import { WORKER_UID, RUNNER_UID } from "../src/runner-uid.js";
+import { WORKER_UID, RUNNER_UID, runnerCommand } from "../src/runner-uid.js";
 import { gitEnv } from "../src/git.js";
 import { forgeToolNames } from "../src/forge-tools.js";
 import { memoryToolNames } from "../src/memory-tools.js";
@@ -5644,9 +5645,9 @@ describe("CodexExecutor: provisioning + init target the SHARED provisioning HOME
       ? false
       : "requires running as WORKER_UID with WORKER_UID + RUNNER_UID group membership";
 
+  describe("real worker-UID initialization and session cleanup", { skip: INIT_SKIP }, () => {
   it(
     "run() initializes the FRESH per-run HOME to worker:runner 3770 BEFORE provisioning materializes it",
-    { skip: INIT_SKIP },
     async () => {
       // Single-uid (#58) non-root k8s: no UZI_UID_SPLIT, so run()'s worktree-posture assert is inert.
       const savedSplit = process.env.UZI_UID_SPLIT;
@@ -5703,6 +5704,210 @@ describe("CodexExecutor: provisioning + init target the SHARED provisioning HOME
       }
     },
   );
+describe("production session-seed cleanup (#2324)", () => {
+  it("refuses a planted seed root before adoption and retains it", async (t) => {
+    const root = await fs.mkdtemp(path.join("/tmp", "cdr-seed-refusal-"));
+    t.after(async () => {
+      const { restoreTreeWritability } = await import("../src/rmtree.js");
+      await restoreTreeWritability(root);
+      await fs.rm(root, { recursive: true, force: true });
+    });
+    await fs.chown(root, -1, RUNNER_UID);
+    await fs.chmod(root, 0o3775);
+    const home = path.join(root, "home");
+    const work = path.join(root, "work");
+    const victim = path.join(root, "outside");
+    await fs.mkdir(work);
+    await fs.chown(work, -1, RUNNER_UID);
+    await fs.chmod(work, 0o2770);
+    await fs.mkdir(victim);
+    await fs.writeFile(path.join(victim, "keep"), "outside");
+    const rig = makeRig();
+    let adopted = 0;
+    let planted: string | undefined;
+    const join = path.join;
+    const joinMock = t.mock.method(path, "join", (...parts: string[]) => {
+      const joined = join(...parts);
+      if (parts[0] === home && parts[1] === "codex-data" && (parts[2] ?? "").endsWith("-epoch-0") && planted === undefined) {
+        planted = `${joined}.session-seed`;
+        symlinkSync(victim, planted, "dir");
+      }
+      return joined;
+    });
+    const executor = new CodexExecutor(noopLog, home, {
+      binding: bindingOf(API_KEY), client: rig.client as never, provider, provisionHomeDir: root,
+    }, {
+      ...rig.deps,
+      provisionRunTools: async () => ({ toolEnv: {} }),
+      spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls),
+      launchProviderRoot: async () => { throw new Error("must not launch after a cleanup refusal"); },
+      sessionStore: { ...rig.deps.sessionStore!, adopt: async () => { adopted++; return { files: 0 }; } },
+    });
+    Object.defineProperty(executor, "providerLaunchInjected", { value: () => false });
+    try {
+      await assert.rejects(executor.run(makeCtx({ worktreePath: work }).ctx), /Codex session seed cleanup refused/);
+      assert.equal(adopted, 0, "refused content is never adopted");
+      assert.ok(planted, "the actual production staging name was planted");
+      assert.ok((await fs.lstat(planted)).isSymbolicLink(), "refused root remains for inspection");
+      assert.equal(await fs.readFile(join(victim, "keep"), "utf8"), "outside");
+    } finally { joinMock.mock.restore(); }
+  });
+
+  it("refuses a runner seed planted between removal and exclusive creation", async (t) => {
+    const root = await fs.mkdtemp("/tmp/cdr-seed-create-");
+    await fs.chown(root, -1, RUNNER_UID);
+    await fs.chmod(root, 0o3775);
+    const home = path.join(root, "home");
+    const work = path.join(root, "work");
+    await fs.mkdir(work);
+    await fs.chown(work, -1, RUNNER_UID);
+    await fs.chmod(work, 0o2770);
+    const rig = makeRig();
+    let adopted = 0;
+    let launched = 0;
+    let planted: string | undefined;
+    const open = fs.open;
+    const openMock = t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+      try { return await open(...args); }
+      catch (error) {
+        const name = String(args[0]);
+        if ((error as NodeJS.ErrnoException).code === "ENOENT" && name.startsWith("/proc/self/fd/") && name.endsWith(".session-seed") && planted === undefined) {
+          planted = path.join(home, "codex-data", path.basename(name));
+          const create = runnerCommand(process.execPath, ["-e", "const fs=require('node:fs');fs.mkdirSync(process.argv[1],{mode:0o750});fs.writeFileSync(process.argv[1]+'/keep','not adopted')", planted]);
+          const result = spawnSync(create.command, create.args, { env: { PATH: "/usr/bin:/bin" }, timeout: 10_000 });
+          assert.equal(result.status, 0, result.stderr?.toString());
+        }
+        throw error;
+      }
+    });
+    t.after(async () => {
+      openMock.mock.restore();
+      if (planted) {
+        const clean = runnerCommand(process.execPath, ["-e", "require('node:fs').rmSync(process.argv[1],{recursive:true,force:true})", planted]);
+        const result = spawnSync(clean.command, clean.args, { env: { PATH: "/usr/bin:/bin" }, timeout: 10_000 });
+        assert.equal(result.status, 0, "runner-owned planted fixture cleanup");
+      }
+      const { restoreTreeWritability } = await import("../src/rmtree.js");
+      await restoreTreeWritability(root);
+      await fs.rm(root, { recursive: true, force: true });
+    });
+    const executor = new CodexExecutor(noopLog, home, {
+      binding: bindingOf(API_KEY), client: rig.client as never, provider, provisionHomeDir: root,
+    }, {
+      ...rig.deps,
+      provisionRunTools: async () => ({ toolEnv: {} }),
+      spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls),
+      launchProviderRoot: async () => { launched++; throw new Error("must not launch with a planted seed"); },
+      sessionStore: { ...rig.deps.sessionStore!, adopt: async () => { adopted++; return { files: 0 }; } },
+    });
+    Object.defineProperty(executor, "providerLaunchInjected", { value: () => false });
+    try {
+      await assert.rejects(executor.run(makeCtx({ worktreePath: work }).ctx), /Codex session seed preparation refused/);
+      assert.ok(planted, "the runner planted an entry at the actual removal/creation boundary");
+      assert.equal(adopted, 0);
+      assert.equal(launched, 0);
+      const st = await fs.stat(planted);
+      assert.equal(st.uid, RUNNER_UID);
+      assert.equal(await fs.readFile(path.join(planted, "keep"), "utf8"), "not adopted");
+    } finally { openMock.mock.restore(); }
+  });
+
+  it("ordinary production staging is worker-owned and removed before returning", async (t) => {
+    const root = await fs.mkdtemp("/tmp/cdr-seed-normal-");
+    await fs.chown(root, -1, RUNNER_UID);
+    await fs.chmod(root, 0o3775);
+    t.after(async () => {
+      const { restoreTreeWritability } = await import("../src/rmtree.js");
+      await restoreTreeWritability(root);
+      await fs.rm(root, { recursive: true, force: true });
+    });
+    const home = path.join(root, "home");
+    const work = path.join(root, "work");
+    await fs.mkdir(work);
+    await fs.chown(work, -1, RUNNER_UID);
+    await fs.chmod(work, 0o2770);
+    const rig = makeRig();
+    const sentinel = new Error("stop after ordinary staging");
+    let staged: string | undefined;
+    let observed: { uid: number; gid: number; groupWrite: number; parentUid: number; sticky: number } | undefined;
+    const executor = new CodexExecutor(noopLog, home, {
+      binding: bindingOf(API_KEY), client: rig.client as never, provider, provisionHomeDir: root,
+    }, {
+      ...rig.deps, provisionRunTools: async () => ({ toolEnv: {} }),
+      spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls),
+      launchProviderRoot: async () => { throw sentinel; },
+      sessionStore: { ...rig.deps.sessionStore!, adopt: async (_store, dest) => {
+        staged = dest;
+        const st = await fs.stat(dest);
+        const parent = await fs.stat(path.dirname(dest));
+        await fs.writeFile(path.join(dest, "ordinary"), "remove");
+        observed = { uid: st.uid, gid: st.gid, groupWrite: st.mode & 0o020, parentUid: parent.uid, sticky: parent.mode & 0o1000 };
+        return { files: 0 };
+      } },
+    });
+    Object.defineProperty(executor, "providerLaunchInjected", { value: () => false });
+    await assert.rejects(executor.run(makeCtx({ worktreePath: work }).ctx), (error) => error === sentinel);
+    assert.deepEqual(observed, { uid: WORKER_UID, gid: RUNNER_UID, groupWrite: 0, parentUid: WORKER_UID, sticky: 0o1000 }, "observe outside the best-effort adopt catch");
+    assert.ok(staged);
+    await assert.rejects(fs.stat(staged), { code: "ENOENT" });
+  });
+
+  it("the production staging finally preserves outside files during swaps", async (t) => {
+    const root = await fs.mkdtemp(path.join("/tmp", "cdr-seed-race-"));
+    t.after(async () => {
+      const { restoreTreeWritability } = await import("../src/rmtree.js");
+      await restoreTreeWritability(root);
+      await fs.rm(root, { recursive: true, force: true });
+    });
+    await fs.chown(root, -1, RUNNER_UID);
+    await fs.chmod(root, 0o3775);
+    const home = path.join(root, "home");
+    const work = path.join(root, "work");
+    const victim = path.join(root, "outside");
+    await fs.mkdir(work);
+    await fs.chown(work, -1, RUNNER_UID);
+    await fs.chmod(work, 0o2770);
+    await fs.mkdir(victim);
+    const { seedRacedTree, startSwapRacer, RACED_FILES } = await import("./swap-racer.js");
+    const rig = makeRig();
+    const launchSentinel = new Error("stop after production session staging");
+    let racer: Awaited<ReturnType<typeof startSwapRacer>> | undefined;
+    let swaps = 0;
+    let adopted = 0;
+    const deps: CodexExecutorDeps = {
+      ...rig.deps,
+      launchProviderRoot: async () => { throw launchSentinel; },
+      provisionRunTools: async () => ({ toolEnv: {} }),
+      spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls),
+      sessionStore: {
+        ...rig.deps.sessionStore!,
+        adopt: async (_store, dest) => {
+          adopted += 1;
+          await seedRacedTree(dest, victim);
+          racer = await startSwapRacer(dest, victim, root);
+          return { files: 0 };
+        },
+      },
+    };
+    const executor = new CodexExecutor(noopLog, home, { binding: bindingOf(API_KEY), client: rig.client as never, provider, provisionHomeDir: root }, deps);
+    // Exercise actual production preparation/staging, then stop at the injected
+    // provider launcher before any model-bearing request.
+    Object.defineProperty(executor, "providerLaunchInjected", { value: () => false });
+    try {
+      await assert.rejects(executor.run(makeCtx({ worktreePath: work }).ctx), (error) => error === launchSentinel);
+      assert.ok(adopted > 0, "the production staging path ran");
+    } finally {
+      if (racer) swaps = await racer.stop();
+    }
+    assert.ok(swaps > 0, "positive intermediate swaps");
+    const names = (await fs.readdir(victim)).sort();
+    console.log(JSON.stringify({ site: "session-seed", swaps, outsideRemaining: names.length, outsideLost: RACED_FILES - names.length }));
+    assert.deepEqual(names, Array.from({ length: RACED_FILES }, (_, i) => `f${i}`).sort());
+    for (const name of names) assert.equal(await fs.readFile(path.join(victim, name), "utf8"), "keep\n");
+  });
+});
+
+  });
 });
 
 // ================================================================================
