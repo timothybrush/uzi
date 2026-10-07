@@ -1309,7 +1309,7 @@ WITH claimant AS MATERIALIZED (
 hold AS (
     -- PRD #1296 M1 (D2/D3): open the H-free custody hold atomically with the claim, for a
     -- RECOVERY-CAPABLE worker (@recovery_capable, derived from the worker's advertised
-    -- recovery_archive_v1 protocol capability) on one of the six code-publishing profiles.
+    -- recovery_archive_v1, recovery_archive_v2 or recovery_inventory_v1 protocol capability) on one of the six code-publishing profiles.
     -- Reads FROM ` + "`" + `target` + "`" + `, so it inserts exactly one hold iff a run was actually claimable
     -- (an admission-gated or idle claim produces no ` + "`" + `target` + "`" + ` row and thus no hold). Both live
     -- FKs point at the claimed run + claiming worker (ON DELETE RESTRICT while open), and the
@@ -1319,9 +1319,10 @@ hold AS (
     INSERT INTO recovery_custody_holds
         (id, user_id, repo_id, run_id, generation, state,
          original_worker_id, original_worker_identity, live_worker_id, live_run_id,
-         created_at, updated_at)
+         created_at, updated_at, inventory_guarded)
     SELECT gen_random_uuid(), t.user_id, t.repo_id, t.id, t.claim_generation + 1, 'open',
-           $1, $27::text, $1, t.id, now(), now()
+           $1, $27::text, $1, t.id, now(), now(),
+           ('recovery_inventory_v1' = ANY($11::text[]))
     FROM target t
     WHERE $28::boolean
       AND t.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
