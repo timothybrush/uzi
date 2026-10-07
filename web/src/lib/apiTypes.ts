@@ -3586,8 +3586,14 @@ export interface SelfUsage {
   last7_unreported_run_count: number;
 }
 
-// AdminUsageUser is one user's lifetime row in the admin factory breakdown.
+// AdminUsageUser preserves lifetime figures and adds seven-day figures to the factory breakdown.
 export interface AdminUsageUser {
+  // Optional for older API deployments. The new handler always sends a usage bundle.
+  last_7_days?: RunUsage;
+  last7_run_count?: number;
+  last7_outcomes?: RunOutcomes;
+  last7_subscription_run_count?: number;
+  last7_unreported_run_count?: number;
   user_id: string;
   email: string;
   usage: RunUsage;
@@ -3603,8 +3609,8 @@ export interface AdminUsageUser {
 }
 
 // AdminUsage is the factory-wide view (GET /api/admin/usage, admin-only): the
-// factory totals plus the per-user breakdown. The per-user rows sum to factory
-// lifetime by construction (the server rollup guarantees it).
+// factory totals plus the per-user breakdown. For the same snapshot and cutoff,
+// each window's per-user rows sum to its factory totals; separate reads may differ.
 export interface AdminUsage {
   factory: SelfUsage;
   users: AdminUsageUser[];
