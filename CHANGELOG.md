@@ -22,12 +22,6 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
-### Fixed
-
-- **Checkpoint pushes with lost acknowledgements can be confirmed while a run is live ([#2395](https://github.com/vtmocanu/uzi/issues/2395)).**
-  After the broker records an actual advance or a potentially sent push with an unknown outcome, reconciliation can confirm the matching forge tip. Later unchanged-tip retries and restarted claims recognize the durable checkpoint without creating live retention or deletion obligations. Unclassified attempts remain pending competing claims; another run's claims and newer checkpoint or slot state prevent adoption. Broker acknowledgements retain their raw success/rejection markers and have a cumulative 1 MiB response limit.
-  Migration 00306 is additive, leaves legacy attempts pending without backfill, and retains readiness evidence on rollback. A crash before disposition recording can still leave a landed push pending. The existing terminal stalled-sender hazard remains outside this fix (finding 5b641106-d2cf-4767-813f-e29d0692c228).
-
 ## [0.86.0] - 2026-10-06
 
 ### Changed
@@ -173,6 +167,10 @@ through `[0.52.0]`.)
 
 - **Recovery custody retains complete candidate inventories ([#1924](https://github.com/vtmocanu/uzi/issues/1924)).**
   Workers retain divergent unpublished heads under worker-local refs, distinguish them from durable remote checkpoints in the feed, and freeze a recovery-only aggregate whose ancestry preserves the original heads with one current source tree. Inventory-guarded generations keep custody open despite completion or an earlier available archive until the exact final covering archive or verified empty inventory is acknowledged; an owner-readable receipt identifies the selected capture and coverage digest. The selected archive is protected while its local worker exists, and physical worker deletion renews the configured normal ready-retention window (7 days by default); earlier non-final and legacy captures keep their existing TTL. Dirty or unverified source and pending final acknowledgments retain custody with bounded retries. A guarded claim that parks or fails before its clone closes its own empty hold with a settled release once nothing is proven adopted locally. Older APIs report unguarded generations without promising complete terminal or reclamation protection; local pins alone are not durable recovery. A run retains at most 64 such heads: at the limit the worker keeps the existing pins and the clone and stops the run as a preservation failure instead of letting a rewriting agent grow worker-local pins without bound, and the feed announces each retained head only once.
+
+- **Checkpoint pushes with lost acknowledgements can be confirmed while a run is live ([#2395](https://github.com/vtmocanu/uzi/issues/2395)).**
+  After the broker records an actual advance or a potentially sent push with an unknown outcome, reconciliation can confirm the matching forge tip. Later unchanged-tip retries and restarted claims recognize the durable checkpoint without creating live retention or deletion obligations. Unclassified attempts remain pending competing claims; another run's claims and newer checkpoint or slot state prevent adoption. Broker acknowledgements retain their raw success/rejection markers and have a cumulative 1 MiB response limit.
+  Migration 00306 is additive, leaves legacy attempts pending without backfill, and retains readiness evidence on rollback. A crash before disposition recording can still leave a landed push pending. The existing terminal stalled-sender hazard remains outside this fix (finding 5b641106-d2cf-4767-813f-e29d0692c228).
 
 ## [0.85.2] - 2026-10-05
 
