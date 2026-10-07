@@ -45,9 +45,32 @@ func TestDeriveHoldAttention(t *testing.T) {
 		{"capturing beats a terminal run", row("open", "preparing", "completed", false), attentionCapturing},
 		{"needs_action beats a live run", row("open", "needs_action", "running", false), attentionNeedsAction},
 	}
+	for _, tc := range []struct {
+		name string
+		row  store.ListCustodyHoldsForOwnerRow
+		want string
+	}{
+		{"exhausted no archive", row("open", "", "recovery_wait", false), attentionSourceOnly},
+		{"exhausted available wins", row("open", "needs_action", "recovery_wait", true), attentionArchiveReady},
+		{"exhausted preparing wins", row("open", "preparing", "recovery_wait", false), attentionCapturing},
+		{"exhausted uploading wins", row("open", "uploading", "recovery_wait", false), attentionCapturing},
+		{"exhausted needs action wins", row("open", "needs_action", "recovery_wait", false), attentionNeedsAction},
+		{"exhausted released", row("released", "", "recovery_wait", false), attentionReleased},
+		{"exhausted discarded", row("discarded", "", "recovery_wait", false), attentionDiscarded},
+	} {
+		tc.row.RecoveryWaitCause = custodyRecoveryCauseWorkerRequeueExhausted
+		cases = append(cases, tc)
+	}
+	ordinary := row("open", "", "recovery_wait", false)
+	ordinary.RecoveryWaitCause = "worker_restart"
+	cases = append(cases, struct {
+		name string
+		row  store.ListCustodyHoldsForOwnerRow
+		want string
+	}{"ordinary recovery wait", ordinary, attentionActive})
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			batch := store.ListOpenCustodyHoldsForWorkersRow{State: tc.row.State, HasAvailableCapture: tc.row.HasAvailableCapture, CaptureState: tc.row.CaptureState, RunStatus: tc.row.RunStatus}
+			batch := store.ListOpenCustodyHoldsForWorkersRow{State: tc.row.State, HasAvailableCapture: tc.row.HasAvailableCapture, CaptureState: tc.row.CaptureState, RunStatus: tc.row.RunStatus, RecoveryWaitCause: tc.row.RecoveryWaitCause}
 			if ownerHoldAttentionInput(tc.row) != batchHoldAttentionInput(batch) {
 				t.Fatal("owner/batch adapter inputs differ")
 			}
@@ -178,5 +201,39 @@ func TestCaptureToDTOHoldID(t *testing.T) {
 	got := captureToDTO(store.RecoveryCapture{ID: id, RunID: runID, HoldID: holdID, State: "available", SourceSha: "abc"})
 	if got.ID != id.String() || got.RunID != runID.String() || got.HoldID != holdID.String() {
 		t.Errorf("identity fields wrong: %+v", got)
+	}
+}
+
+// A guarded inventory hold on an exhausted run keeps its earlier archive visible but stays an
+// owner decision, in both the owner listing and the per-worker batch adapter; a capture in
+// flight or one needing action still takes precedence.
+func TestGuardedExhaustedHoldAttention(t *testing.T) {
+	for _, tc := range []struct {
+		name, captureState, want string
+	}{
+		{"earlier archive available", "available", attentionSourceOnly},
+		{"capture preparing", "preparing", attentionCapturing},
+		{"capture uploading", "uploading", attentionCapturing},
+		{"capture needs action", "needs_action", attentionNeedsAction},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			owner := store.ListCustodyHoldsForOwnerRow{
+				State: "open", CaptureState: tc.captureState, RunStatus: "recovery_wait",
+				RecoveryWaitCause:   custodyRecoveryCauseWorkerRequeueExhausted,
+				HasAvailableCapture: true, InventoryGuarded: true,
+			}
+			batch := store.ListOpenCustodyHoldsForWorkersRow{
+				State: owner.State, CaptureState: owner.CaptureState, RunStatus: owner.RunStatus,
+				RecoveryWaitCause:   owner.RecoveryWaitCause,
+				HasAvailableCapture: true, InventoryGuarded: true,
+			}
+			if got := deriveHoldAttention(batchHoldAttentionInput(batch)); got != tc.want {
+				t.Fatalf("batch attention = %q, want %q", got, tc.want)
+			}
+			dto := custodyHoldToDTO(owner)
+			if dto.Attention != tc.want || !dto.HasAvailableCapture || !dto.InventoryGuarded {
+				t.Fatalf("owner dto = %+v, want attention %q with the archive and guard kept", dto, tc.want)
+			}
+		})
 	}
 }
