@@ -1353,6 +1353,7 @@ type Store interface {
 type Params struct {
 	PlanCrossCheckTimeout time.Duration
 	RunTimeout            time.Duration
+	RunWallCeiling        time.Duration
 	RunIdleTimeout        time.Duration
 	// WorkerTaskIdleTimeout (PRD #517 M5, WORKER_TASK_IDLE_TIMEOUT) is the interactive-task
 	// park's worker-side idle backstop. Mirrored from config and shipped in the claim (like
@@ -2188,6 +2189,11 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 	}
 	if p.DispatchGrace <= 0 {
 		p.DispatchGrace = defaultDispatchGrace
+	}
+	// An unwired ceiling must not freeze 0-second walls (LEAST(…, 0)): fall back to the
+	// same derived default config.Load uses for an unset RUN_WALL_CEILING (#2279).
+	if p.RunWallCeiling <= 0 {
+		p.RunWallCeiling = min(max(24*time.Hour, p.RunTimeout), 72*time.Hour)
 	}
 	return &Service{
 		q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker(), outbox: newOutboxTracker(), quarantine: newQuarantineTracker(),
@@ -4274,7 +4280,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		runningParams.RunTimeoutSeconds = int32(s.p.RunTimeout.Seconds())
 		runningParams.MilestoneBudgetCap = milestoneBudgetCap
 		runningParams.SizeBudgetFactorL = sizeBudgetFactorL
-		runningParams.BudgetWallCeilingSeconds = budgetWallCeilingSeconds
+		runningParams.BudgetWallCeilingSeconds = budgetDurationSeconds(s.p.RunWallCeiling)
 		// PRD #84 M4: an AUTOPILOT run auto-approves its own plan and NEVER reports
 		// awaiting_approval, so it rides the plan-time INFERRED requirement set on this
 		// self-contained `running` report instead (runner.ts toolchainReportFields, the

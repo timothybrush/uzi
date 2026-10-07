@@ -139,8 +139,9 @@ import {
 // defaults. On a milestone-structured run the server scales the effective budget by
 // milestone count (Decisions 5/5b) and serves the scaled numbers — on the claim config
 // for a resume, on the per-iteration state-report ACK for a fresh run — which the loop
-// applies over these. A run with no milestones keeps exactly these values.
-const DEFAULT_RUN_TIMEOUT_SECONDS = 2 * 60 * 60; // 2h
+// applies over these. A small/medium-repo run with no milestones keeps these base values;
+// the server also applies a large-repo floor.
+const DEFAULT_RUN_TIMEOUT_SECONDS = 6 * 60 * 60; // 6h, mirrors the server RUN_TIMEOUT default
 const DEFAULT_IDLE_TIMEOUT_SECONDS = 10 * 60; // 10m
 const DEFAULT_MAX_ITERATIONS = 5; // PRD: RUN_MAX_ITERATIONS default 5 (single-milestone)
 // PRD #41: the plan-revision cap (PLAN_MAX_REVISIONS, default 3). The server also
@@ -1755,7 +1756,7 @@ export class SdkExecutor implements Executor {
        *  NOT DURABLE, and the honest bound is worth stating because the other #88
        *  bound already states its own: this is worker memory, so a worker death
        *  re-queues the run, execute() runs fresh, and the count restarts at 0. The
-       *  real lifetime ceiling is QUESTION_MAX x (RUN_MAX_REQUEUES + 1) — 10 on
+       *  real lifetime ceiling is QUESTION_MAX x (RUN_MAX_REQUEUES + 1) — 20 on
        *  defaults, not 5 (a run that used the issue #1742 one-shot finalize-resume
        *  allowance gets one more attempt, so x (RUN_MAX_REQUEUES + 2)) — exactly as QUESTION_TIMEOUT_SECONDS multiplies for the
        *  identical reason. Documenting one and not the other would be worse than
