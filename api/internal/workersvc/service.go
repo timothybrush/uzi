@@ -475,6 +475,10 @@ type Store interface {
 	// spending an automatic cycle; UserHasEnabledAnthropicToken is the door-check that the
 	// owner can pay for the run the endpoint would mint.
 	GetMRReworkLedger(ctx context.Context, arg store.GetMRReworkLedgerParams) (store.MrReworkLedger, error)
+	RemoveMRReworkPendingIDs(ctx context.Context, arg store.RemoveMRReworkPendingIDsParams) error
+	// UpsertMRReworkLedger records an automatic cycle (issue #2347): the watcher's create runs
+	// it in the same transaction as the run INSERT (CreateAutoMRReworkRunAndAdvance).
+	UpsertMRReworkLedger(ctx context.Context, arg store.UpsertMRReworkLedgerParams) error
 	// CreateManualMRReworkRunAndAdvance folds the on-demand run INSERT and the non-counting
 	// high-water advance into ONE atomic statement (PRD #1202, review-finding hardening):
 	// Postgres commits BOTH or NEITHER, so a create can never leave an unadvanced ledger that
@@ -3274,13 +3278,13 @@ var errRunVanished = errors.New("run vanished before claim assembly")
 // no secret bytes.
 var errCustomModelCapabilityMissing = errors.New("worker lacks codex_custom_model_v1 for a custom Codex root model")
 
-// errGuardrailBlockedClaim marks a claim the #66 default-branch guardrail refused
-// AT CLAIM (D1 layer 3, the security net): the bot can reach the repo's default
-// branch, or that could not be verified (fail-closed). finishRunClaim treats
-// it as TERMINAL (like errCredentialUnavailable, not the transient errVaultLocked
-// requeue), so the run is failed rather than pushing. Its message is safe to store
-// as a run failure reason — it carries only the block finding messages, never any
-// secret bytes.
+// errGuardrailBlockedClaim marks a claim refused AT CLAIM for a terminal, run-level reason:
+// the #66 default-branch guardrail (D1 layer 3, the security net) found the bot can reach the
+// repo's default branch or could not verify it (fail-closed), or a legacy mr_rework run
+// (legacyReviewClaimError, issue #2347) cannot resume. finishRunClaim treats it as TERMINAL
+// (like errCredentialUnavailable, not the transient errVaultLocked requeue), so the run is
+// failed rather than pushing. Its message is safe to store as a run failure reason: it carries
+// only the block finding messages or the legacy refusal text, never any secret bytes.
 var errGuardrailBlockedClaim = errors.New("run refused by the default-branch guardrail at claim")
 
 // errVaultLocked marks a claim that cannot open the owner's DEK-sealed Anthropic
@@ -6903,8 +6907,9 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			// (D9), or when no forge builder is wired (tests).
 			IssueComments: issueCommentsJSON,
 			// PRD #700 M2: issue runs never carry MR review comments — always NULL here.
-			// The mr_rework create path (M3's CreateAutoMRReworkRun) fetches the MR review
-			// snapshot via fetchReviewCommentsSnapshot and populates this itself.
+			// The mr_rework create paths (CreateAutoMRReworkRun, CreateManualMRReworkRun) take
+			// the author-assessed MR review snapshot from their callers and populate this
+			// themselves.
 			ReviewComments: nil,
 			// issue #857 M2: the provenance stamp threaded from each public entrypoint
 			// ("manual"/"schedule"/"autopilot"), so a run records why it fired.
