@@ -2748,9 +2748,12 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
   it("(6) a cancel beats the raw aborted error the transport throws mid-setup", async () => {
     const controller = new AbortController();
     const rig = makeRig();
+    let signalTurnStart!: () => void;
+    const turnStarted = new Promise<void>(resolve => { signalTurnStart = resolve; });
     // turn/start pends until its signal aborts, then rejects with a RAW aborted error.
     rig.transport.requestOverride = (c, opts) => {
       if (c.method !== "turn/start") return undefined;
+      signalTurnStart();
       return new Promise((_, reject) => {
         const sig = opts?.signal;
         const fail = (): void => reject(new Error("AbortError: the transport request was aborted"));
@@ -2761,7 +2764,8 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
     rig.transport.push(threadStarted());
     const { ctx } = makeCtx({ signal: controller.signal });
     const p = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
-    await tick();
+    // Cancel only once setup reaches the transport request this test exercises.
+    await withTimeout(turnStarted, 3000, "turn/start pending before cancellation");
     controller.abort();
     await assert.rejects(withTimeout(p, 3000, "cancel run"), (e: Error) => {
       assert.equal(e.message, "run cancelled", "the trip wins over the raw AbortError");
@@ -2910,10 +2914,17 @@ describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
   it("(implement) a `wall` PauseNowSignal trips REASON_PAUSE not REASON_CANCEL and reaches the wall park", async () => {
     const controller = new AbortController();
     const rig = makeRig();
+    let signalTurnStart!: () => void;
+    const turnStarted = new Promise<void>(resolve => { signalTurnStart = resolve; });
+    rig.transport.requestOverride = c => {
+      if (c.method === "turn/start") signalTurnStart();
+      return undefined;
+    };
     rig.transport.push(threadStarted()); // the turn is in progress; no terminal, so we abort it
     const { ctx, spies } = wallCtx({ signal: controller.signal });
     const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
-    await tick();
+    // Deliver the pause only after credential setup reaches the model turn.
+    await withTimeout(turnStarted, 3000, "turn/start pending before wall pause");
     // Issue #1764: the `wall` request lands WITH the abort (steering sets the mode and aborts together);
     // a mode already pending before the loop top would park there instead, before any turn.
     spies.mode = "wall";
@@ -2921,6 +2932,7 @@ describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
     const result = await withTimeout(running, 3000, "codex implement wall pause");
     // The run PARKED (walled) rather than cancelling — proving REASON_PAUSE (not REASON_CANCEL) was
     // tripped AND the wall seam was reached. A REASON_CANCEL trip would have rejected /run cancelled/.
+    assert.equal(rig.transport.turnStartCount, 1, "the pause interrupted an active model turn");
     assert.deepStrictEqual(result.walled, { reason: "codex run wall-clock timeout" }, "the Codex run parked at the wall");
     assert.equal(spies.parkForWallCalls, 1, "the `wall` pause reached the wall park");
   });
@@ -2961,6 +2973,12 @@ describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
   it("(plan) a `wall` PauseNowSignal during the plan turn reaches the wall park", async () => {
     const controller = new AbortController();
     const rig = makeRig();
+    let signalTurnStart!: () => void;
+    const turnStarted = new Promise<void>(resolve => { signalTurnStart = resolve; });
+    rig.transport.requestOverride = c => {
+      if (c.method === "turn/start") signalTurnStart();
+      return undefined;
+    };
     rig.transport.push(threadStarted());
     // A NON-pre-approved run runs the plan turn on epoch 0 (before any recreation), so the trip
     // lands in the plan turn. gatePlan is never reached (the turn aborts first).
@@ -2972,9 +2990,11 @@ describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
     });
     spies.mode = "wall";
     const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
-    await tick();
+    // Deliver the pause only after credential setup reaches the model turn.
+    await withTimeout(turnStarted, 3000, "turn/start pending before wall pause");
     controller.abort(new PauseNowSignal());
     const result = await withTimeout(running, 3000, "codex plan wall pause");
+    assert.equal(rig.transport.turnStartCount, 1, "the pause interrupted an active model turn");
     assert.deepStrictEqual(result.walled, { reason: "codex run wall-clock timeout" }, "the plan-turn wall pause parked the run");
     assert.equal(spies.parkForWallCalls, 1, "the plan-turn `wall` pause reached the wall park");
   });
