@@ -76,6 +76,8 @@ import {
   type CodexReleaseResponse,
   type CodexRefreshRequest,
   type CodexRefreshResponse,
+  type RecoveryReconcileRequest,
+  type RecoveryReconcileResponse,
   type RecoveryReserveRequest,
   type RecoveryReserveResponse,
   type RecoveryUploadManifest,
@@ -1768,8 +1770,23 @@ export class WorkerClient {
     )) as RecoveryReserveResponse;
   }
 
+  /** Atomically reconcile an exact inventory capture and fence it before granting
+   * replacement authority. JSON POST. Throws RequestError on 4xx/5xx. */
+  async reconcileRecoveryCapture(runId: string, captureId: string, req: RecoveryReconcileRequest): Promise<RecoveryReconcileResponse> {
+    if (!this.hasFeature("recovery_inventory_v1")) throw new Error("inventory feature unavailable; capture retained");
+    return await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/archives/${encodeURIComponent(captureId)}/reconcile`,
+      req,
+      this.httpTimeoutMs,
+      undefined,
+      // The immutable receipt carries IDs, generation, outcome and optional disposition/evidence;
+      // 16 KiB leaves ample protocol headroom while bounding actual response bytes.
+      16 * 1024,
+    ) as RecoveryReconcileResponse;
+  }
+
   /** By-id status poll of a capture (handles lost ACKs; on restart tells whether the byte
-   *  manifest is already bound). JSON GET. Throws RequestError on 4xx/5xx. */
+   * manifest is already bound). JSON GET. Throws RequestError on 4xx/5xx. */
   async getRecoveryCaptureStatus(
     runId: string,
     captureId: string,
