@@ -189,6 +189,7 @@ export interface RecoveryArchiveClient {
 
 /** The bundle-producer subset {@link RecoveryCoordinator} needs — GitCache satisfies it. */
 export interface RecoveryBundleProducer {
+  cleanupRecoveryGeneration?: GitCache["cleanupRecoveryGeneration"];
   readInventoryCloneHeads?: GitCache["readInventoryCloneHeads"];
   committedTrackingOwnership?: GitCache["committedTrackingOwnership"];
   ancestry?: GitCache["ancestry"];
@@ -345,6 +346,7 @@ function hasJournaledBundle(record: RecoveryRecord): record is JournaledBundleRe
  *  Legacy records need a journaled bundle that is bundled or needs_action for a
  *  transient/credential reason; pinned, bundle-less and permanent legacy records are skipped. */
 function isLiveCandidate(record: RecoveryRecord): boolean {
+  if (record.inventoryGuarded && record.finalAcknowledged) return true;
   if (record.inventoryGuarded && record.coverageDigest && !record.finalAcknowledged) {
     if (record.reason === "inventory_quiescence_breach" || record.reason === "inventory_snapshot_changed") return false;
     return record.state !== "needs_action" || (!!record.reason && LIVE_RETRY_REASONS.has(record.reason));
@@ -635,13 +637,14 @@ export class RecoveryCoordinator {
     this.enabled = this.key !== undefined;
   }
 
-  // ── D1: unconditional local pin + authenticated journal ────────────────────────
+  // ── D1: source pin + authenticated journal ─────────────────────────────────────
 
   /**
-   * Pin H into the durable authenticated journal. UNCONDITIONAL, local and credential-free
-   * — this never waits for a server response and never uses a forge PAT. Idempotent within
-   * a run: an existing verified record for the same (runId, sourceSha) is reused, so a
-   * re-execution of the same committed head does not duplicate the pin.
+   * Pin H into the authenticated local journal without a forge PAT. Creating a new guarded
+   * journal requires a fresh exact open-hold read; unavailable or closed custody refuses
+   * creation. Updates to existing journals and legacy pins remain local. Reuses an existing
+   * verified source record for the same run and claim generation, or for the same run and
+   * source SHA when the legacy input has no generation.
    *
    * Returns the record, or undefined when recovery is disabled or the pin failed (the
    * caller treats undefined as "no capture to drive", never as a release authority).
@@ -686,6 +689,10 @@ export class RecoveryCoordinator {
           await this.writeRecordUnlocked(next);
           return next;
         }
+        // No surviving journal is permission to reopen a closed/discarded guarded hold.
+        // Inventory-protocol creation requires a fresh exact open hold. An indeterminate
+        // read retains the source without manufacturing a new journal.
+        if ((await this.guardedGeneration(input)) && !(await this.openInventoryHold(input))) return undefined;
         const record: RecoveryRecord = {
           version: JOURNAL_VERSION,
           runId: input.runId,
@@ -1030,6 +1037,8 @@ export class RecoveryCoordinator {
       }
       await this.writeExistingRecord(record, cur => ({ ...cur, finalAcknowledged: true }));
       this.onAuthoritativeGenerationReleased?.(record.runId, record.generation!);
+      await this.forgetGenerationWithinCycle(record.runId, record.generation!);
+      return { state: "uploaded", captureId: record.captureId };
     } catch (err) {
       this.log.warn("recovery: final inventory ACK pending; exact request retained", { run_id: record.runId, generation: record.generation, error: errText(err) });
       const cls = await classifyUploadFailure(err, record);
@@ -1040,7 +1049,11 @@ export class RecoveryCoordinator {
     }
   }
 
-  private async resumeInventory(record: RecoveryRecord, signal?: AbortSignal): Promise<RecoveryOutcome | void> {
+  private async resumeInventory(record: RecoveryRecord, signal?: AbortSignal, isExecuting = this.isExecuting): Promise<RecoveryOutcome | void> {
+    if (record.finalAcknowledged) {
+      await this.forgetGenerationWithinCycle(record.runId, record.generation!, isExecuting);
+      return;
+    }
     if (this.isExecuting(record.runId) || !isLiveCandidate(record) || !record.coverageDigest || record.finalAcknowledged || !(await this.inactiveInventory(record))) return;
     if (record.finalRequest || record.state === "uploaded") return this.finalizeInventory(record);
     const barePath = record.bareDir && await this.git.resolveRecoveryBareDir?.(record.bareDir);
@@ -1628,7 +1641,7 @@ export class RecoveryCoordinator {
    * issue #1742 D4(a) — snapshot the records the PREVIOUS process left behind. Taken by the worker
    * BEFORE register, so it provably excludes any record a live flight of this process writes
    * later; {@link resumePending} then processes only this snapshot. Authenticated records only
-   * (a tampered record is never trusted), `uploaded` ones omitted (nothing to do).
+   * (a tampered record is never trusted), legacy uploads omitted; guarded ACKs retry local cleanup.
    */
   async snapshotBootRecords(): Promise<RecoveryRecord[]> {
     if (!this.enabled) return [];
@@ -1641,7 +1654,7 @@ export class RecoveryCoordinator {
     const out: RecoveryRecord[] = [];
     for (const runId of runDirs) {
       for (const record of await this.listRecords(runId)) {
-        if (record.state !== "uploaded" || (record.inventoryGuarded && !record.finalAcknowledged)) out.push(record);
+        if (record.state !== "uploaded" || record.inventoryGuarded) out.push(record);
       }
     }
     return out;
@@ -1876,12 +1889,13 @@ export class RecoveryCoordinator {
    * Re-drive journaled bundles whose upload failed while the worker stayed alive. Called by the
    * worker after each successful heartbeat (`authenticatedAtMs` is that heartbeat's SEND time).
    * Bounded and cheap to call: it returns at once while any pass (this or the boot sweep) is in
-   * flight, before `nextPassAt`, or while a credential rejection is newer than the heartbeat; a
-   * pass touches at most `liveMaxPerPass` records, least recently attempted first, and backs off
-   * exponentially (capped) after a pass with a transient failure. Only records with a journaled
-   * bundle that are `bundled`, or `needs_action` for a transient reason or `credential_rejected`,
-   * are candidates; the upload is the journaled-bytes upload (no forge PAT; a journaled bundle is
-   * never re-produced). A run that is executing is skipped, and each record step takes the
+   * flight or before `nextPassAt`; rejected credentials exclude uploads but permit local ACK cleanup.
+   * A pass touches at most `liveMaxPerPass` records, least recently attempted first, and backs off
+   * exponentially (capped) after a pass with a transient failure. Guarded records with a FINAL
+   * ACK retry local cleanup, including uploaded records. Other guarded candidates follow
+   * inventory retry eligibility; legacy candidates need a journaled bundle in `bundled` or
+   * transient/credential-rejected `needs_action`. Uploads use journaled bytes without a forge
+   * PAT and never reproduce the bundle. A run that is executing is skipped, and each step takes the
    * capture-cycle lock in skip mode, so it never waits behind a foreground capture or sweep step
    * on the same record.
    */
@@ -1897,15 +1911,16 @@ export class RecoveryCoordinator {
       return;
     }
     if (this.now() < this.nextPassAt) return;
-    if (this.credentialBlockedAt !== undefined && opts.authenticatedAtMs <= this.credentialBlockedAt) return;
     await this.trackPass(() => this.livePass(opts));
   }
 
   private async livePass(opts: ResumeLiveOptions): Promise<void> {
     let transient = false;
     try {
-      // One credential-free discovery per spaced pass. Failed discovery retains earlier entries.
-      if (this.git.discoverOwedCandidates && this.client.hasFeature?.("recovery_inventory_v1")) {
+      const credentialsBlocked = this.credentialBlockedAt !== undefined && opts.authenticatedAtMs <= this.credentialBlockedAt;
+      // Discovery may materialize uploads; blocked passes only retry persisted local ACKs.
+      // One discovery per spaced pass. Failed discovery retains earlier entries.
+      if (!credentialsBlocked && this.git.discoverOwedCandidates && this.client.hasFeature?.("recovery_inventory_v1")) {
         try { await this.snapshotOwedInventory(); }
         catch (err) {
           transient = true;
@@ -1919,10 +1934,15 @@ export class RecoveryCoordinator {
       for (const id of this.lastAttemptAt.keys()) if (!seen.has(id)) this.lastAttemptAt.delete(id);
       // Executing runs are filtered BEFORE the per-pass cap so they cannot hold its slots.
       const candidates = all
-        .filter((r) => isLiveCandidate(r) && !opts.isExecuting(r.runId))
+        .filter((r) => isLiveCandidate(r) && !opts.isExecuting(r.runId) &&
+          (!credentialsBlocked || (r.inventoryGuarded && r.finalAcknowledged)))
         .sort((a, b) => (this.lastAttemptAt.get(a.captureId) ?? 0) - (this.lastAttemptAt.get(b.captureId) ?? 0))
         .slice(0, this.liveMaxPerPass);
+      // A blocked pass with no local ACK work must not delay a newer authenticated heartbeat.
+      if (credentialsBlocked && candidates.length === 0) return;
+      let uploadsStopped = credentialsBlocked;
       for (const snap of candidates) {
+        if (uploadsStopped && !(snap.inventoryGuarded && snap.finalAcknowledged)) continue;
         if (opts.signal?.aborted) break;
         const res = await runCaptureCycle(await this.cycleKey(snap), "skip", () => this.liveStep(snap, opts));
         if (!res.ran) {
@@ -1932,7 +1952,9 @@ export class RecoveryCoordinator {
           continue;
         }
         if (res.value === "transient") transient = true;
-        if (res.value === "credential") break;
+        // A credential failure blocks further uploads in this pass even if its heartbeat
+        // timestamp is newer than the local clock. Local ACK siblings still run.
+        if (res.value === "credential") uploadsStopped = true;
       }
     } catch (err) {
       this.log.warn("recovery: live re-drive pass failed", { error: errText(err) });
@@ -1967,11 +1989,13 @@ export class RecoveryCoordinator {
     }
     const record = res.record;
     // Re-checked inside the lock: the record may have moved on, or the run started executing.
-    if (!isLiveCandidate(record) || opts.isExecuting(record.runId)) return "ok";
+    if (!isLiveCandidate(record) || opts.isExecuting(record.runId) ||
+        (!(record.inventoryGuarded && record.finalAcknowledged) && this.credentialBlockedAt !== undefined &&
+         opts.authenticatedAtMs <= this.credentialBlockedAt)) return "ok";
     this.lastAttemptAt.set(record.captureId, this.now());
     try {
       const out = record.inventoryGuarded
-        ? await this.resumeInventory(record, opts.signal)
+        ? await this.resumeInventory(record, opts.signal, opts.isExecuting)
         : await this.uploadJournaledBundle(record, opts.signal, "live");
       if (!out) return "ok";
       log(out.state, out.reason);
@@ -1990,7 +2014,7 @@ export class RecoveryCoordinator {
         capture_id: record.captureId,
         error: errText(err),
       });
-      await this.markFailure(record, "upload_transient").catch(() => undefined);
+      if (!record.finalAcknowledged) await this.markFailure(record, "upload_transient").catch(() => undefined);
       log("needs_action", "upload_transient");
       return "transient";
     }
@@ -2004,18 +2028,79 @@ export class RecoveryCoordinator {
    * successor generation is live and writing its own record/bundle/`*.tmp` into the same dir, so it
    * removes only the named generation's files and then attempts a non-recursive rmdir, which leaves
    * any non-empty dir in place. Unauthenticated/orphan leftovers are swept later by the
-   * completed-run release(). Local-only (no RPC); the caller invokes it only after a `released`
-   * settle outcome.
+   * completed-run release(). Guarded cleanup additionally requires a covering authenticated FINAL
+   * ACK; a server release or owner discard alone grants no source-deletion authority.
    */
   async forgetGeneration(runId: string, generation: number): Promise<void> {
     if (!this.enabled) return;
-    if (!(await this.guardedGeneration({ runId, generation }))) {
-      await this.removeGenerationRecords(runId, generation, "rmdir_if_empty");
-      return;
-    }
-    await runCaptureCycle(await this.cycleKey({ runId, captureId: "", generation }), "wait", async () => {
-      if ((await this.listRecords(runId)).some(r => r.generation === generation && r.inventoryGuarded && !r.finalAcknowledged)) return;
-      await this.removeGenerationRecords(runId, generation, "rmdir_if_empty");
+    await runCaptureCycle(await this.cycleKey({ runId, captureId: "", generation, inventoryGuarded: true }), "wait",
+      () => this.forgetGenerationWithinCycle(runId, generation));
+  }
+
+  /** Caller owns the generation cycle. The journal lock spans selection and every destructive
+   * step, excluding delayed journal writers. One pass, no internal retries; failure keeps the
+   * covering ACK and the bounded boot/live passes retry it independently of upload eligibility. */
+  private async forgetGenerationWithinCycle(runId: string, generation: number, isExecuting = this.isExecuting): Promise<void> {
+    await this.withJournalLock(runId, async () => {
+      // Keep legacy exact-release cleanup (including opaque sibling retention) unchanged.
+      // Classify under the journal lock and generation cycle so a new guarded writer cannot
+      // slip between classification and removal. Guarded cleanup checks the complete inventory.
+      if (!(await this.guardedGeneration({ runId, generation }))) {
+        await this.removeGenerationRecordsUnlocked(runId, generation, "rmdir_if_empty");
+        return;
+      }
+      const records = await this.checkedRecords(runId);
+      const selected = records.filter(r => r.generation === generation);
+      if (!selected.length) return;
+      const state = await this.cleanupStateOf(records, generation);
+      if (state === "legacy") {
+        await this.removeGenerationRecordsUnlocked(runId, generation, "rmdir_if_empty");
+        return;
+      }
+      if (state !== "acknowledged" || !this.git.cleanupRecoveryGeneration) return;
+      const ack = selected.find(r => r.inventoryGuarded && r.finalAcknowledged && r.finalRequest && r.coverageDigest)!;
+      const open = (): boolean => residueQuarantine() === undefined && !this.isExecuting(runId) && !isExecuting(runId);
+      if (!open() || !ack.coverageContext || !ack.bareDir) return;
+      const bare = await this.git.resolveRecoveryBareDir?.(ack.bareDir);
+      if (bare !== ack.coverageContext.barePath) return;
+      const bundles = new Set<string>();
+      // Positive ownership is the canonical capture filename, not an arbitrary MAC-covered path.
+      // Validate every path before changing refs; an unknown journal path retains all authority.
+      for (const record of selected) {
+        if ((record.bareDir && record.bareDir !== ack.bareDir) ||
+            (record.recoveryPinBareDir && record.recoveryPinBareDir !== ack.bareDir) ||
+            (record.coverageContext && record.coverageContext.barePath !== bare)) return;
+        const canonical = path.resolve(this.bundlePath(record));
+        if (record.bundlePath && path.resolve(record.bundlePath) !== canonical) return;
+        if (path.dirname(canonical) !== path.resolve(this.runDir(runId))) return;
+        try {
+          const st = await fs.lstat(canonical);
+          if (!st.isFile() || st.isSymbolicLink()) return;
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        }
+        bundles.add(canonical);
+      }
+      if (!open()) return;
+      const result = await this.git.cleanupRecoveryGeneration(bare, ack.coverageContext,
+        ack.originalRoots ?? [], selected.filter(r => r.coverageDigest).map(r => ({
+          fingerprint: r.coverageDigest!, sha: r.sourceSha,
+          coveredHeads: [...new Set([r.originalSourceSha!, r.inventoryCurrentSha!, ...(r.originalRoots ?? []).map(root => root.sha)])],
+        })), [...new Set(selected.flatMap(r => [r.sourceSha, r.originalSourceSha].filter((s): s is string => !!s)))],
+        ack.sourceSha, open);
+      if (result !== "removed") return;
+      const unlink = async (file: string): Promise<void> => {
+        if (!open()) throw new Error("recovery cleanup source protection changed");
+        try { await fs.unlink(file); }
+        catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+      };
+      for (const bundle of bundles) await unlink(bundle);
+      // All other journals (including other ACKs) go first. The ACK chosen by cleanupStateOf
+      // remains a covering authority at every intermediate state and is removed last.
+      for (const record of selected.filter(r => r.captureId !== ack.captureId)
+        .sort((a, b) => Number(!!a.finalAcknowledged) - Number(!!b.finalAcknowledged))) await unlink(this.recordPath(record));
+      await unlink(this.recordPath(ack));
+      await fs.rmdir(this.runDir(runId)).catch(() => undefined);
     });
   }
 
@@ -2027,8 +2112,10 @@ export class RecoveryCoordinator {
   }
 
   /** Cleanup authority requires a complete authenticated physical journal, unlike inspect. */
-  async inventoryCleanupState(runId: string, generation: number): Promise<"legacy" | "pending" | "acknowledged"> {
-    return this.cleanupStateOf(await this.checkedRecords(runId), generation);
+  async inventoryCleanupState(runId: string, generation: number): Promise<"absent" | "legacy" | "pending" | "acknowledged"> {
+    const records = await this.checkedRecords(runId);
+    if (!records.some(r => r.generation === generation || r.generation === undefined)) return "absent";
+    return this.cleanupStateOf(records, generation);
   }
 
   /** Earlier generations whose own covering FINAL is acknowledged (cleanupStateOf says so): their
