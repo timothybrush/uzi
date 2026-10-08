@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Completed guarded recovery can settle after attributed clone parents disappear ([#2433](https://github.com/vtmocanu/uzi/issues/2433)).**
+  After loss of the runner tree, verified absence of an attributed clone's parent directories no longer blocks archive-backed FINAL for a completed run with a valid durable capture; once FINAL is acknowledged, replay can retire its pending terminal journal. Discarded holds (#2417) and unresolved initial clone survival remain outside this fix.
+
 - **Empty pre-clone terminal claims settle guarded custody ([#2469](https://github.com/vtmocanu/uzi/issues/2469)).**
   A confirmed forge-park cap failure or cancellation releases its exact-generation hold after positive evidence that no source was adopted. Lost acknowledgements require a matching terminal ownership generation; stale or unknown claims and retained source keep their custody protection.
 
