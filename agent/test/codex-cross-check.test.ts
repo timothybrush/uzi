@@ -30,6 +30,7 @@ type Emit = (frame: unknown) => void;
 // Both injected roots speak the real NDJSON contracts. The fileop stand-in exposes
 // only its dictionary root. This proves functional wiring, not kernel isolation.
 function rig(options: {
+ round?: number;
  notes?: (emit: Emit) => void;
  beforeResponse?: (frame: Frame, emit: Emit) => void;
  afterResponse?: (frame: Frame, emit: Emit) => void;
@@ -134,9 +135,48 @@ function rig(options: {
  const log = { ...recorded.logger, addSecret: (s: string) => secrets.add(s), removeSecret: (s: string) => secrets.delete(s) } as unknown as Logger;
  const checker = new CodexCrossCheck(client, log, deps);
  return { logs: recorded.lines, get releases() { return releases; }, requests, ops, specs, disposed, secrets, usage, refreshes, terminal, fail: () => failProvider(new Error("root failed")),
-  run: (signal = new AbortController().signal) => checker.run(options.claim ?? claim(options.subscription), "/checkout", "/owned", signal,
-   async (payload) => { usage.push(payload); if (options.failUsage && payload.event === "result") throw new Error("usage failed"); }) };
+  run: (signal = new AbortController().signal) => {
+   const c = options.claim ?? claim(options.subscription);
+   if (options.round !== undefined) c.cross_check!.round = options.round;
+   return checker.run(c, "/checkout", "/owned", signal, async (payload) => {
+    usage.push(payload); if (options.failUsage && payload.event === "result") throw new Error("usage failed");
+   });
+  } };
 }
+
+for (const pinned of [false, true]) {
+it("round two runs the confined checker and fences its round without a child budget snapshot: " + (pinned ? "pinned" : "default"), async () => {
+ const c = pinned ? pinnedClaim() : claim();
+ assert.equal("automatic_revision_limit" in c.cross_check!, false);
+ assert.equal("automatic_rounds_enabled" in c.cross_check!, false);
+ const r = rig({ round: 2, claim: c });
+ assert.equal(await r.run(), verdict);
+ assert.equal(r.specs.length, 2);
+ assert.ok("args" in r.specs[0]! && r.specs[0].args.includes("--cross-check"));
+ const turn = r.requests.find((frame) => frame.method === "turn/start");
+ assert.ok(turn);
+ const candidate = JSON.parse(/<candidate_[a-f0-9]{32}>\n([\s\S]*?)\n<\/candidate_[a-f0-9]{32}>/.exec(turn.params!.input[0].text)![1]!);
+ assert.equal(candidate.round, 2);
+ if (pinned) {
+  assert.equal(candidate.model_source, "pin");
+  assert.equal(candidate.effort_source, "pin");
+  assertOneAttempt(r);
+ }
+ assert.deepEqual(r.ops, ["stat"]);
+ assert.deepEqual(r.disposed, ["provider", "fileop"]);
+});
+}
+
+it("checker rejects rounds outside positive integers one through five before launch", async () => {
+ for (const round of [0, 6, 1.5, NaN]) {
+  const r = rig({ round });
+  await assert.rejects(r.run(), /unsupported cross-check candidate/);
+  assert.deepEqual(r.specs, []);
+ }
+ const c = claim();
+ c.cross_check!.round = 5;
+ assert.match(crossCheckPrompt(c), /"round":5/);
+});
 
 // Synthetic 0.159.3 local Responses HTTP 400 selected frame (#2151),
 // copied after inspecting the capture/schema. Not hosted entitlement evidence.
@@ -169,22 +209,22 @@ function assertOneAttempt(r: ReturnType<typeof rig>, turn = true): void {
  assert.deepEqual(r.disposed, ["provider", "fileop"]);
  assert.equal(r.secrets.size, 0);
 }
-for (const mode of ["async", "terminal", "thread/start", "turn/start"] as const) {
- it("maps pinned startup rejection over real transport: " + mode, async () => {
-  const r = rig({ claim: pinnedClaim(),
+for (const round of [1, 2]) for (const mode of ["async", "terminal", "thread/start", "turn/start"] as const) {
+ it("maps pinned startup rejection over real transport: " + mode + " round " + round, async () => {
+  const r = rig({ round, claim: pinnedClaim(),
    ...(mode.includes("/") ? { rpcFailure: mode, rpcError: { code: -32000, message: capturedError.message } } : {}),
    notes: (emit) => mode === "terminal" ? failedTerminal(emit) : rejection(emit) });
   await assert.rejects(r.run(), CrossCheckCheckerUnavailableError);
   assertOneAttempt(r, mode !== "thread/start");
  });
 }
-for (const source of [undefined, "worker default", "effort-only"] as const) {
- it("retains model error without model pin: " + source, async () => {
+for (const round of [1, 2]) for (const source of [undefined, "worker default", "effort-only"] as const) {
+ it("retains model error without model pin: " + source + " round " + round, async () => {
   const c = pinnedClaim();
   if (source === "worker default") c.cross_check!.model_source = source;
   else delete c.cross_check!.model_source;
   if (source !== "effort-only") delete c.cross_check!.effort_source;
-  const r = rig({ claim: c, notes: (emit) => rejection(emit) });
+  const r = rig({ round, claim: c, notes: (emit) => rejection(emit) });
   await assert.rejects(r.run(), (e: Error) => !(e instanceof CrossCheckCheckerUnavailableError) && /model error/.test(e.message));
   assertOneAttempt(r);
  });
@@ -226,16 +266,16 @@ const negatives: [string, unknown, Record<string, unknown>?][] = [
  ["nestedstring", { ...capturedError, message: JSON.stringify(capturedError.message) }],
  ["oversize", { ...capturedError, message: capturedError.message + " ".repeat(8192) }],
 ];
-for (const [label, error, overrides] of negatives) {
- it("does not map negative rejection control: " + label, async () => {
-  const r = rig({ claim: pinnedClaim(), notes: (emit) => rejection(emit, error, overrides) });
+for (const round of [1, 2]) for (const [label, error, overrides] of negatives) {
+ it("does not map negative rejection control: " + label + " round " + round, async () => {
+  const r = rig({ round, claim: pinnedClaim(), notes: (emit) => rejection(emit, error, overrides) });
   await assert.rejects(r.run(), (e: Error) => !(e instanceof CrossCheckCheckerUnavailableError));
   assertOneAttempt(r);
  });
 }
-for (const activity of ["delta", "reasoning", "tool", "completed", "terminal-items", "usage-output"]) {
- it("does not reclassify after model activity: " + activity, async () => {
-  const r = rig({ claim: pinnedClaim(), notes: (emit) => {
+for (const round of [1, 2]) for (const activity of ["delta", "reasoning", "tool", "completed", "terminal-items", "usage-output"]) {
+ it("does not reclassify after model activity: " + activity + " round " + round, async () => {
+  const r = rig({ round, claim: pinnedClaim(), notes: (emit) => {
    if (activity === "terminal-items") { failedTerminal(emit, capturedError, "thread", "turn", [{ type: "reasoning" }]); return; }
    if (activity === "usage-output") {
     const usage = { totalTokens: 2, inputTokens: 1, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 1, reasoningOutputTokens: 0 };
