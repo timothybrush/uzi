@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **Dedicated cross-check capacity ([#2169](https://github.com/vtmocanu/uzi/issues/2169)).**
+  Plan cross-check children use a separate agent pool (`WORKER_CROSS_CHECK_SLOTS`, default 1, range 0–16), prefer their lead's worker, and retain the plan-stage run-slot fallback only on older workers with an unadvertised cap and no lane capability. Explicit zero disables advertisement/polling without enabling fallback. Cordoned workers may finish their pinned child, subject to maintenance fences; an eligible ephemeral own lane avoids another pod and preserves the parent binding, while active children block lease entry and teardown. Lane claims retain credential, recovery and custody checks, including same-generation lane accounting. Web capacity shows separate runs/cross-checks; owner/admin API DTOs and CLI `RUN SLOTS` / `CROSS-CHECKS` expose both lanes during draining. Hosted `workers.crossCheckSlots` / `UZI_WORKER_CROSS_CHECK_SLOTS` preserve zero and roll workers through the spec hash without raising preset memory. Lead/checker memory remains shared and default-one hosted headroom is unmeasured; hosted acceptance is pending. This enables Claude-lead plan checks on Codex, not the reverse direction or Code cross-check.
+
 - **Guarded recovery records safe inventory-source refusal diagnostics ([#2507](https://github.com/vtmocanu/uzi/issues/2507)).**
   Worker logs and authenticated local recovery reasons identify the first failed source check and a bounded inventory-read cause without raw errors or paths. Existing custody and release decisions stay unchanged; the observed automatic hold-release failure still needs live evidence.
 
