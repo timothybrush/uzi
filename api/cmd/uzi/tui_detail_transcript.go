@@ -125,6 +125,21 @@ func (m tuiModel) buildFrameBlocksFrom(lane agentLane, start int) []frameBlock {
 			}
 		}
 	}
+	// A single narrower renderer serves every structured field/frame in this build.
+	// Glamour reserves two cells on each document edge: add those four cells to
+	// the prose width after reserving five for option-description chrome.
+	// questionProse handles widths below newTUIRenderer's 20-cell minimum.
+	var questionModel *tuiModel
+	questionView := func() tuiModel {
+		if questionModel == nil {
+			copy := m
+			if renderer, err := newTUIRenderer(max(1, width-5)+4, m.dark); err == nil {
+				copy.renderer = renderer
+			}
+			questionModel = &copy
+		}
+		return *questionModel
+	}
 	blocks := make([]frameBlock, 0, len(lane.Frames)-start)
 	for i := start; i < len(lane.Frames); i++ {
 		f := lane.Frames[i]
@@ -183,6 +198,28 @@ func (m tuiModel) buildFrameBlocksFrom(lane agentLane, start int) []frameBlock {
 			}
 			line += m.pal.faint.Render(m.renderer.Plain(sum, 200))
 			block = clampVisual(line, width)
+		case "question", "answer":
+			// This event's fields are the only evidence of its actor. Lane identities
+			// can inherit labels/roles from earlier frames and must not label an answer.
+			actor := ""
+			if f.AgentLabel != "" || f.Agent != "" {
+				actor = frameAgentTag(f)
+			}
+			if f.Kind == "question" {
+				if questions := parseTranscriptQuestions(f.Payload); len(questions) > 0 {
+					block = questionView().formatTranscriptQuestions(questions, actor, width)
+				}
+			} else if answers := parseTranscriptAnswers(f.Payload); len(answers) > 0 && strings.TrimSpace(strings.Join(answers, "")) != "" {
+				block = questionView().formatTranscriptAnswers(answers, actor, width)
+			}
+			if block == "" {
+				// Preserve the safe raw body fallback without borrowing a lane's actor.
+				head := tungsten.Render("▪ " + m.renderer.Plain(f.Kind, 16))
+				if actor != "" {
+					head += m.pal.faint.Render("  · ") + tungsten.Render(m.renderer.Plain(actor, 24))
+				}
+				block = clampVisual(head, width) + "\n" + strings.TrimLeft(m.renderer.Markdown(transcriptText(f)), "\n")
+			}
 		case "text", "thinking":
 			// TrimLeft drops Glamour's document top-margin so the body sits directly under the
 			// "▪ <who>" speaker line instead of a blank line below it.
@@ -386,7 +423,7 @@ func resultIsError(payload json.RawMessage) bool {
 	return json.Unmarshal(payload, &p) == nil && p.IsError
 }
 
-// transcriptViewport is the transcript's visible line budget (the pane title is a fixed
+// transcriptBudgetWithoutCard is the transcript's visible line budget before the card (the pane title is a fixed
 // header above it, so it is one row shorter than the pane).
 //
 // The budget is the terminal height minus every OTHER row the detail view draws, so the
@@ -398,7 +435,9 @@ func resultIsError(payload json.RawMessage) bool {
 // the pane title row, an optional attention banner, an optional steer bar, and the footer — so
 // this and the render cannot disagree; both the window render and the scroll clamp read it.
 // renderSteerBar/detailBanner/transportLine are pure and never call back here (no recursion).
-func (m tuiModel) transcriptViewport() int {
+// transcriptBudgetWithoutCard shares the existing chrome accounting with the card.
+// It excludes the pane title, and deliberately has no minimum floor.
+func (m tuiModel) transcriptBudgetWithoutCard() int {
 	lineCount := func(s string) int {
 		if s == "" {
 			return 0
@@ -434,10 +473,11 @@ func (m tuiModel) transcriptViewport() int {
 	if m.detail.steer.mode == steerIdle {
 		chrome++ // the footer (suppressed while the steer bar owns the key hints)
 	}
-	if h := m.height - chrome; h > 3 {
-		return h
-	}
-	return 3
+	return m.height - chrome
+}
+
+func (m tuiModel) transcriptViewport() int {
+	return max(3, m.transcriptBudgetWithoutCard()-len(m.questionCardLines()))
 }
 
 // padLinesToViewport joins lines and pads with blank lines to exactly vp rows, so the
@@ -505,11 +545,12 @@ func (m tuiModel) renderTranscript() string {
 		maxTop = 0
 	}
 	top := m.detail.scroll
-	if m.detail.follow || top > maxTop {
+	if m.detail.follow {
 		top = maxTop
-	}
-	if top < 0 {
-		top = 0
+	} else {
+		// A larger viewport must not pull a paused content anchor upward.
+		// Clamp stale offsets to content, then pad a short window near the end.
+		top = min(max(0, top), max(0, len(lines)-1))
 	}
 	end := top + vp
 	if end > len(lines) {
