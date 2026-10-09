@@ -64,6 +64,9 @@ through `[0.52.0]`.)
 - **PR diagram diagnostics explain omission and removal ([#2516](https://github.com/vtmocanu/uzi/issues/2516)).**
   Structured worker logs identify editor, parser, zero-code, renderer and size-cap decisions without diagram content or credentials. API rejection warnings correlate committed versions and omit version IDs when staging fails; diagram policy and publication flags remain unchanged.
 
+- **Documentation heading links work in the app ([#2262](https://github.com/vtmocanu/uzi/issues/2262)).**
+  In-app documentation headings have fragment IDs, and links to a heading scroll it into view with space for the mobile navigation bar.
+
 ### Security
 
 - **Go toolchain 1.27.2 and golang.org/x/net 0.60.0 ([#2543](https://github.com/vtmocanu/uzi/pull/2543), supersedes #2536, #2537, #2465).**
