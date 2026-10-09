@@ -289,7 +289,7 @@ separate decision.
   total: tokens, the cost or "cost unknown", the price-table version and the coverage
   reasons. The current wording distinguishes this separate tail from recorded
   API-equivalent cost; it changes no fold or aggregate boundary (see
-  [PRD #2559](../prds/2559-codex-subscription-cost.md)).
+  [PRD #2559](../prds/done/2559-codex-subscription-cost.md)).
 
 ## D11 — Per-run caps, atomic, with one lock order
 
