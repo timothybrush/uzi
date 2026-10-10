@@ -54,6 +54,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **The split TUI footer keeps its key hints beside the restart hint ([#2609](https://github.com/vtmocanu/uzi/issues/2609)).**
+  When "vX installed, restart uzi to use it" shows, the split footer no longer collapses to `? keys · q quit` on wide terminals: it drops the optional hints only as far as needed and right-aligns the full restart text, falling back to the short footer when the hints cannot fit beside it.
+
 - **A judge run killed by a usage limit now fails with the limit facts instead of posting the fallback review ([#1970](https://github.com/vtmocanu/uzi/issues/1970)).**
   The Claude judge lane reports the run failed with its rate-limit window and reset time (or a usage-limit reason when the model reported none), posts no review and does not report the run completed. Other model errors still post the deterministic fallback; the Codex judge lane is unchanged.
 
