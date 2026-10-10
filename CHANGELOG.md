@@ -54,6 +54,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **A judge run killed by a usage limit now fails with the limit facts instead of posting the fallback review ([#1970](https://github.com/vtmocanu/uzi/issues/1970)).**
+  The Claude judge lane reports the run failed with its rate-limit window and reset time (or a usage-limit reason when the model reported none), posts no review and does not report the run completed. Other model errors still post the deterministic fallback; the Codex judge lane is unchanged.
+
 - **TUI run detail fits narrow terminals ([#2591](https://github.com/vtmocanu/uzi/issues/2591)).**
   The run detail and answer views' crew and transcript rows are now clipped to the terminal width instead of overflowing it; the crew rail keeps its width and the transcript column is what is cut.
 
