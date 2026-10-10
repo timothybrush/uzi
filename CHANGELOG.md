@@ -48,6 +48,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Retained recovery continues after a refused immediate or wall pause.**
+  Trusted model settlement can clear the persisted recovery budget and a later credential switch reaches its exact-generation handler after pause refusal; current pauses, cancellation, shutdown, fencing, and disk stops still stop retained work without changing custody or cleanup authority.
+
 - **Chart-rendered api settings now reach the pod when `api.config` is empty ([#2623](https://github.com/vtmocanu/uzi/issues/2623)).**
   The api Deployment mounted its ConfigMap only when `api.config` or the hosted-workers flag was set, while the ConfigMap itself also rendered for the forge allowlist and release-check keys, so those keys were silently not loaded in that configuration. Both templates now share one condition, which also covers the new `DB_STORAGE_CAPACITY_BYTES`.
 
@@ -81,6 +84,9 @@ through `[0.52.0]`.)
   Homebrew upgrades use tap-qualified stable or RC targets and inherit your auto-update settings; a zero Homebrew exit succeeds only when the formula-owned CLI reaches the offered version. The TUI detects external upgrades on successful five-minute build-info polls, closes the update modal and shows the actual installed version with a restart hint, without automatic re-exec. Server release checks use the persisted checked-at timestamp to schedule their first attempt after startup, then wait the full configured interval after each attempt; existing opt-outs remain in effect.
 
 ### Changed
+
+- **Retained work recovers within a durable budget on a fresh attempt ([#2512](https://github.com/vtmocanu/uzi/issues/2512)).**
+  Three source-bound reserved iterations and a five-minute deadline survive crash, reclaim and handoff; a trusted successfully settled real model turn resets the budget. Permanent blockers or exhaustion fail with local work and custody retained, without automatic cycling or failed-run Resume. Verified under-cap thin bundles with locally verified prerequisites permit local execution despite unknown publication, but do not prove remote durability or release custody. Ordinary unwired resumes keep same-path continuity; downgrade during pending recovery is unsupported. Reachable-history integrity verification fails closed above 1 GiB of delivered decoded content and records the blocker in run recovery and worker logs; this cap does not bound Git-internal delta decompression memory, and the shared worker cgroup does not isolate sibling runs. Recovery records attribution before journal and clone adoption, repairs older-order attribution only for a proven absent successor path, preserves `clone_path_invalid` for invalid paths, and retains custody during pending rediscovery with a distinct missing-journal failure. Owner cancellation reports a failed run with reason `run cancelled` while preserving its source and pins; model settlement clears only episode suppression, and successor retirement requires authenticated, exact-generation covering FINAL authority and quiescence, with durable predecessor reanchoring before moving the successor, leaving predecessors, recovery pins and run HOMEs intact.
 
 - **The lead defers a costly full gate after review invalidates a candidate ([#2593](https://github.com/vtmocanu/uzi/issues/2593)).**
   The lead still overlaps the integration gate with the read-only review wave by default (refining #215), but once review invalidates a candidate whose full gate is costly it completes the repair reviews and focused checks before repeating the full gate, and it triages a failed gate (narrowest reproducer on candidate and base) before rerunning it. This is prompt-level guidance, not enforcement; it ships in the worker image (agent prompt) and in the app release (builtin lead body).
