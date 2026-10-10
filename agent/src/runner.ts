@@ -6,7 +6,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import { basename as pathBasename, join, resolve as resolvePath } from "node:path";
 import type { WorkerClient } from "./client.js";
-import { RequestError, isRunOwnershipLost } from "./client.js";
+import { RequestError, StateReportUnappliedError, isRunOwnershipLost } from "./client.js";
 import { RecoveryClosureLimitError } from "./recovery-closure.js";
 import type { GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
 import {
@@ -85,7 +85,7 @@ import type {
 import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
-import { RecoveryCoordinator, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, type InventorySourceBoundaryContext, type RecoveryRecord } from "./recovery.js";
+import { RecoveryCoordinator, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, type InventorySourceBoundaryContext, type CompletionSource, type RecoveryRecord } from "./recovery.js";
 import {
   PUSHED_HEAD_UNRECORDED,
   PredecessorSettler,
@@ -899,10 +899,10 @@ const REPO_AGENT_FOLDER_FEATURE = "repo_agent_folder";
  * terminal state (another claim owns the run now) and without setting a preserve flag
  * (normal teardown — the new claim has its own clone). Thrown from the flight.reportState
  * closure the moment any report is answered stale, and caught in executeClaim's catch chain
- * BEFORE the generic terminal path (mirroring the PauseNowSignal arm). Local, like
- * TerminalReportError: it is thrown and caught entirely within this file.
+ * BEFORE the generic terminal path (mirroring the PauseNowSignal arm). Runtime throws and
+ * catches stay in runner.ts; exported so tests can reproduce the reportState throw.
  */
-class StaleClaimError extends Error {
+export class StaleClaimError extends Error {
   constructor() {
     super("run claim superseded server-side (stale_claim)");
     this.name = "StaleClaimError";
@@ -919,8 +919,8 @@ class StaleClaimError extends Error {
  * non-terminal and a safe incarnation will resume it from the last checkpoint. Thrown from the
  * flight.reportState closure the moment any report reads that pair, AHEAD of the StaleClaimError
  * throw; caught in executeClaim's catch chain BEFORE the StaleClaimError arm, where it sets the
- * preserve flags, closes the batcher, reports NOTHING terminal, and keeps clone + HOME. Local, like
- * StaleClaimError: thrown and caught entirely within this file.
+ * preserve flags, closes the batcher, reports NOTHING terminal, and keeps clone + HOME.
+ * Thrown and caught entirely within runner.ts.
  */
 class ServerWallParkedError extends Error {
   constructor() {
@@ -938,7 +938,7 @@ class ServerWallParkedError extends Error {
  * `running` for the api's heartbeat missing-run requeue (M2b) to reclaim after the fence, the
  * snapshot entry is removed by the ordinary finally, and the claim loop is paused (via the
  * shared registry) so the e2e can observe the requeued run before a reclaim. Local, thrown
- * and caught entirely within this file, exactly like StaleClaimError. */
+ * and caught entirely within runner.ts. */
 class E2EDropExecutionError extends Error {
   constructor() {
     super("e2e drop-execution seam: ending flight with no terminal report");
@@ -1852,6 +1852,9 @@ interface RunFlight {
   publishedRealTips?: string[];
   /** Exact candidate of the successful finalize push, retained for completion bookkeeping. */
   successfulPushedSha?: string;
+  inventoryGuarded?: boolean;
+  /** Transient ambiguity guard; conveys neither durable evidence nor deletion authority. */
+  completionSendAttempted?: boolean;
   /** PRD #1416 M2: the set of fetched tips already steered on for a divergence, so the mid-run
    *  detection emits AT MOST ONE status + steer per distinct tip. A repeated checkpoint tick that
    *  re-fetches the SAME diverged tip emits nothing; a FURTHER rewrite (a new tip) is a new key
@@ -2334,6 +2337,7 @@ export class RunRunner {
         terminalRecordProtection: (runId) => this.git.hasPhysicalTerminalProtection(runId),
         isExecuting: (runId) => this.isExecuting(runId) && !this.inventoryReservations.has(runId),
         withInventorySourceBoundary: (context, action) => this.withInventorySourceBoundary(context, action),
+        withCompletionSourceBoundary: (source, action) => this.withCompletionSourceBoundary(source, action),
         onAuthoritativeGenerationReleased: opts.queueTerminalRejectionReconciliation,
         workerToken: this.joinToken,
         now: opts.now,
@@ -2495,12 +2499,64 @@ export class RunRunner {
    * retired (the live reportState choke point, and the boot / post-drain / queued-duplicate outbox
    * replays), so a crash between the ACK and the promotion replays and promotes. Never throws.
    */
+  private readonly completionReceipts = new Map<string, StateAck["completedPublicationReceipt"]>();
+  private readonly unpersistedCompletionReceipts = new Set<string>();
+  // Retirement only: physical cleanup still requires the authenticated on-disk receipt.
+  private readonly persistedCompletionReceipts = new Set<string>();
+  private readonly attemptedPublicationTerminals = new Map<string, object>();
+
+  private completionKey(runId: string, generation: number): string {
+    return runId + ":" + generation;
+  }
+
+  private readonly publicationAdmissions = new WeakMap<object, boolean>();
+  private readonly persistedReceiptProofs = new WeakSet<object>();
+
+  private selectPublicationCompletion(flight: RunFlight, body: StateRequest | Record<string, unknown>): boolean {
+    const prior = this.publicationAdmissions.get(body);
+    if (prior !== undefined) return prior;
+    const admitted = this.eligiblePublicationCompletion(flight, body) &&
+      this.client.canStartPublicationCompletion?.(flight.runId, flight.claimGeneration) !== false;
+    this.publicationAdmissions.set(body, admitted);
+    return admitted;
+  }
+
+  private eligiblePublicationCompletion(flight: RunFlight, body: StateRequest | Record<string, unknown>): boolean {
+    return flight.inventoryGuarded === true && ["issue", "mr_rework", "self_improve"].includes(flight.runKind) &&
+      this.client.hasFeature("recovery_completed_publication_v1") && body.status === "completed" &&
+      typeof body.completion_final_head === "string" && /^[0-9a-f]{40}$/.test(body.completion_final_head);
+  }
+
   async observeSettlementTerminalAck(
     runId: string,
     claimGeneration: number,
     body: StateRequest,
     ack: StateAck,
   ): Promise<void> {
+    if (body.status === "completed" && body.completion_final_head)
+      this.attemptedPublicationTerminals.set(this.completionKey(runId, claimGeneration), {});
+    const receipt = ack.completedPublicationReceipt;
+    if (receipt && body.status === "completed" && receipt.run_id === runId &&
+        receipt.generation === claimGeneration && receipt.final_head === body.completion_final_head) {
+      const key = this.completionKey(runId, claimGeneration);
+      this.completionReceipts.set(key, receipt);
+      // Protected retirement sees failure before it can consult server release authority.
+      this.unpersistedCompletionReceipts.add(key);
+      const persisted = await this.recovery.persistCompletionReceipt(receipt).catch(() => false);
+      if (persisted) {
+        this.persistedReceiptProofs.add(receipt);
+        this.unpersistedCompletionReceipts.delete(key);
+        this.persistedCompletionReceipts.add(key);
+      }
+      this.log.info("recovery: completed publication receipt accepted", {
+        run_id: runId, generation: claimGeneration, hold_id: receipt.hold_id,
+        physical_retirement_receipt_persisted: persisted,
+      });
+    } else if (body.status === "completed" && body.completion_final_head && ack.completedPublicationReason) {
+      this.log.info("recovery: completed publication custody retained", {
+        run_id: runId, generation: claimGeneration, reason: ack.completedPublicationReason,
+      });
+    }
     await this.settler.observeTerminalAck(runId, claimGeneration, body, ack).catch((err) => {
       this.log.warn("recovery settlement: terminal ACK observation failed", { run_id: runId, error: errMessage(err) });
     });
@@ -2575,6 +2631,82 @@ export class RunRunner {
       this.inventoryReservations.delete(runId);
       if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
       release();
+    }
+  }
+
+  /** Reserve execution through completion retirement's disposal under the bare lock. Successor admission
+   * replaces this tail and stops any further destruction while waiting for our release. */
+  private async withCompletionSourceBoundary(source: CompletionSource,
+    action: (canDelete: () => boolean) => Promise<void>): Promise<"passed" | "retained"> {
+    const ctx = source.context;
+    if (this.executionTails.has(ctx.runId) || process.platform !== "linux") return "retained";
+    let release!: () => void;
+    const tail = new Promise<void>(resolve => { release = resolve; });
+    this.executionTails.set(ctx.runId, tail);
+    this.inventoryReservations.add(ctx.runId);
+    const open = (): boolean => this.executionTails.get(ctx.runId) === tail && residueQuarantine() === undefined &&
+      !this.liveAttempts.isLivePath(source.clonePath);
+    try {
+      const inventory = await this.git.readInventoryCloneHeads(ctx.barePath, ctx.runId);
+      if (inventory.kind !== "verified" || !open()) return "retained";
+      const clone = inventory.clones.find(c => c.clonePath === source.clonePath);
+      if (!clone) {
+        if (!await this.git.completionSourceAlreadyRetired(ctx.barePath, ctx.branch, ctx.runId, source.clonePath, source.attemptId) || !open()) return "retained";
+        await action(open);
+        return "passed";
+      }
+      if (clone.branch !== ctx.branch || clone.runId !== ctx.runId) return "retained";
+      const request = { mode: "capture" as const, attempt: undefined,
+        cloneKey: cloneKeyOf(source.clonePath).cloneKey, targetPaths: [source.clonePath],
+        processes: true, dockerHost: this.dockerHost, registry: this.liveAttempts,
+        otherClaimInFlight: [...this.executionTails.keys()].some(id => id !== ctx.runId),
+        site: "completion_source" };
+      const before = await this.quiesceImpl(request);
+      if (before.process?.state !== "quiescent" || !open()) return "retained";
+      if (await this.git.worktreeHead(source.clonePath) !== source.expectedHead) return "retained";
+      const after = await this.quiesceImpl({ ...request, dockerHost: undefined, site: "completion_source:after_git" });
+      if (after.process?.state !== "quiescent" || !open()) return "retained";
+      await this.git.retireRunnerClone(ctx.barePath, source.clonePath, ctx.branch, ctx.runId, {
+        discard: true, attemptId: source.attemptId, completionSource: { expectedHead: source.expectedHead, canDelete: open },
+      });
+      if (!open()) return "retained";
+      await action(open);
+      return "passed";
+    } catch (err) {
+      this.log.warn("recovery: completion source retained", { run_id: ctx.runId, error: errMessage(err) });
+      return "retained";
+    } finally {
+      this.inventoryReservations.delete(ctx.runId);
+      if (this.executionTails.get(ctx.runId) === tail) this.executionTails.delete(ctx.runId);
+      release();
+    }
+  }
+
+  /** One best-effort fallback attempt; a closed hold confers no deletion authority. */
+  private async prepareCompletionFallback(flight: RunFlight): Promise<void> {
+    try { await flight.prepareTerminalInventory(); }
+    catch (err) {
+      flight.preserveRecoveryClone = true;
+      flight.runLog.warn("recovery: completion fallback retained source", { error: errMessage(err) });
+    }
+  }
+
+  private async bindCompletionSource(flight: RunFlight): Promise<void> {
+    if (!flight.barePath || !flight.worktreePath || !flight.branch || flight.predecessorCapture ||
+        !flight.runnerClone || flight.runnerClone.path !== flight.worktreePath || flight.runnerClone.branch !== flight.branch) return;
+    try {
+      const context = (await this.owedOptions(flight, flight.barePath, flight.branch)).context;
+      if (!context || context.generation === null || "legacy" in context) return;
+      const expectedHead = await this.git.worktreeHead(flight.worktreePath);
+      if (!expectedHead) return;
+      const candidates = await this.git.enumerateOwedCandidates(flight.barePath, flight.runId);
+      const roots = candidates.map(r => ({ sha: r.sha,
+        contexts: r.contexts.filter(c => c.generation === flight.claimGeneration && !("origin" in c)) }))
+        .filter(r => r.contexts.length > 0);
+      await this.recovery.bindCompletionSource({ context: context as CompletionSource["context"],
+        clonePath: flight.worktreePath, attemptId: flight.runnerClone?.attemptId, expectedHead, roots });
+    } catch (err) {
+      flight.runLog.warn("recovery: completion source provenance unavailable; deletion remains protected", { error: errMessage(err) });
     }
   }
 
@@ -3773,9 +3905,13 @@ export class RunRunner {
       // `abandoned`, NO filesystem operation on its path — and never retired or reused. Its
       // capture already ran behind the predecessor-scoped capture-mode proof.
       let ownAttemptRetired = false;
+      // Custody release does not bypass this flight's still-live execution tail.
+      if (this.completionReceipts.has(this.completionKey(runId, flight.claimGeneration))) flight.preserveRecoveryClone = true;
       // This credential-free retention reads only the trusted bare, including when the clone
       // must stay in place after a blocked proof. Inventory freeze uses the retire proof below.
-      if (flight.barePath && flight.branch && !terminalDisposeUnproven && typeof this.git.retainCurrentOwedCandidate === "function") {
+      if (flight.barePath && flight.branch && !terminalDisposeUnproven &&
+          !this.completionReceipts.has(this.completionKey(runId, flight.claimGeneration)) &&
+          typeof this.git.retainCurrentOwedCandidate === "function") {
         try {
           const retain = async () => this.git.retainCurrentOwedCandidate(flight.barePath!, await this.owedOptions(flight, flight.barePath!, flight.branch!));
           // Retained-flight cleanup must not requeue behind a lock its lifecycle just cancelled.
@@ -3819,7 +3955,8 @@ export class RunRunner {
             clone: flight.worktreePath,
             state: q.outcome.process?.state,
           });
-        } else if (claim.inventory_guarded === true && !flight.active?.shuttingDown) {
+        } else if (claim.inventory_guarded === true && !flight.active?.shuttingDown &&
+                   !this.completionReceipts.has(this.completionKey(runId, flight.claimGeneration))) {
           await this.settleGuardedInventory(claim, flight, undefined, undefined, undefined, true);
         }
       }
@@ -4016,9 +4153,12 @@ export class RunRunner {
    */
   private async retireFinalizeRecord(flight: RunFlight, site: string): Promise<void> {
     if (!this.outbox) return;
+    const incarnation = this.client.capturePublicationCompletionRetirement?.();
     if (await this.recoveryInventoryPending(flight.runId, flight.claimGeneration)) return;
     try {
-      await this.outbox.retireFinalize(flight.runId, flight.claimGeneration);
+      const retired = await this.outbox.retireFinalize(flight.runId, flight.claimGeneration);
+      if (retired === true && incarnation)
+        await this.notifyPublicationCompletionRetired(flight.runId, flight.claimGeneration, incarnation);
     } catch (err) {
       this.log.warn("finalize record retire failed", {
         run_id: flight.runId,
@@ -4033,10 +4173,21 @@ export class RunRunner {
    *  outbox is wired (a test without spill, or a store that failed closed) — in which case the
    *  write-ahead terminal send path falls back to today's un-journaled `reportState`. */
   async recoveryInventoryPending(runId: string, generation: number): Promise<boolean> {
+    if (this.unpersistedCompletionReceipts.has(this.completionKey(runId, generation))) return true;
+    const key = this.completionKey(runId, generation);
+    if (this.persistedCompletionReceipts.has(key)) return false;
+    if (await this.recovery.hasPersistedCompletionReceipt(runId, generation)) {
+      this.persistedCompletionReceipts.add(key);
+      return false;
+    }
     if (this.activeRuns.get(runId)?.retainedLocalCustody?.()) return true;
     try {
       const state = await this.recovery.inventoryCleanupState(runId, generation);
       if (state === "acknowledged") return false;
+      // Attempted publication requires confirmed discard even with absent local inventory:
+      // absent-mode authority also permits released/legacy custody, forbidden for this attempt.
+      if (this.attemptedPublicationTerminals.has(this.completionKey(runId, generation)))
+        return !(await this.client.hasRecoveryRetirementAuthority(runId, generation, "pending"));
       if (state === "absent" || state === "pending" || this.client.knowsInventoryGuardedClaim?.(runId, generation) === true) {
         return !(await this.client.hasRecoveryRetirementAuthority(runId, generation, state === "absent" ? "absent" : "pending"));
       }
@@ -4056,7 +4207,17 @@ export class RunRunner {
     const outbox = new Proxy(deps.outbox, {
       get: (target, property) => {
         if (property === "retireTerminal") return async (runId: string, generation: number) => {
-          if (!(await this.recoveryInventoryPending(runId, generation))) await target.retireTerminal(runId, generation);
+          const incarnation = this.client.capturePublicationCompletionRetirement?.();
+          const receipt = this.completionReceipts.get(this.completionKey(runId, generation));
+          const original = receipt && this.persistedReceiptProofs.has(receipt)
+            ? await target.readTerminalJournal(runId, generation) : undefined;
+          if (await this.recoveryInventoryPending(runId, generation)) return false;
+          const retired = await target.retireTerminal(runId, generation);
+          if (retired === true && incarnation && (!receipt ||
+              (this.persistedReceiptProofs.has(receipt) && original?.body.status === "completed" &&
+                original.body.completion_final_head === receipt.final_head)))
+            await this.notifyPublicationCompletionRetired(runId, generation, incarnation, target);
+          return retired;
         };
         const value = Reflect.get(target, property);
         return typeof value === "function" ? value.bind(target) : value;
@@ -4064,6 +4225,33 @@ export class RunRunner {
     });
     this.protectedTerminalOutboxes.set(deps.outbox, outbox);
     return { ...deps, outbox };
+  }
+
+  /** Only callers observing an actual authorized retirement may notify. Absence alone is no event. */
+  async notifyPublicationCompletionRetired(runId: string, generation: number, incarnation: Readonly<object>,
+    reports: Pick<Outbox, "confirmReportsAbsent"> = this.outbox!,
+  ): Promise<void> {
+    const key = this.completionKey(runId, generation);
+    if (this.unpersistedCompletionReceipts.has(key) ||
+        typeof reports?.confirmReportsAbsent !== "function" ||
+        !(await reports.confirmReportsAbsent(runId, generation)) ||
+        this.unpersistedCompletionReceipts.has(key)) return;
+    const receipt = this.completionReceipts.get(key);
+    if (receipt) {
+      if (this.persistedReceiptProofs.has(receipt)) this.client.releasePublicationCompletion?.(receipt, incarnation);
+    } else this.client.releaseRetiredPublicationCompletion?.(runId, generation, incarnation);
+  }
+
+  private async releaseUnjournaledCompletion(flight: RunFlight, body: StateRequest, incarnation?: Readonly<object>): Promise<void> {
+    if (!incarnation || await this.recoveryInventoryPending(flight.runId, flight.claimGeneration)) return;
+    const receipt = this.completionReceipts.get(this.completionKey(flight.runId, flight.claimGeneration));
+    if (receipt && (!this.persistedReceiptProofs.has(receipt) ||
+        body.status !== "completed" || body.completion_final_head !== receipt.final_head)) return;
+    // A disabled store cannot prove absence; either original report stays retained.
+    if (this.outbox) {
+      await this.notifyPublicationCompletionRetired(flight.runId, flight.claimGeneration, incarnation);
+    } else if (receipt) this.client.releasePublicationCompletion?.(receipt, incarnation);
+    else this.client.releaseRetiredPublicationCompletion?.(flight.runId, flight.claimGeneration, incarnation);
   }
 
   private terminalDeps(): TerminalOutboxDeps | undefined {
@@ -4102,14 +4290,64 @@ export class RunRunner {
     // journals no terminal; the StaleClaimError reaches executeClaim's quiet stop.
     if (flight.steering?.claimFence() !== undefined) throw new StaleClaimError();
     const deps = this.terminalDeps();
+    const preexistingPending = deps?.outbox.hasPendingTerminal(flight.runId, flight.claimGeneration) ?? false;
+    const previouslyAttempted = flight.completionSendAttempted ||
+      this.attemptedPublicationTerminals.has(this.completionKey(flight.runId, flight.claimGeneration));
+    const admitted = preexistingPending || previouslyAttempted || this.selectPublicationCompletion(flight, body);
+    if (!admitted && !preexistingPending && !previouslyAttempted && body.completion_final_head !== undefined) {
+      const ordinary = { ...body };
+      delete ordinary.completion_final_head;
+      body = ordinary;
+    }
+    const key = this.completionKey(flight.runId, flight.claimGeneration);
+    // Capture freshness at the actual send, after asynchronous preparation. Replacing the
+    // single token fences an older caller without adding another per-generation authority.
+    const beginPublicationAttempt = (sentBody: StateRequest, publicationSend: boolean) => {
+      if (sentBody.status !== "completed" ||
+          (!publicationSend && !flight.completionSendAttempted && !this.attemptedPublicationTerminals.has(key))) return undefined;
+      const fresh = publicationSend && !flight.completionSendAttempted && !this.attemptedPublicationTerminals.has(key) &&
+        !preexistingPending && !(this.outbox?.hasPendingTerminal(flight.runId, flight.claimGeneration) ?? false);
+      const token = {};
+      flight.completionSendAttempted = true;
+      this.attemptedPublicationTerminals.set(key, token);
+      return { token, fresh };
+    };
+    // A fresh send may release only its own marker, never custody or receipt provenance.
+    const clearFreshUnappliedAttempt = async (
+      err: unknown, attempt: ReturnType<typeof beginPublicationAttempt>,
+    ): Promise<void> => {
+      const ownsFreshAttempt = () => attempt?.fresh === true &&
+        this.attemptedPublicationTerminals.get(key) === attempt.token &&
+        flight.steering?.claimFence() === undefined;
+      if (!(err instanceof StateReportUnappliedError) || err.runId !== flight.runId ||
+          !ownsFreshAttempt()) return;
+      if (this.outbox && !await this.outbox.confirmTerminalAbsent(flight.runId, flight.claimGeneration)) return;
+      // Absence checking can yield to another send or ACK; neither marker belongs to this caller.
+      if (!ownsFreshAttempt()) return;
+      flight.completionSendAttempted = false;
+      this.attemptedPublicationTerminals.delete(key);
+    };
     if (!deps) {
+      const incarnation = this.client.capturePublicationCompletionRetirement?.();
       // No usable outbox: run beforeResolve (abort + reap) then send un-journaled exactly as today. A
       // stale ack still THROWS StaleClaimError out of `send` and propagates to executeClaim's catch
-      // (there is no journal to stale-retire on this degradation path), so this branch is otherwise
-      // byte-for-byte unchanged.
+      // (there is no journal to stale-retire on this degradation path).
       await beforeResolve?.();
-      await flight.prepareTerminalInventory();
-      await send(body);
+      const deferred = admitted;
+      if (deferred) await this.bindCompletionSource(flight);
+      else await flight.prepareTerminalInventory();
+      const attempt = beginPublicationAttempt(body, deferred);
+      try {
+        const ack = await send(body);
+        if (ack.applied && ack.status === body.status &&
+            (ack.status === "completed" || ack.status === "failed"))
+          await this.releaseUnjournaledCompletion(flight, body, incarnation);
+      } catch (err) {
+        await clearFreshUnappliedAttempt(err, attempt);
+        throw err;
+      } finally {
+        if (deferred && !this.completionReceipts.has(this.completionKey(flight.runId, flight.claimGeneration))) await this.prepareCompletionFallback(flight);
+      }
       flight.terminalResolved = true;
       return;
     }
@@ -4120,16 +4358,24 @@ export class RunRunner {
     // its terminal_pending lease (and, past the cap, pending_overflow) open (D11). Normalize the throw
     // into the `{applied:false, staleClaim:true}` ack actOnAck stale-retires on, so a superseded
     // generation local-retires the journal UNIFORMLY across lanes (the judge/review/boot lanes already
-    // return this shape via raw client.reportState). StaleClaimError is defined and caught entirely
-    // within this file — it never leaks into terminal-resolve.ts. A genuine transport error still
+    // return this shape via raw client.reportState). Runtime StaleClaimError handling stays in
+    // runner.ts; the export lets tests reproduce the throw. A genuine transport error still
     // propagates, and resolvePendingTerminal keeps the journal for a later resolve, exactly as
     // designed. #1539: this wrapper wraps the send passed to BOTH branches (the reserve-exhausted
     // unjournaled send and the journaled resolve), the same as journalAndResolveTerminal does today.
     const wrappedSend: SendTerminalState = async (b, sig) => {
+      const incarnation = this.client.capturePublicationCompletionRetirement?.();
+      const publicationSend = this.eligiblePublicationCompletion(flight, b);
+      const attempt = beginPublicationAttempt(b, publicationSend);
       try {
-        return await send(b, sig);
+        const ack = await send(b, sig);
+        if (ack.applied && ack.status === b.status &&
+            (ack.status === "completed" || ack.status === "failed"))
+          await this.releaseUnjournaledCompletion(flight, b, incarnation);
+        return ack;
       } catch (err) {
         if (err instanceof StaleClaimError) return { applied: false, staleClaim: true };
+        if (!installed.journaled && !("deferred" in installed)) await clearFreshUnappliedAttempt(err, attempt);
         throw err;
       }
     };
@@ -4147,14 +4393,25 @@ export class RunRunner {
     // #1539: run the hook (abort + reap for the permanent failure hook) after the install
     // decision, including deferral, and BEFORE any resolve/send.
     await beforeResolve?.();
-    if (installed.journaled || !("deferred" in installed)) await flight.prepareTerminalInventory();
-    if (installed.journaled) await this.retireFinalizeRecord(flight, "terminal_journal_installed");
+    // The durable first winner, rather than the competing caller body, selects ordering.
+    const selected = installed.journaled
+      ? (await deps.outbox.readTerminalJournal(flight.runId, flight.claimGeneration))?.body
+      : ("canonical" in installed ? installed.canonical : undefined);
+    const deferred = !!selected && this.eligiblePublicationCompletion(flight, selected) &&
+      (preexistingPending || previouslyAttempted || admitted);
+    if (deferred) await this.bindCompletionSource(flight);
+    if (!deferred && (installed.journaled || !("deferred" in installed))) await flight.prepareTerminalInventory();
+    if (installed.journaled && !deferred) await this.retireFinalizeRecord(flight, "terminal_journal_installed");
     if (!installed.journaled && "deferred" in installed) {
       // Preserve finalize and the selected winner; reach the latch before the hook releases its hold.
     } else if (!installed.journaled) {
-      // reserve_exhausted: send unjournaled. A throw here propagates (skipping the latch below), so the
-      // executor catch finds NO journal and takes today's fallback — unchanged from journalAndResolveTerminal.
-      await sendUnjournaledTerminal(deps, installed.canonical, fence, wrappedSend);
+      // reserve_exhausted: a throw skips terminalResolved. A fresh, proven-unapplied completion
+      // clears its attempt markers; an ambiguous or previously attempted completion still suppresses failed.
+      try {
+        await sendUnjournaledTerminal(deps, installed.canonical, fence, wrappedSend);
+      } finally {
+        if (deferred && !this.completionReceipts.has(this.completionKey(flight.runId, flight.claimGeneration))) await this.prepareCompletionFallback(flight);
+      }
       // Issue #1742 retirement site (b): no journal could be installed and the unjournaled terminal
       // send resolved, so the api holds G's outcome.
       await this.retireFinalizeRecord(flight, "unjournaled_terminal_sent");
@@ -4165,10 +4422,14 @@ export class RunRunner {
         send: wrappedSend,
       });
     }
+    if (deferred && installed.journaled) {
+      if (!this.completionReceipts.has(this.completionKey(flight.runId, flight.claimGeneration))) await this.prepareCompletionFallback(flight);
+      await this.retireFinalizeRecord(flight, "completion_ack_observed");
+    }
     // PRD #1391 Run B M3 (N2/D5): latch terminal resolution or selected-winner deferral, so
     // a later reportGenericFailure never reports a SECOND `failed` — even after a 200 RETIRED the
-    // journal (hasPendingTerminal then reads false). Skipped on a throw above (reserve_exhausted's
-    // un-journaled send that failed), so that fallback still reports failed as today.
+    // journal (hasPendingTerminal then reads false). An unjournaled throw skips this latch;
+    // completionSendAttempted still suppresses failed unless the fresh send was proven unapplied.
     flight.terminalResolved = true;
   }
 
@@ -4370,7 +4631,7 @@ export class RunRunner {
     // Still close the batcher and settle
     // recovery custody (clone cleanup is independent of the report).
     if (
-      flight.terminalResolved ||
+      flight.terminalResolved || flight.completionSendAttempted ||
       (this.outbox && this.outbox.hasPendingTerminal(flight.runId, flight.claimGeneration))
     ) {
       runLog.info("run outcome already selected; not reporting a second failed", {
@@ -5256,6 +5517,7 @@ export class RunRunner {
     ): Promise<void> => {
       const status = (body as { status?: string }).status;
       try {
+        if (this.completionReceipts.has(this.completionKey(flight.runId, flight.claimGeneration))) return;
         if (claim.inventory_guarded === true && ["completed", "failed", "cancelled"].includes(status ?? "")) {
           await this.settleGuardedInventory(claim, flight, recoveryRecord?.sourceSha, status === "completed" ? body as StateRequest : undefined, boundarySignal,
             flight.terminalInventoryQuiesced);
@@ -5356,9 +5618,13 @@ export class RunRunner {
       logMessage: string,
       fields: Record<string, unknown>,
     ): Promise<void> => {
+      // Freeze delivered identity before journal installation and before fallback can change HEAD.
+      const finalHead = body.head ?? flight.successfulPushedSha;
+      if (flight.inventoryGuarded && ["issue", "mr_rework", "self_improve"].includes(flight.runKind) &&
+          body.status === "completed" && typeof finalHead === "string" && /^[0-9a-f]{40}$/.test(finalHead))
+        body = { ...body, completion_final_head: finalHead };
       if (deferCommittedTerminal) {
         deferCommittedTerminal(async () => {
-          await flight.prepareTerminalInventory();
           await batcher.close();
           // Journal write-ahead here too (D3): the deferred Codex sink sends through
           // flight.reportState + driveRecoveryTerminal, so wrap that pair as the resolve `send`.
@@ -5373,7 +5639,6 @@ export class RunRunner {
         });
         return;
       }
-      await flight.prepareTerminalInventory();
       await closeBatcher();
       await journalTerminalReport(body);
       runLog.info(logMessage, fields);
@@ -7834,7 +8099,9 @@ export class RunRunner {
       inventoryArchiveNotices: new Set(),
       keepGuardedInventoryOpen: false,
       terminalInventoryQuiesced: false,
+      inventoryGuarded: claim.inventory_guarded === true,
       prepareTerminalInventory: async () => {
+        if (this.completionReceipts.has(this.completionKey(runId, claimGeneration))) return;
         if (flight.retainedLocalCustody) return;
         flight.terminalInventoryQuiesced = false;
         if (!this.recovery.enabled || !isCodePublishingKind(flight.runKind) || claim.inventory_guarded !== true || !flight.barePath || !flight.branch) return;
@@ -7857,6 +8124,8 @@ export class RunRunner {
         } catch (err) {
           flight.preserveRecoveryClone = true;
           runLog.warn("recovery: preterminal snapshot failed; source retained, reporting continues", { error: errMessage(err) });
+        } finally {
+          if (flight.completionSendAttempted) await this.bindCompletionSource(flight);
         }
       },
       runKind: resolveRunKind(claim.kind),
@@ -11036,6 +11305,7 @@ export class RunRunner {
     claim: ClaimResponse, flight: RunFlight, originalSourceSha?: string,
     completedBody?: StateRequest, signal?: AbortSignal, locallyQuiescent = false,
   ): Promise<void> {
+    if (this.completionReceipts.has(this.completionKey(flight.runId, flight.claimGeneration))) return;
     const barePath = flight.barePath, branch = flight.branch;
     if (flight.keepGuardedInventoryOpen || !barePath || !branch || !claim.claim_generation || !this.recovery.enabled ||
         !isCodePublishingKind(resolveRunKind(claim.kind))) return;
@@ -13213,6 +13483,7 @@ export class RunRunner {
     runLog: Logger,
     signal?: AbortSignal,
   ): Promise<void> {
+    if (this.completionReceipts.has(this.completionKey(flight.runId, flight.claimGeneration))) return;
     if (flight.retainedLocalCustody) return;
     if (!this.recovery.enabled) return; // token-less harness: nothing to settle
     if (!isCodePublishingKind(resolveRunKind(claim.kind))) return;

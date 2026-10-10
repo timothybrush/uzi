@@ -115,6 +115,129 @@ describe("verified successor retirement", () => {
     assert.equal(command(s.bare, "rev-parse", s.pin), s.tip);
   }
 
+  for (const count of [1, 3]) for (const shape of ["recovery", "retainedSources", "both"] as const) {
+    for (const helper of [false, true]) {
+      it(`completion predecessor refusal count=${count} shape=${shape} helper=${helper}`, async (t) => {
+        const s = await seedCompleted(count);
+        const journal = { ...s.expected };
+        if (shape !== "retainedSources") journal.recovery = { version: 1,
+          source: s.expected.retainedSources![0]!, attempts: 1, startedAt: 0, deadline: 300000,
+          backoffMs: 0, stage: "ready-for-model", restoreTip: s.tip,
+          successor: { runId: s.owner, clonePath: s.expected.clonePath, attemptId: s.opts.attemptId, restoreTip: s.tip } };
+        if (shape === "recovery") delete journal.retainedSources;
+        command(s.bare, "config", `uzi-recovery.${s.branch}.clone`, JSON.stringify(journal));
+        if (helper) {
+          command(s.bare, "config", "--add", `uzi-attempts.${s.branch}.entry`, JSON.stringify({
+            attemptId: s.opts.attemptId, runId: s.owner, clonePath: s.expected.clonePath, state: "retired" }));
+          await fsp.rm(s.expected.clonePath, { recursive: true });
+          assert.equal(fs.existsSync(s.expected.clonePath), false);
+          assert.equal(s.ledger().at(-1)!.state, "retired");
+        }
+        const before = fs.readFileSync(path.join(s.bare, "config"));
+        const descriptors = s.expected.retainedSources!.map(src => fs.statSync(src.clonePath));
+        let moves = 0;
+        const rename = fsp.rename.bind(fsp);
+        t.mock.method(fsp, "rename", async (...args: Parameters<typeof fsp.rename>) => { moves++; return rename(...args); });
+        if (helper) assert.equal(await git.completionSourceAlreadyRetired(s.bare, s.branch, s.owner,
+          s.expected.clonePath, s.opts.attemptId), false);
+        else await assert.rejects(git.retireRunnerClone(s.bare, s.expected.clonePath, s.branch, s.owner, {
+          discard: true, attemptId: s.opts.attemptId, completionSource: { expectedHead: s.tip, canDelete: () => true },
+        }), /recovery sources require explicit verified disposition/);
+        assert.equal(moves, 0);
+        assert.deepEqual(fs.readFileSync(path.join(s.bare, "config")), before, "journal, ledger and descriptors are byte-identical");
+        for (const [i, src] of s.expected.retainedSources!.entries()) {
+          assert.equal(fs.readFileSync(path.join(src.clonePath, "predecessor.txt"), "utf8"), s.bytes.get(src.clonePath));
+          assert.equal(fs.statSync(src.clonePath).ino, descriptors[i]!.ino);
+        }
+        if (!helper) assert.equal(fs.readFileSync(path.join(s.expected.clonePath, "predecessor.txt"), "utf8"), "successor bytes\n");
+        assert.equal(command(s.bare, "rev-parse", s.pin), s.tip);
+      });
+    }
+  }
+
+  it("dual retirement authority refuses before mutation", async (t) => {
+    const s = await seedCompleted();
+    const before = fs.readFileSync(path.join(s.bare, "config"));
+    let calls = 0;
+    s.opts.verifiedSuccessor.acknowledged = async () => { calls++; return true; };
+    t.mock.method(fsp, "rename", async () => { throw new Error("unexpected move"); });
+    await assert.rejects(git.retireRunnerClone(s.bare, s.expected.clonePath, s.branch, s.owner, {
+      ...s.opts, completionSource: { expectedHead: s.tip, canDelete: () => true },
+    }), /retirement authorities are mutually exclusive/);
+    assert.equal(calls, 0);
+    assert.deepEqual(fs.readFileSync(path.join(s.bare, "config")), before);
+    await assertPredecessors(s, false);
+  });
+
+  for (const drift of ["journal", "ledger", "identity"] as const) {
+    it(`mid-await ${drift} drift refuses verified successor before move`, async (t) => {
+      const s = await seedCompleted();
+      let changed = false, moves = 0;
+      const rename = fsp.rename.bind(fsp);
+      t.mock.method(fsp, "rename", async (...args: Parameters<typeof fsp.rename>) => { moves++; return rename(...args); });
+      s.opts.verifiedSuccessor.acknowledged = async () => {
+        const current = JSON.parse(command(s.bare, "config", "--get", `uzi-recovery.${s.branch}.clone`)) as import("../src/git.js").RecoveryJournalEntry;
+        // Drift on the final acknowledgement, after predecessor anchoring: earlier
+        // checks cannot substitute for checkSuccessor revalidation after this await.
+        if (!changed && current.clonePath === s.expected.retainedSources![0]!.clonePath) {
+          changed = true;
+          if (drift === "ledger") command(s.bare, "config", "--add", `uzi-attempts.${s.branch}.entry`,
+            JSON.stringify({ attemptId: s.opts.attemptId, runId: s.owner, clonePath: s.expected.clonePath, state: "retired" }));
+          else command(s.bare, "config", `uzi-recovery.${s.branch}.clone`, JSON.stringify(drift === "journal"
+            ? { ...current, retainedSources: [] }
+            : { ...current, runId: randomUUID() }));
+        }
+        return true;
+      };
+      await assert.rejects(s.retire(), /changed|identity/);
+      assert.equal(changed, true);
+      assert.equal(moves, 0);
+      assert.ok(fs.existsSync(s.expected.clonePath));
+      for (const src of s.expected.retainedSources!)
+        assert.equal(fs.readFileSync(path.join(src.clonePath, "predecessor.txt"), "utf8"), s.bytes.get(src.clonePath));
+      assert.equal(command(s.bare, "rev-parse", s.pin), s.tip);
+    });
+  }
+
+  for (const exdev of [false, true]) {
+    it(`verified successor releases bare lock during paused disposal EXDEV=${exdev}`, async (t) => {
+      const s = await seedCompleted();
+      let enter!: () => void, release!: () => void;
+      const entered = new Promise<void>(resolve => { enter = resolve; });
+      const barrier = new Promise<void>(resolve => { release = resolve; });
+      const remove = fsp.rm.bind(fsp), rename = fsp.rename.bind(fsp);
+      t.mock.method(fsp, "rename", async (...args: Parameters<typeof fsp.rename>) => {
+        if (exdev && String(args[0]) === s.expected.clonePath && String(args[1]).startsWith(holdingRoot()))
+          throw Object.assign(new Error("cross device"), { code: "EXDEV" });
+        return rename(...args);
+      });
+      t.mock.method(fsp, "rm", async (...args: Parameters<typeof fsp.rm>) => {
+        if (String(args[0]).startsWith(holdingRoot()) || path.basename(String(args[0])).startsWith(".retire-")) {
+          enter(); await barrier;
+        }
+        return remove(...args);
+      });
+      const retiring = s.retire();
+      let competitor: Promise<void> | undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const bounded = <T,>(promise: Promise<T>) => Promise.race([promise, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("bare operation/disposal did not settle")), 5000);
+      })]).finally(() => clearTimeout(timer));
+      try {
+        await bounded(entered);
+        competitor = (async () => {
+          assert.ok(await git.terminalRetainedSnapshot(s.bare, s.branch, s.key, s.expected.retainedSources![0]!));
+        })();
+        await bounded(competitor);
+        assert.equal(fs.existsSync(s.expected.clonePath), false);
+        release(); await bounded(retiring);
+      } finally {
+        release(); clearTimeout(timer);
+        await bounded(Promise.allSettled([retiring, ...(competitor ? [competitor] : [])]));
+      }
+    });
+  }
+
   for (const predecessorCount of [1, 2, 3]) for (const exdev of [false, true]) {
     it(`covering FINAL retires successor and ledger, preserving predecessors and pins (predecessors=${predecessorCount}, EXDEV=${exdev})`, async (t) => {
       const s = await seedCompleted(predecessorCount);

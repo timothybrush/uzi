@@ -54,6 +54,18 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Recovery cleanup tests respect the host platform.**
+  Cleanup checks prove physical deletion on Linux and retention of authenticated recovery sources on other hosts, while keeping custody and conflict checks active on both.
+
+- **Workers report terminal failure after a proven unapplied completion refusal.**
+  An unjournaled completion rejected before mutation can follow the ordinary failure path; lost acknowledgements and journaled originals still preserve the selected completion for replay.
+
+- **Persistent workers keep publication capacity after non-receipt reports retire.**
+  Failed, cancelled and archive-fallback generations release completion bookkeeping only after proven report retirement, preserving unresolved completion replay and custody safeguards.
+
+- **Completed publication serializes safely with worker updates.**
+  Persistent workers complete under the same worker-before-run lock order as claims and registration, even with leasing disabled. A worker capability downgrade still completes and consumes its matching permit without stamping a publication head or custody identity. Completion migrations also support schema rollback and reapplication while keeping released custody released.
+
 - **The split TUI footer keeps its key hints beside the restart hint ([#2609](https://github.com/vtmocanu/uzi/issues/2609)).**
   When "vX installed, restart uzi to use it" shows, the split footer no longer collapses to `? keys · q quit` on wide terminals: it drops the optional hints only as far as needed and right-aligns the full restart text, falling back to the short footer when the hints cannot fit beside it.
 
@@ -101,6 +113,9 @@ through `[0.52.0]`.)
 
 - **Follow-up typing captures global TUI shortcuts ([#2548](https://github.com/vtmocanu/uzi/issues/2548)).**
   Typing `q` or `?` in a run follow-up now adds the character to the input. Escape clears the input and restores the quit and help shortcuts; pending cancel confirmations retain those shortcuts.
+
+- **Completed issue, MR-rework and self-improvement runs can release guarded custody after verified publication ([#2507](https://github.com/vtmocanu/uzi/issues/2507)).**
+  With worker and API support, completion commits before the API verifies the fixed final commit against the run's recorded branch and MR, releasing only the exact completing-generation hold and returning a replayable receipt; no new archive is required, and existing archives retain their normal policy. CLI recovery shows the receipt or bounded refusal reason separately from archive availability. Physical cleanup still requires authenticated receipt persistence, quiescence, exact source attribution and execution/adoption exclusion, retaining sibling, shared, unknown or quarantined evidence. Failed, cancelled, parked and other run kinds keep their existing rules, and older completed holds are not backfilled.
 
 - Checkpoint and park-bridge scratch publication refusals now name bounded kind and step codes in the feed, deduped per pair.
 

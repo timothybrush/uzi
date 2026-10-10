@@ -1436,16 +1436,78 @@ export class Outbox {
 
   /** Retire a terminal journal (the api applied the transition on a 200, or answered a 409 whose
    *  returned status is terminal): unlink the file and drop it from the pending set (D3). */
-  async retireTerminal(runId: string, claimGeneration: number): Promise<void> {
-    if (this.disabled) return;
-    await this.withRunLock(runId, async () => {
-      if (!this.validRunId(runId)) return;
-      if (!await this.readTerminalAuthed(runId, claimGeneration)) return;
-      await fs
-        .rm(path.join(this.runDir(runId), this.runs.get(runId)?.terminals.get(claimGeneration)?.fileName ?? terminalFileName(claimGeneration)), { force: true })
-        .catch(() => undefined);
+  async retireTerminal(runId: string, claimGeneration: number): Promise<boolean> {
+    if (this.disabled) return false;
+    return this.withRunLock(runId, async () => {
+      if (!this.validRunId(runId)) return false;
+      if (!await this.readTerminalAuthed(runId, claimGeneration)) return false;
+      try {
+        await fs.unlink(path.join(this.runDir(runId), this.runs.get(runId)?.terminals.get(claimGeneration)?.fileName ?? terminalFileName(claimGeneration)));
+      } catch { return false; }
       this.runs.get(runId)?.terminals.delete(claimGeneration);
+      return true;
     });
+  }
+
+  /** Positive absence proof for a successful unjournaled send, under the same run lock. */
+  async confirmTerminalAbsent(runId: string, claimGeneration: number): Promise<boolean> {
+    if (this.disabled || !this.validRunId(runId)) return false;
+    return this.withRunLock(runId, async () => {
+      if (this.hasPendingTerminal(runId, claimGeneration)) return false;
+      // Unknown or noncanonical physical aliases cannot prove absence.
+      if (await this.hasPhysicalTerminalProtection(runId)) return false;
+      try {
+        await fs.lstat(path.join(this.runDir(runId), terminalFileName(claimGeneration)));
+        return false;
+      } catch (err) { return (err as NodeJS.ErrnoException).code === "ENOENT"; }
+    });
+  }
+
+  /** Positive exact report absence: one run lock, a one-second deadline and at most
+   * 16384 root / 256 run entries. Unknown aliases, scan errors and exhaustion retain provenance. */
+  async confirmReportsAbsent(runId: string, claimGeneration: number): Promise<boolean> {
+    if (this.disabled || !this.validRunId(runId)) return false;
+    const signal = AbortSignal.timeout(1_000);
+    try {
+      return await this.withRunLock(runId, async () => {
+        if (this.disabled || signal.aborted || this.hasPendingTerminal(runId, claimGeneration) ||
+            this.runs.get(runId)?.finalizes.has(claimGeneration)) return false;
+        try {
+          const root = await fs.lstat(this.root);
+          if (!root.isDirectory() || root.isSymbolicLink()) return false;
+        } catch (err) { return !signal.aborted && (err as NodeJS.ErrnoException).code === "ENOENT"; }
+        const root = await fs.opendir(this.root);
+        try {
+          let ended = false;
+          for (let n = 0; n < 16384 && !signal.aborted; n++) {
+            const entry = await root.read();
+            if (!entry) { ended = true; break; }
+            if (entry.name !== runId && terminalRunUUID(entry.name) &&
+                entry.name.toLowerCase() === runId.toLowerCase()) return false;
+          }
+          if (!ended) return false;
+        } finally { await root.close(); }
+        try {
+          await fs.lstat(this.runDir(runId));
+        } catch (err) { return !signal.aborted && (err as NodeJS.ErrnoException).code === "ENOENT"; }
+        if (!await this.terminalDirectorySafe(runId)) return false;
+        const dir = await fs.opendir(this.runDir(runId));
+        try {
+          for (let n = 0; n < 256 && !signal.aborted; n++) {
+            const entry = await dir.read();
+            if (!entry) return !signal.aborted;
+            const terminal = entry.name.startsWith(TERMINAL_FILE_PREFIX);
+            const finalize = entry.name.startsWith(FINALIZE_FILE_PREFIX);
+            if (!terminal && !finalize) continue;
+            const generation = terminal ? parseTerminalFileName(entry.name) : parseFinalizeFileName(entry.name);
+            if (generation === undefined || generation === claimGeneration ||
+                entry.name !== (terminal ? terminalFileName(generation) : finalizeFileName(generation)) ||
+                !entry.isFile() || entry.isSymbolicLink()) return false;
+          }
+          return false;
+        } finally { await dir.close(); }
+      }, signal);
+    } catch { return false; }
   }
 
   /**
@@ -1706,27 +1768,29 @@ export class Outbox {
     eligible: () => boolean,
     signal: AbortSignal,
     expectedIdentity: Readonly<object>,
-  ): Promise<void> {
-    if (this.disabled) return;
-    await this.withRunLock(runId, async () => {
+  ): Promise<boolean> {
+    if (this.disabled) return false;
+    return this.withRunLock(runId, async () => {
       const rs = this.runs.get(runId);
       if (!expectedIdentity || rs?.finalizes.get(claimGeneration) !== expectedIdentity ||
           !this.validRunId(runId) || !rs?.finalizes.has(claimGeneration) ||
-          rs.terminals.size > 0 || signal.aborted || !eligible()) return;
-      await fs.rm(path.join(this.runDir(runId), finalizeFileName(claimGeneration)), { force: true });
+          rs.terminals.size > 0 || signal.aborted || !eligible()) return false;
+      await fs.unlink(path.join(this.runDir(runId), finalizeFileName(claimGeneration)));
       rs.finalizes.delete(claimGeneration);
+      return true;
     }, signal);
   }
 
   /** Issue #1742: retire one finalize record (unlink the file, drop it from the pending set). */
-  async retireFinalize(runId: string, claimGeneration: number): Promise<void> {
-    if (this.disabled) return;
-    await this.withRunLock(runId, async () => {
-      if (!this.validRunId(runId)) return;
-      await fs
-        .rm(path.join(this.runDir(runId), finalizeFileName(claimGeneration)), { force: true })
-        .catch(() => undefined);
+  async retireFinalize(runId: string, claimGeneration: number): Promise<boolean> {
+    if (this.disabled) return false;
+    return this.withRunLock(runId, async () => {
+      if (!this.validRunId(runId) || !this.runs.get(runId)?.finalizes.has(claimGeneration)) return false;
+      try {
+        await fs.unlink(path.join(this.runDir(runId), finalizeFileName(claimGeneration)));
+      } catch { return false; }
       this.runs.get(runId)?.finalizes.delete(claimGeneration);
+      return true;
     });
   }
 
