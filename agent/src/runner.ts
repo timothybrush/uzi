@@ -112,7 +112,7 @@ import type {
 import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
-import { RecoveryCoordinator, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type CompletionSource, type RecoveryRecord, type RecoveryCoordinatorOptions } from "./recovery.js";
+import { RecoveryCoordinator, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type CompletionSource, type RecoveryRecord, type RecoveryCoordinatorOptions } from "./recovery.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
 import {
   PUSHED_HEAD_UNRECORDED,
@@ -2098,6 +2098,24 @@ type MemoryFlight = {
 };
 
 /** Private execution provenance only; never claim input or maintenance authority. */
+type TerminalSource = Readonly<{
+  executor: Executor; safety: CodexExecutionSafety; runId: string; generation: number;
+  clonePath: string | undefined; attemptId: string | undefined;
+  barePath: string | undefined; branch: string | undefined;
+  genesis: SourceGenesis | undefined; attempt: RunFlight["attempt"]; clone: RunFlight["runnerClone"];
+  flightAttemptId: string | undefined;
+  cancelled: boolean; cancelAborted: boolean;
+}>;
+/** Process-local deny-only provenance; serialized completion sources compare by value. */
+type CompletionSourceBinding = Readonly<{
+  key: string; signature: string; contextSignature: string; flight: RunFlight; executor: Executor;
+  kind: "knownCodex" | "knownClaude"; source?: TerminalSource;
+}>;
+
+type DeferredTerminalRelease = TerminalSource & Readonly<{
+  reason: string; memo: boolean; capturedHead?: string; stale: boolean; record: "none";
+}>;
+
 type SourceGenesis = Readonly<{
   runId: string;
   generation: number;
@@ -2110,6 +2128,12 @@ type ClaimCheckpointEvidence = Readonly<{ tip?: string; attestedSource?: string;
 interface RunFlight {
   readonly checkpointCoordinates?: CheckpointCoordinates;
   readonly checkpointClaimEvidence: ClaimCheckpointEvidence;
+  /** Initial trusted claim/executor classification; denial only, never disposal evidence. */
+  readonly initiallyCodex: boolean;
+  terminalDisposal?: Readonly<{ source: TerminalSource; result: Awaited<ReturnType<CodexExecutionSafety["dispose"]>> }>;
+  deferredTerminalRelease?: DeferredTerminalRelease;
+  terminalReleaseOwner?: { veto: boolean; provisional: (value: boolean) => void };
+
   /** Local observer only; preservation keeps its own operation and authority. */
   memoryHoldObserver?: () => void;
   /** Exact facade of a refused/unacknowledged owner-pause capture; never cleanup or resume authority. */
@@ -2919,6 +2943,11 @@ export class RunRunner {
   private readonly inventoryReservations = new Set<string>();
   private readonly commandSettlements = new WeakMap<Executor, { confirmed: boolean; failed: boolean }>();
   private readonly executionTails = new Map<string, Promise<ClosedSourceObservation | void>>();
+  // A boundary pass alone is not full cleanup. Bindings retire only on positive cleanup evidence: the
+  // coordinator's completion notifications, or a binder's cleanup witness reporting full fallback cleanup.
+  private readonly completionSourceBindings = new Map<string, readonly CompletionSourceBinding[]>();
+  private readonly conflictedCompletionSources = new Set<CompletionSourceBinding>();
+  private readonly completionSourceBinds = new Set<Pick<CompletionSourceBinding, "key">>();
   /** PRD #218 M1: set by `shutdown()`. Read when a run registers so a run that starts
    *  DURING the shutdown drain (a late claim) is aborted immediately rather than running
    *  to completion past the grace window. */
@@ -2990,6 +3019,8 @@ export class RunRunner {
         terminalSettlementConfirmed: runId => !this.executionTails.has(runId),
         withInventorySourceBoundary: (context, action) => this.withInventorySourceBoundary(context, action),
         withCompletionSourceBoundary: (source, action) => this.withCompletionSourceBoundary(source, action),
+        onCompletionSourceForgotten: source => this.forgetCompletionSourceBinding(source),
+        onCompletionGenerationForgotten: (runId, generation) => this.forgetCompletionSourceBindings(runId, generation),
         withTerminalSourceBoundary: (runId, paths, action, signal) => {
           const pressureOpen = () => this.dataVolume?.preflight() !== "data_volume_full";
           if (!pressureOpen()) return Promise.resolve({ entered: false as const });
@@ -3327,24 +3358,107 @@ export class RunRunner {
     }
   }
 
+  private completionSourceIdentity(source: CompletionSource): string {
+    const ctx = source.context;
+    return JSON.stringify([ctx.runId, ctx.generation, ctx.barePath, ctx.branch, source.clonePath, source.attemptId]);
+  }
+
+  private rememberCompletionSource(source: CompletionSource, flight: RunFlight,
+    executor: Executor, terminalSource: TerminalSource | undefined): CompletionSourceBinding {
+    const group = this.completionKey(source.context.runId, source.context.generation);
+    const bindings = this.completionSourceBindings.get(group) ?? [];
+    const key = this.completionSourceIdentity(source), signature = canonicalJson(source);
+    const contextSignature = canonicalJson(source.context);
+    const kind = terminalSource !== undefined || this.requiresCodexTerminalProof(flight, executor) ? "knownCodex" : "knownClaude";
+    const same = bindings.find(b => b.key === key && b.signature === signature && b.flight === flight &&
+      b.executor === executor && b.source?.safety === terminalSource?.safety && b.kind === kind);
+    if (same && !this.completionSourceBinds.has(same)) return same;
+    const binding: CompletionSourceBinding = Object.freeze({ key, signature, contextSignature, flight, executor, kind, source: terminalSource });
+    // HEAD/roots updates still reach the durable binder; changed Codex provenance only vetoes cleanup.
+    for (const old of bindings) {
+      if (old.key === key && (old.kind === "knownCodex" || kind === "knownCodex") &&
+          (old.flight !== flight || old.executor !== executor || old.source?.safety !== terminalSource?.safety ||
+            old.contextSignature !== contextSignature)) {
+        this.conflictedCompletionSources.add(old);
+        this.conflictedCompletionSources.add(binding);
+      }
+    }
+    this.completionSourceBindings.set(group, Object.freeze([...bindings, binding]));
+    return binding;
+  }
+
+  private forgetCompletionSourceBinding(source: CompletionSource): void {
+    this.forgetCompletionSourceBindings(source.context.runId, source.context.generation, this.completionSourceIdentity(source));
+  }
+
+  private forgetCompletionSourceBindings(runId: string, generation: number, key?: string): void {
+    const group = this.completionKey(runId, generation);
+    const bindings = this.completionSourceBindings.get(group);
+    if (!bindings) return;
+    // A binder may already own provenance while waiting on the coordinator's journal lock.
+    // Its partial write must never become an unclassified current-process source; preserve
+    // every version of its identity, including conflicting bindings.
+    const pendingKeys = new Set([...this.completionSourceBinds].map(b => b.key));
+    const remaining = bindings.filter(binding => {
+      if ((key !== undefined && binding.key !== key) || pendingKeys.has(binding.key)) return true;
+      this.conflictedCompletionSources.delete(binding);
+      return false;
+    });
+    if (remaining.length) this.completionSourceBindings.set(group, Object.freeze(remaining));
+    else this.completionSourceBindings.delete(group);
+  }
+
+  private classifyCompletionSource(source: CompletionSource):
+    { kind: "knownCodex"; binding?: CompletionSourceBinding } | { kind: "knownClaude" | "noReliableBinding" } {
+    const bindings = this.completionSourceBindings.get(this.completionKey(source.context.runId, source.context.generation)) ?? [];
+    const exact = bindings.filter(b => b.key === this.completionSourceIdentity(source));
+    const codex = exact.filter(b => b.kind === "knownCodex");
+    if (codex.length) return { kind: "knownCodex", binding: codex.find(b => b.signature === canonicalJson(source)) };
+    if (exact.length) return { kind: "knownClaude" };
+    // Same run/generation is recognizable even if clone, attempt, bare or branch was changed.
+    // A different positively bound tuple above remains independent; path alone grants nothing.
+    return { kind: bindings.some(b => b.kind === "knownCodex") ? "knownCodex" : "noReliableBinding" };
+  }
+
+  private completionSourceProof(source: CompletionSource, binding: CompletionSourceBinding): boolean {
+    const current = this.classifyCompletionSource(source);
+    return current.kind === "knownCodex" && current.binding === binding &&
+      !this.conflictedCompletionSources.has(binding) && binding.signature === canonicalJson(source) &&
+      binding.key === this.completionSourceIdentity(source) && binding.source !== undefined &&
+      source.context.runId === binding.source.runId && source.context.generation === binding.source.generation &&
+      source.context.barePath === binding.source.barePath && source.context.branch === binding.source.branch &&
+      source.clonePath === binding.source.clonePath && source.attemptId === binding.source.attemptId &&
+      binding.flight.executor === binding.executor && this.terminalSourceCurrent(binding.flight, binding.source) &&
+      this.terminalProcessProof(binding.flight) && binding.flight.terminalDisposal?.source.executor === binding.executor &&
+      binding.flight.terminalDisposal.source.safety === binding.source.safety;
+  }
+
   /** Reserve execution through completion retirement's disposal under the bare lock. Successor admission
    * replaces this tail and stops any further destruction while waiting for our release. */
   private async withCompletionSourceBoundary(source: CompletionSource,
     action: (canDelete: () => boolean) => Promise<void>): Promise<"passed" | "retained"> {
     const ctx = source.context;
-    if (this.executionTails.has(ctx.runId) || process.platform !== "linux") return "retained";
+    const classification = this.classifyCompletionSource(source);
+    const proof = (): boolean => {
+      const current = this.classifyCompletionSource(source);
+      if (classification.kind !== "knownCodex") return current.kind !== "knownCodex";
+      return classification.binding !== undefined && this.completionSourceProof(source, classification.binding);
+    };
+    // A known Codex source never falls through to legacy inspection without the live disposal witness.
+    if (!proof() || this.executionTails.has(ctx.runId) || process.platform !== "linux") return "retained";
     let release!: () => void;
     const tail = new Promise<void>(resolve => { release = resolve; });
     this.executionTails.set(ctx.runId, tail);
     this.inventoryReservations.add(ctx.runId);
-    const open = (): boolean => this.executionTails.get(ctx.runId) === tail && residueQuarantine() === undefined &&
+    const open = (): boolean => proof() && this.executionTails.get(ctx.runId) === tail && residueQuarantine() === undefined &&
       !this.liveAttempts.isLivePath(source.clonePath);
     try {
       const inventory = await this.git.readInventoryCloneHeads(ctx.barePath, ctx.runId);
       if (inventory.kind !== "verified" || !open()) return "retained";
       const clone = inventory.clones.find(c => c.clonePath === source.clonePath);
       if (!clone) {
-        if (!await this.git.completionSourceAlreadyRetired(ctx.barePath, ctx.branch, ctx.runId, source.clonePath, source.attemptId) || !open()) return "retained";
+        if (!await this.git.completionSourceAlreadyRetired(ctx.barePath, ctx.branch, ctx.runId, source.clonePath, source.attemptId,
+          classification.kind === "knownCodex" ? { processProof: open } : undefined) || !open()) return "retained";
         await action(open);
         return "passed";
       }
@@ -3356,11 +3470,12 @@ export class RunRunner {
         site: "completion_source" };
       const before = await this.quiesceImpl(request);
       if (before.process?.state !== "quiescent" || !open()) return "retained";
-      if (await this.git.worktreeHead(source.clonePath) !== source.expectedHead) return "retained";
+      if (await this.git.worktreeHead(source.clonePath) !== source.expectedHead || !open()) return "retained";
       const after = await this.quiesceImpl({ ...request, dockerHost: undefined, site: "completion_source:after_git" });
       if (after.process?.state !== "quiescent" || !open()) return "retained";
       await this.git.retireRunnerClone(ctx.barePath, source.clonePath, ctx.branch, ctx.runId, {
         discard: true, attemptId: source.attemptId, completionSource: { expectedHead: source.expectedHead, canDelete: open },
+        ...(classification.kind === "knownCodex" ? { processProof: open } : {}),
       });
       if (!open()) return "retained";
       await action(open);
@@ -3667,17 +3782,45 @@ export class RunRunner {
   private async bindCompletionSource(flight: RunFlight): Promise<void> {
     if (!flight.barePath || !flight.worktreePath || !flight.branch || flight.predecessorCapture ||
         !flight.runnerClone || flight.runnerClone.path !== flight.worktreePath || flight.runnerClone.branch !== flight.branch) return;
+    const executor = flight.executor;
+    const terminalSource = executor.safety ? this.terminalSource(flight, executor, executor.safety) : undefined;
+    const { runId, claimGeneration: generation, barePath, branch, worktreePath } = flight;
+    const attemptId = flight.runnerClone.attemptId;
+    // Preparation protects every existing version before owedOptions can yield.
+    const preparation = { key: JSON.stringify([runId, generation, barePath, branch, worktreePath, attemptId]) };
+    this.completionSourceBinds.add(preparation);
+    const witness = this.recovery.registerCompletionCleanupWitness(runId, generation);
+    let binding: CompletionSourceBinding | undefined;
+    let matchingIdentity = true;
     try {
-      const context = (await this.owedOptions(flight, flight.barePath, flight.branch)).context;
-      if (!context || context.generation === null || "legacy" in context) return;
-      const expectedHead = await this.git.worktreeHead(flight.worktreePath);
-      if (!expectedHead) return;
-      const candidates = await this.git.enumerateOwedCandidates(flight.barePath, flight.runId);
-      const roots = candidates.map(r => ({ sha: r.sha,
-        contexts: r.contexts.filter(c => c.generation === flight.claimGeneration && !("origin" in c)) }))
-        .filter(r => r.contexts.length > 0);
-      await this.recovery.bindCompletionSource({ context: context as CompletionSource["context"],
-        clonePath: flight.worktreePath, attemptId: flight.runnerClone?.attemptId, expectedHead, roots });
+      try {
+        const context = (await this.owedOptions(flight, barePath, branch)).context;
+        if (!context || context.generation === null || "legacy" in context) return;
+        matchingIdentity = context.runId === runId && context.generation === generation &&
+          context.barePath === barePath && context.branch === branch;
+        if (!matchingIdentity) throw new Error("completion source preparation identity changed");
+        const expectedHead = await this.git.worktreeHead(worktreePath);
+        if (!expectedHead) return;
+        const candidates = await this.git.enumerateOwedCandidates(barePath, runId);
+        const roots = candidates.map(r => ({ sha: r.sha,
+          contexts: r.contexts.filter(c => c.generation === generation && !("origin" in c)) }))
+          .filter(r => r.contexts.length > 0);
+        const source: CompletionSource = { context: context as CompletionSource["context"],
+          clonePath: worktreePath, attemptId, expectedHead, roots };
+        matchingIdentity = this.completionSourceIdentity(source) === preparation.key;
+        if (!matchingIdentity) throw new Error("completion source preparation identity changed");
+        // Install before the durable write: false/throw may already have persisted part of the cohort.
+        binding = this.rememberCompletionSource(source, flight, executor, terminalSource);
+        this.completionSourceBinds.add(binding);
+        this.completionSourceBinds.delete(preparation);
+        await this.recovery.bindCompletionSource(source);
+      } finally {
+        this.completionSourceBinds.delete(preparation);
+        if (binding) this.completionSourceBinds.delete(binding);
+        try {
+          if (matchingIdentity && witness.fullyForgotten()) this.forgetCompletionSourceBindings(runId, generation);
+        } finally { witness.release(); }
+      }
     } catch (err) {
       flight.runLog.warn("recovery: completion source provenance unavailable; deletion remains protected", { error: errMessage(err) });
     }
@@ -5065,38 +5208,61 @@ export class RunRunner {
       // settled. A Codex executor's run() no longer disposes its registry on the normal path —
       // its post-run sinks (park/shutdown/finalize) reap the provider root through withBoundary,
       // which needs the roots alive — so the runner disposes it here, once, on every path
-      // (success, park, shutdown, generic failure). Harness-agnostic: guarded on
-      // `executor.safety`, so a Claude/stub run (no safety) is untouched. Best-effort +
+      // (success, park, shutdown, generic failure). Known Codex flights require proof
+      // even before facade installation; ordinary Claude/stub runs are untouched. Best-effort +
       // idempotent (disposeTools is), so a standalone-backstop dispose never double-disposes,
       // and a dispose failure can never convert a completed run into a failed one.
       // Issue #1856: an `incomplete` or rejected dispose has not proven the Codex processes
       // drained, so the clone, its journal and the paired skills dir are kept (the #1783
       // blocked-retire posture). HOME handling is unchanged: a run without resume artifacts
       // still loses its HOME, as in #1783.
-      let terminalDisposeUnproven = false;
-      if (executor.safety && !(flight.workerMemory?.closing && !flight.workerMemory.closingSettled) &&
+      const terminalExecutor = executor;
+      const terminalSafety = terminalExecutor.safety;
+      const terminalSource = terminalSafety ? this.terminalSource(flight, terminalExecutor, terminalSafety) : undefined;
+      const terminalCodex = this.requiresCodexTerminalProof(flight, terminalExecutor);
+      let terminalDisposeUnproven = terminalCodex;
+      let terminalDisposition: "skipped" | "incomplete" | "rejected" | "invalid" = "skipped";
+      if (terminalSafety && terminalSource && !(flight.workerMemory?.closing && !flight.workerMemory.closingSettled) &&
           !(flight.workerMemory?.operation && !flight.workerMemory.settled) &&
           !(flight.workerMemory?.executorRun && !flight.workerMemory.executorSettled) &&
           !this.memoryRuntime?.sinkReceipts.some(receipt => receipt.context.flight === flight)) {
         try {
-          await executor.closeAndSettlePlanSummary?.(this.codexBoundaryDeadlineMs);
-          const disposal = await executor.safety.dispose({ boundary: "terminal", deadlineMs: this.codexBoundaryDeadlineMs });
-          if (disposal.kind === "disposed") flight.evidenceProcessJoined = executor;
-          else flight.evidenceJoinFailed = true;
-          if (disposal.kind === "incomplete") {
-            terminalDisposeUnproven = true;
-            flight.sourceJoinFailed = true;
-            flight.preserveRecoveryClone = true;
-            runLog.warn("codex terminal dispose incomplete; retaining runner clone", { errors: disposal.errors });
-          }
-        } catch (e) {
-          terminalDisposeUnproven = true;
-          flight.evidenceJoinFailed = true;
-          flight.sourceJoinFailed = true;
-          flight.preserveRecoveryClone = true;
-          runLog.warn("codex terminal dispose failed; retaining runner clone", { error: errMessage(e) });
+          await terminalExecutor.closeAndSettlePlanSummary?.(this.codexBoundaryDeadlineMs);
+          const disposal = await terminalSafety.dispose({ boundary: "terminal", deadlineMs: this.codexBoundaryDeadlineMs });
+          flight.terminalDisposal = Object.freeze({ source: terminalSource, result: disposal });
+          terminalDisposeUnproven = !this.terminalProcessProof(flight);
+          terminalDisposition = disposal.kind === "incomplete" ? "incomplete" : "invalid";
+          if (!terminalDisposeUnproven) flight.evidenceProcessJoined = terminalExecutor;
+        } catch {
+          terminalDisposition = "rejected";
         }
       }
+      if (terminalDisposeUnproven) {
+        flight.evidenceJoinFailed = true;
+        flight.sourceJoinFailed = true;
+        flight.preserveRecoveryClone = true;
+        flight.keepGuardedInventoryOpen = true;
+        runLog.warn("codex terminal disposal unproven; retaining runner clone", { disposition: terminalDisposition });
+      }
+      // Consume exactly once, before any later independent custody decision.
+      const deferredRelease = flight.deferredTerminalRelease;
+      flight.deferredTerminalRelease = undefined;
+      if (deferredRelease && this.terminalReleaseAllowed(flight, deferredRelease)) {
+        await this.retainStoppedSource(flight, deferredRelease.executor, deferredRelease.reason, deferredRelease)
+          .catch(() => { flight.preserveRecoveryClone = true; flight.stoppedSourceKept = true; });
+      }
+      const processProof = (): boolean => !terminalCodex ||
+        (this.terminalProcessProof(flight) && this.terminalMemorySettled(flight));
+      // A checkpointed park retires its ordinary clone too; custody flags and the
+      // exact disposal witness still veto release when cleanup is unproven.
+      const cloneReleaseProof = (): boolean => processProof() && !flight.preserveRecoveryClone &&
+        !flight.stoppedSourceKept;
+      const successorProcessProof = (): boolean => processProof() && !flight.parked && !flight.stoppedSourceKept &&
+        !flight.retainedLocalCustody && this.terminalMemorySettled(flight) && !flight.steering.isCancelled();
+      const beforeDestroy = (): void => {
+        if (!processProof() || flight.stoppedSourceKept || (!ownAttemptRetired && flight.preserveRecoveryClone))
+          throw new Error("terminal process proof revoked");
+      };
       // PRD #218 M1: drop the shutdown-registry entry. A terminal run (or a parked one)
       // must not stay abortable — shutdown() iterating a stale entry would abort a
       // controller nobody is watching, and the map would leak an entry per run.
@@ -5260,8 +5426,9 @@ export class RunRunner {
         }
       } else if (!this.cancellationExpired(flight) && flight.worktreePath && !flight.preserveRecoveryClone) {
         const q = await this.quiesceRun(flight, executor, { mode: "own", site: "terminal_retire" });
-        if (q.blocked) {
+        if (q.blocked || !processProof()) {
           flight.sourceJoinFailed = true;
+          flight.keepGuardedInventoryOpen = true;
           retireBlocked = true;
           runLog.warn("runner clone kept: not provably quiescent", {
             clone: flight.worktreePath,
@@ -5289,13 +5456,14 @@ export class RunRunner {
               flight.branch!,
               runId,
               { discard: true, attemptId: flight.runnerClone?.attemptId,
+                ...(terminalCodex ? { processProof: cloneReleaseProof } : {}),
                 onRetirementUnproven: () => { flight.sourceJoinFailed = true; } },
             ));
             ownAttemptRetired = flight.runnerClone?.attemptId !== undefined;
           } else {
             // No bare/branch to key the journal on (a run that never journaled): fall
             // back to pinned runner-owned removal.
-            await this.runCancellationMaintenance(flight, () => this.git.removeRunnerClone(flight.worktreePath!, runId));
+            await this.runCancellationMaintenance(flight, () => this.git.removeRunnerClone(flight.worktreePath!, runId, terminalCodex ? { processProof: cloneReleaseProof } : undefined));
           }
         } catch (e) {
           flight.sourceJoinFailed = true;
@@ -5313,10 +5481,10 @@ export class RunRunner {
           claim.inventory_guarded === true && !terminalDisposeUnproven && flight.barePath && flight.branch && flight.worktreePath &&
           flight.attemptId && !flight.retainedLocalCustody) {
         const acknowledged = async () => {
-          if (flight.active?.shuttingDown || this.shuttingDownGlobal || flight.steering.claimFence() !== undefined ||
+          if ((terminalCodex && !successorProcessProof()) || flight.active?.shuttingDown || this.shuttingDownGlobal || flight.steering.claimFence() !== undefined ||
               residueQuarantine() !== undefined) return false;
           const state = await this.recovery.inventoryCleanupState(runId, flight.claimGeneration);
-          if (flight.active?.shuttingDown || this.shuttingDownGlobal || flight.steering.claimFence() !== undefined ||
+          if ((terminalCodex && !successorProcessProof()) || flight.active?.shuttingDown || this.shuttingDownGlobal || flight.steering.claimFence() !== undefined ||
               residueQuarantine() !== undefined) return false;
           return state === "acknowledged";
         };
@@ -5326,6 +5494,7 @@ export class RunRunner {
             if (!q.blocked && await acknowledged() && !this.cancellationExpired(flight)) {
               await this.runCancellationMaintenance(flight, () => this.git.retireRunnerClone(flight.barePath!, flight.worktreePath!, flight.branch!, runId, {
                 discard: true, attemptId: flight.attemptId,
+                ...(terminalCodex ? { processProof: successorProcessProof } : {}),
                 verifiedSuccessor: { key: this.cloneCoordinates(claim).key, generation: flight.claimGeneration,
                   expected: flight.completedRetainedSuccessor!, acknowledged },
               }));
@@ -5357,9 +5526,9 @@ export class RunRunner {
       // removed with it even on a park; automatic retention keeps a retained predecessor and its pair.
       let sourceSkillsRemoved = false;
       let sourceHomeRemoved = false;
-      const removeSkills = !terminalDisposeUnproven && (flight.predecessorCapture ? false : ownAttemptRetired || !preserveResumeArtifacts);
+      const removeSkills = !terminalDisposeUnproven && (!terminalCodex || !flight.stoppedSourceKept) && (flight.predecessorCapture ? false : ownAttemptRetired || !preserveResumeArtifacts);
       if (!this.cancellationExpired(flight) && flight.worktreePath && removeSkills) {
-        await this.runCancellationMaintenance(flight, () => rmTeardownTree(skillsPluginDir(flight.worktreePath!), this.teardownTestDeps))
+        await this.runCancellationMaintenance(flight, () => rmTeardownTree(skillsPluginDir(flight.worktreePath!), this.teardownTestDeps, terminalCodex ? beforeDestroy : undefined))
           .then(() => { sourceSkillsRemoved = true; })
           .catch((e) => {
             flight.sourceJoinFailed = true;
@@ -10196,6 +10365,7 @@ export class RunRunner {
         ? claim.checkpoint_write_unresolved : undefined,
     });
     const flight: RunFlight = {
+      initiallyCodex: this.requiresFreeCaptureScope(claim, { executor }),
       runId,
       executor,
       runHome,
@@ -14254,8 +14424,9 @@ export class RunRunner {
       MaintenanceBudget.current()?.check();
       outcome = fold(outcome);
       if (!executor.safety) {
-        if (outcome.process?.state === "quiescent") flight.evidenceProcessJoined = executor;
-        else flight.evidenceJoinFailed = true;
+        if (outcome.process?.state === "quiescent") {
+          if (!this.requiresCodexTerminalProof(flight, executor)) flight.evidenceProcessJoined = executor;
+        } else flight.evidenceJoinFailed = true;
       }
       // Ordinary callers allow an absent process result. Private FAILED observation
       // requires explicit process proof, including the transfer's post-Git re-proof.
@@ -15516,7 +15687,7 @@ export class RunRunner {
       flight.executor.withCredentialFreeCapture || claim.secrets.codex);
   }
 
-  private requiresFreeCaptureScope(claim: ClaimResponse, flight: RunFlight): boolean {
+  private requiresFreeCaptureScope(claim: ClaimResponse, flight: Pick<RunFlight, "executor">): boolean {
     return !!(flight.executor.withCredentialFreeCapture || flight.executor.safety ||
       flight.executor.sandboxesCommands || flight.executor.settleForCredentialFreeCapture || claim.secrets.codex);
   }
@@ -17898,7 +18069,14 @@ export class RunRunner {
         flight.cachesDroppedEarly = true;
       }
     }
-    flight.preserveRecoveryClone = true;
+    // Track independent writes, including true -> true, across capture and terminal disposal.
+    // Only this handler's provisional custody may be discharged by its deferred request.
+    if (executor.safety) this.ownTerminalRelease(flight);
+    const provisionalKeep = (): void => {
+      if (flight.terminalReleaseOwner) flight.terminalReleaseOwner.provisional(true);
+      else flight.preserveRecoveryClone = true;
+    };
+    provisionalKeep();
     flight.preserveSession = true;
     let capture: { verified: boolean; published: boolean; capturedHead?: string } | undefined =
       opts.dispositionOnly && progress?.local?.kind === "recovery" ? progress.local.result : undefined;
@@ -18001,7 +18179,7 @@ export class RunRunner {
         pendingRelease = undefined;
         return;
       }
-      flight.preserveRecoveryClone = true;
+      provisionalKeep();
       pendingRelease = { reason, stale: opts.stale ?? false, record: opts.record ?? "none" };
     };
     // Park coverage is diagnostic: latch custody before asynchronous disposition,
@@ -18319,7 +18497,7 @@ export class RunRunner {
             if (attempt.residueBlocked) blockedDetail = attempt.residueDetail ?? "not quiescent";
             if (attempt.verified) {
               capture = attempt;
-              if (credentialFree()) flight.preserveRecoveryClone = true;
+              if (credentialFree()) provisionalKeep();
               else markReleaseEligible("recovery_capture_verified");
               flight.predecessorCaptureVerified = flight.predecessorCapture;
               retries = 0;
@@ -20931,6 +21109,74 @@ export class RunRunner {
    * retained-recovery custody, which this does not touch). `unknown`: kept, not recorded. None of the
    * four grants custody release or successor authority.
    */
+  private ownTerminalRelease(flight: RunFlight): void {
+    if (flight.terminalReleaseOwner) return;
+    let preserved = flight.preserveRecoveryClone;
+    const owner = { veto: !!preserved || flight.stoppedSourceKept,
+      provisional: (value: boolean) => { preserved = value; } };
+    Object.defineProperty(flight, "preserveRecoveryClone", {
+      configurable: true, enumerable: true, get: () => preserved,
+      set: (value: boolean) => {
+        owner.veto = true;
+        flight.deferredTerminalRelease = undefined;
+        preserved = value;
+      },
+    });
+    flight.terminalReleaseOwner = owner;
+  }
+
+  private terminalSource(flight: RunFlight, executor: Executor, safety: CodexExecutionSafety): TerminalSource {
+    return Object.freeze({ executor, safety, runId: flight.runId, generation: flight.claimGeneration,
+      clonePath: flight.worktreePath, attemptId: flight.runnerClone?.attemptId,
+      barePath: flight.barePath, branch: flight.branch, genesis: flight.sourceGenesis,
+      attempt: flight.attempt, clone: flight.runnerClone, flightAttemptId: flight.attemptId,
+      cancelled: flight.steering.isCancelled(), cancelAborted: flight.cancel.signal.aborted });
+  }
+
+  private terminalSourceCurrent(flight: RunFlight, source: TerminalSource): boolean {
+    return flight.executor === source.executor && source.executor.safety === source.safety &&
+      flight.runId === source.runId && flight.claimGeneration === source.generation &&
+      flight.worktreePath === source.clonePath && flight.runnerClone?.attemptId === source.attemptId &&
+      flight.barePath === source.barePath && flight.branch === source.branch &&
+      flight.sourceGenesis === source.genesis && flight.attempt === source.attempt &&
+      flight.runnerClone === source.clone && flight.attemptId === source.flightAttemptId &&
+      flight.steering.isCancelled() === source.cancelled && flight.cancel.signal.aborted === source.cancelAborted;
+  }
+
+  /** Stable initial identity plus current/exact executor markers only require proof.
+   * Missing markers can never turn a known Codex flight into legacy release authority. */
+  private requiresCodexTerminalProof(flight: RunFlight, executor: Executor): boolean {
+    const marked = (e: Executor): boolean => !!(e.safety || e.sandboxesCommands ||
+      e.withCredentialFreeCapture || e.settleForCredentialFreeCapture);
+    return flight.initiallyCodex || marked(flight.executor) || marked(executor);
+  }
+
+  private terminalProcessProof(flight: RunFlight): boolean {
+    const proof = flight.terminalDisposal;
+    return proof !== undefined && proof.result.kind === "disposed" &&
+      this.terminalSourceCurrent(flight, proof.source) && proof.source.safety.acceptsTerminalDisposal(proof.result);
+  }
+
+  private terminalMemorySettled(flight: RunFlight): boolean {
+    const memory = flight.workerMemory;
+    return !(memory?.closing && !memory.closingSettled) &&
+      !(memory?.operation && !memory.settled) &&
+      !(memory?.executorRun && !memory.executorSettled) &&
+      !this.memoryRuntime?.sinkReceipts.some(receipt => receipt.context.flight === flight);
+  }
+
+  private terminalReleaseAllowed(flight: RunFlight, request: DeferredTerminalRelease): boolean {
+    return this.terminalProcessProof(flight) && this.terminalSourceCurrent(flight, request) &&
+      !flight.terminalReleaseOwner?.veto && !flight.parked && !flight.active?.shuttingDown &&
+      !this.shuttingDownGlobal &&
+      flight.steering.claimFence() === undefined && !this.cancellationExpired(flight) &&
+      residueQuarantine() === undefined && this.terminalMemorySettled(flight) && !flight.sourceJoinFailed &&
+      !flight.retainedLocalCustody && !flight.retainedEpisode &&
+      !flight.retainedEpisodeCustody && !flight.completedRetainedSuccessor && !flight.predecessorCapture &&
+      !flight.cancellationCustodyUnknown && !this.captureRetentions.has(flight) &&
+      !this.completionReceipts.has(this.completionKey(flight.runId, flight.claimGeneration));
+  }
+
   private async retainStoppedSource(
     flight: RunFlight, executor: Executor, reason: string,
     /** issue #1786 M2: set by a `handleRecoveryExhausted` exit. The handler latches the preserve flag
@@ -20949,6 +21195,32 @@ export class RunRunner {
   ): Promise<"no_source" | "covered" | "retained_local" | "unknown"> {
     // Includes ambiguous record:none exits; no inherited positive is supported yet.
     flight.sourceExitDenied = true;
+    // Release-capable Codex exits request work only. No Git reads, process scan, or
+    // safety acquisition is permitted in the handler's still-held A/B region.
+    if (this.requiresCodexTerminalProof(flight, executor) && handler?.record === "none" && reason !== "recovery_park_keep") {
+      // Stale-claim inventory exclusion is independent of release eligibility.
+      // A vetoed or invalidated request may never reach post-disposal coverage.
+      if (handler.stale) flight.keepGuardedInventoryOpen = true;
+      const safety = executor.safety;
+      if (!safety) {
+        // No exact facade means no release request or legacy coverage; latch before any read.
+        flight.preserveRecoveryClone = true;
+        flight.stoppedSourceKept = true;
+        flight.keepGuardedInventoryOpen = true;
+        return flight.worktreePath === undefined ? "no_source" : "retained_local";
+      }
+      const request: DeferredTerminalRelease = Object.freeze({
+        ...this.terminalSource(flight, executor, safety), reason, ...handler, record: "none",
+      });
+      if (!flight.terminalDisposal) {
+        this.ownTerminalRelease(flight);
+        flight.terminalReleaseOwner!.provisional(true);
+        flight.stoppedSourceKept = true;
+        if (!flight.terminalReleaseOwner!.veto) flight.deferredTerminalRelease = request;
+        return flight.worktreePath === undefined ? "no_source" : "retained_local";
+      }
+      if (!this.terminalReleaseAllowed(flight, request)) return "unknown";
+    }
     if (flight.cancellationBudget && this.cancellationExpired(flight)) return flight.worktreePath === undefined ? "no_source" : "unknown";
     if (!MaintenanceBudget.current() && flight.cancellationBudget) {
       return this.runCancellationMaintenance(flight, () => this.retainStoppedSource(flight, executor, reason, handler)).catch(() => {
@@ -20968,7 +21240,11 @@ export class RunRunner {
     const custodyHeld = flight.retainedLocalCustody || flight.retainedEpisode || flight.retainedEpisodeCustody ||
       flight.completedRetainedSuccessor || flight.predecessorCapture;
     const priorPreserve = flight.preserveRecoveryClone;
-    flight.preserveRecoveryClone = true;
+    const terminalRequest = executor.safety && handler?.record === "none" && reason !== "recovery_park_keep"
+      ? Object.freeze({ ...this.terminalSource(flight, executor, executor.safety), reason, ...handler, record: "none" as const })
+      : undefined;
+    if (terminalRequest && flight.terminalReleaseOwner) flight.terminalReleaseOwner.provisional(true);
+    else flight.preserveRecoveryClone = true;
     flight.stoppedSourceKept = true;
     // The stale claim owns the guarded inventory now: no ownership probe, freeze or upload from here.
     if (!handler || handler.stale) flight.keepGuardedInventoryOpen = true;
@@ -20980,8 +21256,8 @@ export class RunRunner {
     let dockerSettled = false;
     let coverage: "covered" | "not_covered" | "skipped" = "skipped";
     try {
-      const q = await this.quiesceRun(flight, executor, { mode: "own", site: "stopped_source", forceProcessScan: true });
-      blocked = q.blocked;
+      const q = await this.quiesceRun(flight, executor, { mode: "own", site: "stopped_source", forceProcessScan: terminalRequest === undefined });
+      blocked = q.blocked || (terminalRequest !== undefined && !this.terminalReleaseAllowed(flight, terminalRequest));
       dockerSettled = q.outcome.docker.state === "not_wired" || q.outcome.docker.state === "docker_unconfirmed";
     } catch (err) {
       log.warn("stopped source: the quiescence proof failed; the clone is kept", { error: errMessage(err), reason });
@@ -21003,6 +21279,9 @@ export class RunRunner {
         const head = handler?.memo === true ? handler.capturedHead! : await this.git.worktreeHead(clonePath);
         if (head !== null) {
           const quiesce = async (paths: string[], phase: "before" | "after"): Promise<boolean> => {
+            // This exact disposed epoch cannot reopen admission. Consume its live witness;
+            // legacy procfs snapshots never certify Codex release or reacquire its queue.
+            if (terminalRequest) return this.terminalReleaseAllowed(flight, terminalRequest);
             if (process.platform !== "linux") return false;
             const outcome = await this.quiesceImpl({
               mode: "own", attempt: flight.attempt, cloneKey: cloneKeyOf(clonePath).cloneKey, targetPaths: paths,
@@ -21022,14 +21301,15 @@ export class RunRunner {
             head, { runId: flight.runId, generation: flight.claimGeneration }, quiesce,
           );
           coverage = covered === "covered" ? "covered" : "not_covered";
-          if (covered === "covered") {
+          if (covered === "covered" && (!terminalRequest || this.terminalReleaseAllowed(flight, terminalRequest))) {
             if (handler === undefined || handler.record === "stopped" || reason === "recovery_park_keep") {
               // A stopped exit never trusts the verdict to discard: a writer that wrote and exited between
               // the status read and the "after" scan is invisible to it, and the successor claim cannot see
               // this clone. The latches stay and the retention record below is written.
               log.info("stopped source: coverage verified (diagnostic only); the clone is kept until explicit operator discard", { clone: clonePath, reason });
             } else {
-              flight.preserveRecoveryClone = false;
+              if (terminalRequest && flight.terminalReleaseOwner) flight.terminalReleaseOwner.provisional(false);
+              else flight.preserveRecoveryClone = false;
               flight.stoppedSourceKept = false;
               log.info("stopped source: clean and already held by the worker bare (tracking tip, owed pin or default branch); teardown proceeds", { clone: clonePath, reason });
               return "covered";

@@ -519,6 +519,10 @@ export interface RecoveryCoordinatorOptions {
     captureWip?: GitCache["captureMaintenanceWip"];
     withMaintenanceTransfer?: <V>(action: (check: () => void) => Promise<V>) => Promise<V>;
   }) => Promise<T>, signal?: AbortSignal) => Promise<{ entered: false } | { entered: true; value: T }>;
+  /** Notification only, after exact-source and generation cleanup actually completed. */
+  onCompletionSourceForgotten?: (source: CompletionSource) => void;
+  /** Notification only, after guarded archive/FINAL cleanup removed the full generation. */
+  onCompletionGenerationForgotten?: (runId: string, generation: number) => void;
   withCompletionSourceBoundary?: (
     source: CompletionSource,
     action: (canDelete: () => boolean) => Promise<void>,
@@ -979,6 +983,8 @@ const recoveryJournalLocks = new RunDiskLocks();
 export class RecoveryCoordinator {
   private readonly withInventorySourceBoundary: RecoveryCoordinatorOptions["withInventorySourceBoundary"];
   private readonly withCompletionSourceBoundary: RecoveryCoordinatorOptions["withCompletionSourceBoundary"];
+  private readonly onCompletionSourceForgotten: RecoveryCoordinatorOptions["onCompletionSourceForgotten"];
+  private readonly onCompletionGenerationForgotten: RecoveryCoordinatorOptions["onCompletionGenerationForgotten"];
   private readonly isExecuting: (runId: string) => boolean;
   private bootOwed: Awaited<ReturnType<NonNullable<RecoveryBundleProducer["discoverOwedCandidates"]>>> = [];
   private readonly terminalRecordProtection: RecoveryCoordinatorOptions["terminalRecordProtection"];
@@ -1155,6 +1161,8 @@ export class RecoveryCoordinator {
     }) : undefined;
     this.withInventorySourceBoundary = opts.withInventorySourceBoundary;
     this.withCompletionSourceBoundary = opts.withCompletionSourceBoundary;
+    this.onCompletionSourceForgotten = opts.onCompletionSourceForgotten;
+    this.onCompletionGenerationForgotten = opts.onCompletionGenerationForgotten;
     this.isExecuting = opts.isExecuting ?? (() => false);
     this.terminalRecordProtection = opts.terminalRecordProtection;
     this.pendingGenerationReport = opts.pendingGenerationReport;
@@ -4347,7 +4355,8 @@ export class RecoveryCoordinator {
         recoverySources, authority.completionReceipt!.final_head,
         () => residueQuarantine() === undefined && !isExecuting(runId) && !this.isExecuting(runId), "completion-check"));
       if (preflight !== "verified") return;
-      await this.withCompletionSourceBoundary!(source, async canDelete => {
+      let forgotten = false;
+      const boundary = await this.withCompletionSourceBoundary!(source, async canDelete => {
         const result = await ownedRecoveryIO(() => this.git.cleanupRecoveryGeneration!(bare, ctx, source.roots, pins,
           recoverySources, authority.completionReceipt!.final_head, canDelete, "completion"));
         if (result !== "removed") return;
@@ -4360,7 +4369,10 @@ export class RecoveryCoordinator {
         for (const record of selected) if (record.captureId !== authority.captureId) await unlink(this.recordPath(record));
         await unlink(this.recordPath(authority));
         await ownedRecoveryIO(() => fs.rmdir(this.runDir(runId))).catch(() => undefined);
+        forgotten = true;
       });
+      // A pass whose action returned early, or any partial failure, keeps provenance.
+      if (boundary === "passed" && forgotten) this.onCompletionSourceForgotten?.(source);
     });
     await this.submitRedundancyClaims(claims, budget);
   }
@@ -4451,6 +4463,9 @@ export class RecoveryCoordinator {
         .sort((a, b) => Number(!!a.finalAcknowledged) - Number(!!b.finalAcknowledged))) await unlink(this.recordPath(record));
       await unlink(this.recordPath(ack));
       await ownedRecoveryIO(() => fs.rmdir(this.runDir(runId))).catch(() => undefined);
+      const witness = this.completionCleanupWitnesses.get(`${runId}:${generation}`);
+      if (witness) witness.fullyForgotten = true;
+      this.onCompletionGenerationForgotten?.(runId, generation);
     });
     await this.submitRedundancyClaims(claims, budget);
   }
@@ -4554,6 +4569,36 @@ export class RecoveryCoordinator {
   async inspect(runId: string): Promise<RecoveryRecord[]> {
     if (!this.enabled) return [];
     return this.listRecords(runId);
+  }
+
+  // Only active runner binders retain this evidence; idle generations leave no tombstone.
+  private readonly completionCleanupWitnesses = new Map<string, { fullyForgotten: boolean; active: number }>();
+
+  registerCompletionCleanupWitness(runId: string, generation: number): {
+    fullyForgotten(): boolean; release(): void;
+  } {
+    const key = `${runId}:${generation}`;
+    let group = this.completionCleanupWitnesses.get(key);
+    if (!group) {
+      group = { fullyForgotten: false, active: 0 };
+      this.completionCleanupWitnesses.set(key, group);
+    }
+    group.active++;
+    const shared = group;
+    let released = false;
+    return {
+      fullyForgotten: () => !released && shared.fullyForgotten,
+      release: () => {
+        if (released) return;
+        released = true;
+        if (--shared.active === 0) this.completionCleanupWitnesses.delete(key);
+      },
+    };
+  }
+
+  private invalidateCompletionCleanupWitness(record: RecoveryRecord): void {
+    const group = this.completionCleanupWitnesses.get(`${record.runId}:${record.generation}`);
+    if (group) group.fullyForgotten = false;
   }
 
   async bindCompletionSource(source: CompletionSource): Promise<boolean> {
@@ -4873,6 +4918,7 @@ export class RecoveryCoordinator {
 
   /** Atomic rename with a fresh MAC (0600 file, 0700 dir). The caller holds this run's journal lock. */
   private async writeRecordUnlocked(record: RecoveryRecord): Promise<void> {
+    this.invalidateCompletionCleanupWitness(record);
     if (!this.key) throw new Error("recovery: MAC key unavailable");
     const mac = this.computeMac(record);
     const dir = this.runDir(record.runId);
@@ -4887,6 +4933,7 @@ export class RecoveryCoordinator {
    * The caller owns the journal lock and has durably indexed this immutable ID. */
   private async writeProducerOriginUnlocked(record: RecoveryRecord, check: () => void,
     fresh: () => Promise<void>): Promise<void> {
+    this.invalidateCompletionCleanupWitness(record);
     const sync = async (dir: string) => {
       check();
       const handle = await fs.open(dir, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
