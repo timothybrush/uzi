@@ -179,6 +179,7 @@ const PARK_LABELS = {
 // status pill. An unlisted status falls back to its de-underscored enum, never "".
 export function parkLabel(run: Parameters<typeof effectiveRunStatus>[0]): string {
   const eff = effectiveRunStatus(run);
+  if (isReserveHeldPause(run) && eff === "paused") return RESERVE_PAUSED_LABEL;
   return (PARK_LABELS as Record<string, string>)[eff] ?? eff.replace(/_/g, " ");
 }
 
@@ -466,6 +467,8 @@ export type HealthFlaggable = {
   deadline_at?: string | null;
   // Optional read-time queue projection; absent fields establish no admission hold.
   queue_reason?: QueueReason | null;
+  // PRD #3522: why the weekly usage reserve holds this queued run (queue_reason "weekly_reserve").
+  reserve_hold_reason?: string | null;
   codex_admission_class?: string | null;
   codex_admission_eligible_at?: string | null;
 };
@@ -527,6 +530,36 @@ export function maintenanceQueueText(reason?: string | null): string {
     : `waiting: uzi is in maintenance mode (${clean})`;
 }
 
+// PRD #3522: the weekly usage reserve. A queued run it holds back carries
+// queue_reason "weekly_reserve" plus the human reason in reserve_hold_reason; a run it parked
+// is `paused` with hold_reason "weekly_reserve" (auto-released when usage drops below the
+// threshold). Maintenance takes precedence over a reserve hold wherever both could apply.
+const WEEKLY_RESERVE_HOLD = "weekly_reserve";
+const RESERVE_PAUSED_LABEL = "paused: weekly usage reserve";
+
+// RESERVE_RESUME_CONFIRM is the exact confirmation shown before an owner resumes a run the
+// reserve parked: the resume records an override lasting until the next weekly reset.
+export const RESERVE_RESUME_CONFIRM = "Resuming overrides your weekly usage reserve until the next weekly reset";
+
+// isReserveQueued reports whether the weekly usage reserve (and not maintenance mode or a
+// missing worker) is why this queued run waits.
+export function isReserveQueued(run: { status: string; queue_reason?: QueueReason | null }): boolean {
+  return run.status === "queued" && run.queue_reason === WEEKLY_RESERVE_HOLD;
+}
+
+// isReserveHeldPause reports a `paused` run parked by the weekly usage reserve.
+export function isReserveHeldPause(run: { status: string; hold_reason?: string | null }): boolean {
+  return run.status === "paused" && run.hold_reason === WEEKLY_RESERVE_HOLD;
+}
+
+// reserveQueueText is the one sentence for a reserve-held queued run. The reason is
+// server-composed (it embeds usage figures) and reduced to one display cell; absent reads as
+// the plain name of the hold.
+export function reserveQueueText(reason?: string | null): string {
+  const clean = stripDisplayCell(reason).trim();
+  return `waiting: ${clean === "" ? "weekly usage reserve" : clean}`;
+}
+
 // healthSuffix is the trailing clause on a flagged run's pill. For the NEAR-TIMEOUT flag
 // ("slow", PRD #1170) it counts DOWN to the run's server-computed deadline — `· 1h 5m
 // left`, or `· stopping` once the deadline has passed (the sweeper runs on a ticker, so a
@@ -572,6 +605,12 @@ export function healthBadge(
       title: admission ? `${text} · ${admission}` : text,
       wrap: true,
     };
+  }
+  // PRD #3522: the weekly usage reserve holds this queued run on purpose too (maintenance
+  // already returned above). Same calm info pill; the text names the reserve, not a color.
+  if (isReserveQueued(run)) {
+    const text = reserveQueueText(run.reserve_hold_reason);
+    return { kind: "badge", label: text, tone: "info", pulse: false, title: text, wrap: true };
   }
   if (admission && !queuedBlockerPrecedesCodexAdmission(run)) {
     return { kind: "badge", label: admission, title: admission, tone: "info", pulse: false, wrap: true };
@@ -814,6 +853,18 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     // both surfaces (ui.test.tsx label-agreement loop). Unlike the two self-resuming
     // holds this resumes ONLY on demand, so the title says how, not "resumes on its own".
     case "paused":
+      // PRD #3522: parked by the weekly usage reserve. Releases itself when usage drops
+      // below the threshold (or the threshold is cleared); Resume overrides it until reset.
+      if (isReserveHeldPause(run)) {
+        return {
+          kind: "badge",
+          label: `‖ ${RESERVE_PAUSED_LABEL}`,
+          tone: "info",
+          pulse: false,
+          title:
+            "Held by your weekly usage reserve. It resumes automatically when usage drops below the threshold. Resuming now overrides the reserve until the next weekly reset.",
+        };
+      }
       return {
         kind: "badge",
         label: `‖ ${PARK_LABELS.paused}`,

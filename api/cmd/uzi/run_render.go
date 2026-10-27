@@ -172,6 +172,12 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	if reason := codexAdmissionLineAt(r, now); reason != "" {
 		rows = append(rows, []string{"CODEX_ADMISSION", reason})
 	}
+	// RESERVE (PRD #3522): the weekly usage reserve's visible reason on a queued run it holds
+	// ("weekly usage reserve: 72% >= 70%", or "... weekly usage unknown"), emit-only-when-set. The
+	// text is server-built from numbers, but it rides a persisted column, so it is sanitized.
+	if r.ReserveHoldReason != nil && *r.ReserveHoldReason != "" {
+		rows = append(rows, []string{"RESERVE", sanitizeTTY(*r.ReserveHoldReason)})
+	}
 	if r.FailureReason != nil && *r.FailureReason != "" {
 		rows = append(rows, []string{"FAILURE_REASON", sanitizeTTY(*r.FailureReason)})
 	}
@@ -540,6 +546,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 		clauses = append(clauses, credentialSwitchAction(r))
 	case holdBaseAttestation:
 		clauses = append(clauses, baseAttestationAction(r))
+	case holdWeeklyReserve:
+		clauses = append(clauses, weeklyReserveAction(r))
 	}
 	return []string{"HOLD", strings.Join(clauses, " · ")}
 }
@@ -562,9 +570,18 @@ func holdReasonLabel(reason string) string {
 		return "credential switch unsettled"
 	case holdBaseAttestation:
 		return "base not attested"
+	case holdWeeklyReserve:
+		return "weekly usage reserve"
 	default:
 		return cellText(reason)
 	}
+}
+
+// weeklyReserveAction is the owner's next step for a weekly_reserve hold (PRD #3522): the run resumes
+// by itself when usage falls below the threshold, and `uzi run resume` overrides the reserve until the
+// next weekly reset.
+func weeklyReserveAction(r apitypes.RunDTO) string {
+	return "resumes when usage drops below the threshold; override: uzi run resume " + cellText(r.ID)
 }
 
 // isBaseAttestationHold reports whether r is held because its kept work carries no
@@ -639,6 +656,8 @@ func pausedHoldNotice(r apitypes.RunDTO, origin ...string) string {
 		return "held, credential switch unsettled; " + credentialSwitchAction(r)
 	case holdBaseAttestation:
 		return "held, its kept work is not attested against the planned base (--require-base); " + baseAttestationAction(r)
+	case holdWeeklyReserve:
+		return "held by the weekly usage reserve; " + weeklyReserveAction(r)
 	default:
 		return "paused (" + holdReasonLabel(reason) + ")"
 	}
@@ -800,14 +819,20 @@ func pauseBoundaryClause(r apitypes.RunDTO) string {
 	if r.PauseMode != nil && *r.PauseMode == "now" {
 		return "now"
 	}
+	// PRD #3522: the weekly usage reserve files the same milestone-boundary request; name the cause so
+	// the owner does not read it as their own pause.
+	suffix := ""
+	if r.PauseMode != nil && *r.PauseMode == "reserve" {
+		suffix = " (weekly usage reserve)"
+	}
 	if len(r.Milestones) == 0 {
-		return "after the current step"
+		return "after the current step" + suffix
 	}
 	n := 1
 	if r.PauseAfterCount != nil {
 		n = *r.PauseAfterCount + 1
 	}
-	return fmt.Sprintf("after M%d", n)
+	return fmt.Sprintf("after M%d", n) + suffix
 }
 
 // joinSheddingClauses joins clauses with " · ", DROPPING trailing clauses (from the right)
@@ -2671,10 +2696,15 @@ func pauseOriginLabel(r apitypes.RunDTO, personal bool, origin ...string) string
 	return runpresentation.PauseLabel(value, personal)
 }
 
-// queueReasonCell spells out maintenance; unknown future values render sanitized.
+// queueReasonCell renders a run's queue_reason. The two reasons today are spelled out:
+// "maintenance" (PRD #3454) and "weekly_reserve" (PRD #3522, the exact figures are on the
+// RESERVE row beside it); an unknown future value still renders, sanitized.
 func queueReasonCell(reason string) string {
-	if reason == "maintenance" {
+	switch reason {
+	case "maintenance":
 		return "maintenance (uzi is in maintenance mode)"
+	case "weekly_reserve":
+		return "weekly_reserve (held by your weekly usage reserve)"
 	}
 	return sanitizeTTY(reason)
 }

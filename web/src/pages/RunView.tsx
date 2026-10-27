@@ -45,6 +45,10 @@ import {
   healthFlagLabel,
   isMaintenanceQueued,
   maintenanceQueueText,
+  isReserveQueued,
+  isReserveHeldPause,
+  reserveQueueText,
+  RESERVE_RESUME_CONFIRM,
   codexAdmissionText,
   displayHealthReason,
   queuedBlockerPrecedesCodexAdmission,
@@ -333,10 +337,13 @@ export function HealthFlag({ run }: { run: Run }) {
   // health flag (the detector may still say waiting_worker). A calm info line, no "stuck
   // for" clock: the wait is the admin's drain, not a fault.
   const maintenance = isMaintenanceQueued(run);
+  // PRD #3522: the weekly usage reserve is the same kind of deliberate wait (maintenance wins;
+  // the reserve outranks Codex account admission, as in the server's health ladder).
+  const reserve = !maintenance && isReserveQueued(run);
   const admission = codexAdmissionText(run, now);
-  const primaryAdmission = !maintenance && !queuedBlockerPrecedesCodexAdmission(run) ? admission : null;
+  const primaryAdmission = !maintenance && !reserve && !queuedBlockerPrecedesCodexAdmission(run) ? admission : null;
   const reason = displayHealthReason(run);
-  const show = !maintenance && !primaryAdmission && shouldShowHealthFlag(run.health, run.status);
+  const show = !maintenance && !reserve && !primaryAdmission && shouldShowHealthFlag(run.health, run.status);
   const since = run.health_since ? Date.parse(run.health_since) : NaN;
   // Near timeout ("slow", PRD #1170) counts DOWN to run.deadline_at instead of the
   // since-flagged "stuck for Xm" every other flag keeps: `· 1h 5m left`, or `· stopping`
@@ -359,9 +366,11 @@ export function HealthFlag({ run }: { run: Run }) {
   // the visible pill, which no screen reader is listening to.
   const announce = maintenance
     ? maintenanceQueueText(maintenanceReason)
-    : primaryAdmission ?? (show
-      ? (healthFlagLabel(run.health) ?? "")
-      : "");
+    : reserve
+      ? reserveQueueText(run.reserve_hold_reason)
+      : primaryAdmission ?? (show
+        ? (healthFlagLabel(run.health) ?? "")
+        : "");
   return (
     <>
       {primaryAdmission && (
@@ -374,6 +383,14 @@ export function HealthFlag({ run }: { run: Run }) {
           className="inline-flex items-center gap-1 rounded-full border border-info/40 bg-info/10 px-2 py-0.5 text-[11px] font-medium text-info"
         >
           {maintenanceQueueText(maintenanceReason)}
+        </span>
+      )}
+      {reserve && (
+        <span
+          data-queue-reason="weekly_reserve"
+          className="inline-flex items-center gap-1 rounded-full border border-info/40 bg-info/10 px-2 py-0.5 text-[11px] font-medium text-info"
+        >
+          {reserveQueueText(run.reserve_hold_reason)}
         </span>
       )}
       {show && (
@@ -811,12 +828,35 @@ const MAX_GUIDANCE_BYTES = 8192;
 // on a milestone-structured run (N = pause_after_count + 1, the milestone the request waits
 // to see complete); "· after the current step" on a milestone mode request against a run
 // with no frozen list (milestone mode then parks at the next turn boundary).
-function pauseRequestedLabel(run: Run): string {
+// PRD #3522: a "reserve" request is filed by the weekly usage reserve, not the owner, and
+// names itself ("· weekly usage reserve · after M<N>"), matching the CLI's suffix.
+export function pauseRequestedLabel(run: Run): string {
   if (run.pause_mode === "now") return "Pause requested · now";
+  const source = run.pause_mode === "reserve" ? " · weekly usage reserve" : "";
   const hasMilestones = milestoneBadge(run) != null;
-  if (!hasMilestones) return "Pause requested · after the current step";
+  if (!hasMilestones) return `Pause requested${source} · after the current step`;
   const n = (run.pause_after_count ?? 0) + 1;
-  return `Pause requested · after M${n}`;
+  return `Pause requested${source} · after M${n}`;
+}
+
+// confirmReserveResume gates an owner Resume of a run the weekly usage reserve parked: the
+// resume records an override until the next weekly reset, so the owner confirms first. Any
+// other run resumes without a prompt.
+function confirmReserveResume(run: Run): boolean {
+  return !isReserveHeldPause(run) || window.confirm(RESERVE_RESUME_CONFIRM);
+}
+
+// ReserveExemptLine states the owner's override of the weekly usage reserve while it lasts.
+export function ReserveExemptLine({ run }: { run: Run }) {
+  const until = run.reserve_exempt_until ? Date.parse(run.reserve_exempt_until) : NaN;
+  // The server never clears the stamp on a finished run, so the line is for live runs only.
+  if (isTerminalRun(run.status) || !Number.isFinite(until) || until <= Date.now()) return null;
+  return (
+    <span className="text-xs text-muted" data-reserve-exempt="true">
+      Weekly usage reserve overridden until{" "}
+      {new Date(until).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+    </span>
+  );
 }
 
 // checkpointLine renders the PausedPanel's "the checkpoint is safe" sentence from the
@@ -919,6 +959,12 @@ export function PausedPanel({
           <p className="mt-1.5 text-xs text-muted">
             Nothing runs and nothing is spent while it waits.
           </p>
+          {isReserveHeldPause(run) && (
+            <p className="mt-1.5 text-xs text-muted" data-hold-reason="weekly_reserve">
+              Held by your weekly usage reserve. It resumes automatically when usage drops below the
+              threshold. Resuming now overrides the reserve until the next weekly reset.
+            </p>
+          )}
           {/* PRD #1809 M6: checkpoint durability and the run's size on its worker. */}
           <RunParkDiskFacts run={run} />
           {/* Worker / re-planning mechanics live behind a disclosure so the panel stays
@@ -937,7 +983,7 @@ export function PausedPanel({
               who can, never a greyed button that 404s. */}
           {canSteer ? (
             <>
-              <Button size="sm" disabled={busy} onClick={onResume}>
+              <Button size="sm" disabled={busy} onClick={() => { if (confirmReserveResume(run)) onResume(); }}>
                 ▶ Resume
               </Button>
               {showExtend && onExtend && (
@@ -2467,12 +2513,13 @@ export function RunView() {
                   <Button
                     size="sm"
                     disabled={busy}
-                    onClick={() =>
-                      act(async (isCurrent) => {
+                    onClick={() => {
+                      if (!confirmReserveResume(run)) return;
+                      void act(async (isCurrent) => {
                         await api.resumeRun(run.id);
                         if (isCurrent()) await refreshRun();
-                      })
-                    }
+                      });
+                    }}
                   >
                     ▶ Resume
                   </Button>
@@ -2496,21 +2543,31 @@ export function RunView() {
               {run.pause_requested_at && (
                 <span className="inline-flex flex-wrap items-center gap-2">
                   <Badge tone="info">{pauseRequestedLabel(run)}</Badge>
+                  {run.pause_mode === "reserve" && (
+                    // PRD #3522: the reserve's request cannot be withdrawn (the server 409s a
+                    // cancel), so no Cancel pause is offered; say how to get out of it instead.
+                    <span className="text-xs text-muted" data-pause-source="weekly_reserve">
+                      Set by your weekly usage reserve. Resume the run after it parks, or change the
+                      threshold in Run defaults.
+                    </span>
+                  )}
                   {canSteer && run.status === "running" && (
                     <>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        disabled={busy}
-                        onClick={() =>
-                          act(async () => {
-                            await api.cancelPause(run.id);
-                            await refreshRun();
-                          })
-                        }
-                      >
-                        Cancel pause
-                      </Button>
+                      {run.pause_mode !== "reserve" && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          disabled={busy}
+                          onClick={() =>
+                            act(async () => {
+                              await api.cancelPause(run.id);
+                              await refreshRun();
+                            })
+                          }
+                        >
+                          Cancel pause
+                        </Button>
+                      )}
                       {run.pause_mode !== "now" && (
                         <Button
                           variant="secondary"
@@ -2530,6 +2587,7 @@ export function RunView() {
                   )}
                 </span>
               )}
+              <ReserveExemptLine run={run} />
               {run.auto_approve && (
                 <Badge tone="brand" title="Autopilot: started from the label, plan auto-approved">
                   autopilot
