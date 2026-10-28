@@ -12795,6 +12795,9 @@ export class RunRunner {
       } : {}),
       runId,
       claimGeneration: claim.claim_generation,
+      codexIdleStallRecovery: this.client.hasFeature("recovery_cause_codex_idle_stall_v1") &&
+        Number.isSafeInteger(claim.claim_generation) && (claim.claim_generation ?? 0) > 0 &&
+        this.client.stampsClaimGeneration(claim.claim_generation),
       ...(flight.workerMemory ? {
         capturedMemory: () => this.captureWorkerMemory(flight),
         // Issue #2471: the run's redaction secrets for the guarded command lane's output windows.
@@ -13056,7 +13059,7 @@ export class RunRunner {
         : {}),
       beforePlanRevisionTurn: (observer, remainingWallMs) => revisionRecovery?.beforeTurn(observer, remainingWallMs) ?? Promise.resolve(),
       retryPlanRevisionTurn: async (cause, observer, remainingWallMs) => {
-        if (!(cause instanceof TransientRecoveryError) || (!cause.providerOrigin && !cause.zeroEvidenceIdle) || !revisionRecovery) throw cause;
+        if (!(cause instanceof TransientRecoveryError) || (!cause.providerOrigin && cause.idleStallKind !== "zero_evidence") || !revisionRecovery) throw cause;
         return revisionRecovery.retry(cause, observer, remainingWallMs);
       },
       gatePlan: async (planMd, milestones, onPlanPersisted, settles, semanticSubmission) => {
@@ -18116,6 +18119,10 @@ export class RunRunner {
     // proof from the single pre-report reap (undefined = not attempted); `providerTypedSent` is set
     // once a typed body has gone out, so a lost ack can be reconciled against the ownership probe.
     const providerOrigin = cause.kind === "transient" && err instanceof TransientRecoveryError && err.providerOrigin;
+    // The executor marks only measured, negotiated ordinary idle. Do not recompute
+    // this obligation after capture: registration rollback must refuse, never downgrade.
+    const idleTyped = cause.kind === "transient" && err instanceof TransientRecoveryError &&
+      err.idleStallKind !== undefined;
     let providerReap: boolean | undefined;
     let providerTypedSent = false;
     const terminal = TERMINAL_RUN_STATUSES;
@@ -18395,7 +18402,7 @@ export class RunRunner {
             if (cancelReap) await this.settleRecoveryGeneration(claim, flight, runLog);
           }
           if (!terminal.has(status)) markParkKeep();
-          return status === "recovery_wait";
+          return !idleTyped && status === "recovery_wait";
         }
         if (flight.steering.isCancelled()) {
           this.observeCancellation(flight);
@@ -18680,7 +18687,9 @@ export class RunRunner {
         }
         try {
           const parkBody: StateRequest = {
-            ...(providerTyped
+            ...(idleTyped
+              ? { status: "recovery_wait", recovery_cause: "codex_idle_stall", provider_progress_turns: flight.productiveTurns ?? 0 }
+              : providerTyped
               ? { status: "recovery_wait", recovery_cause: "provider_outage", productive_turns: flight.productiveTurns ?? 0 }
               : cause.kind === "vault_locked" && this.client.protocolFeatures.includes("recovery_cause_vault_locked")
               ? { status: "recovery_wait", recovery_cause: "vault_locked" }
@@ -18689,7 +18698,7 @@ export class RunRunner {
                 : !credentialDeferred && disk
                 ? this.diskParkBody(claim, disk.preventive)
                 : { status: "recovery_wait" }),
-            ...(!providerOrigin && !credentialDeferred && (cause.kind === "transient" || disk) &&
+            ...(!idleTyped && !providerOrigin && !credentialDeferred && (cause.kind === "transient" || disk) &&
               (flight.productiveTurns ?? 0) > 0 &&
               this.client.protocolFeatures.includes("provider_progress_on_recovery_park_v1") &&
               (claim.claim_generation ?? 0) > 0 && this.client.stampsClaimGeneration(claim.claim_generation)
@@ -18710,7 +18719,8 @@ export class RunRunner {
           // ACK before a scoped expiry can interrupt disposition; the joined continuation
           // consumes this evidence without another POST or source settlement.
           const ack = await report(parkBody, captureSignal);
-          if (progress && (ack.status === "recovery_wait" ||
+          const idleAccepted = ack.status === "recovery_wait" && ack.recoveryCause === "codex_idle_stall";
+          if (progress && ((!idleTyped && ack.status === "recovery_wait") || (idleTyped && idleAccepted) ||
               (providerTyped && ack.status === "paused" && ack.holdReason === PROVIDER_HOLD_REASON)))
             progress.parkAcknowledged = true;
           captureSignal?.throwIfAborted();
@@ -18762,7 +18772,7 @@ export class RunRunner {
             markParkKeep();
             return true;
           }
-          if (ack.status === "recovery_wait") {
+          if (ack.status === "recovery_wait" && (!idleTyped || idleAccepted)) {
             if (opts.freeFallback && !credentialDeferred) {
               markParkKeep();
               runLog.info("run parked after capture boundary refusal; source and custody retained");
@@ -18786,12 +18796,19 @@ export class RunRunner {
               return true;
             }
             markParkKeep();
-            runLog.info("run parked for transient recovery", { detail: err.message });
+            const idleHeld = idleTyped && ack.recoveryRetryNotBefore === undefined;
+            const idleOpening = err instanceof TransientRecoveryError && err.idleStallKind === "zero_evidence" ? "provider sent no model output" : "model output stalled";
+            const idleCheckpoint = capture.published ? "published" : "saved on this worker";
+            runLog.info(idleHeld ? "run held for Codex idle recovery" : "run parked for transient recovery", { detail: err.message });
             batcher.emit({
               kind: "status",
               agent: "worker",
               payload: {
-                text: capture.published
+                text: idleTyped
+                  ? idleHeld
+                    ? `paused after ${idleOpening}; the recovery checkpoint is ${idleCheckpoint} and the run waits for its owner to resume it`
+                    : `paused after ${idleOpening}; the recovery checkpoint is ${idleCheckpoint} and it resumes automatically`
+                  : capture.published
                   ? "paused to recover from a transient interruption; the recovery checkpoint is published and it resumes automatically"
                   : "paused to recover from a transient interruption; the recovery checkpoint is saved on this worker and it resumes automatically",
               },
@@ -18813,7 +18830,7 @@ export class RunRunner {
             }
             return true;
           }
-          if (ack.status && ack.status !== "running") {
+          if (ack.status && ack.status !== "running" && !(idleTyped && ack.status === "recovery_wait")) {
             if (terminal.has(ack.status)) {
               markReleaseEligible("recovery_park_ack_terminal");
               flight.preserveSession = false;

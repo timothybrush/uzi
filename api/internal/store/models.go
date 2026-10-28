@@ -1144,6 +1144,7 @@ type Run struct {
 	ReserveExemptPriorPct       pgtype.Int2        `json:"reserve_exempt_prior_pct"`
 	HintedCapabilities          []string           `json:"hinted_capabilities"`
 	CapabilityInferenceEvidence []byte             `json:"capability_inference_evidence"`
+	IdleStallParkCount          int32              `json:"idle_stall_park_count"`
 }
 
 type RunCompletionAttempt struct {
