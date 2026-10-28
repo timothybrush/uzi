@@ -82,9 +82,10 @@ it.
 ### Vault
 
 - `uzi vault` — show vault command help.
-- `uzi vault status` — report `locked` or `unlocked` for the active user;
-  `--json` returns only `{"unlocked":false}` or `{"unlocked":true}`.
-  Status output remains visible with `--quiet`.
+- `uzi vault status` — report `locked` or `unlocked` for the active user,
+  or `off` for an unprotected user when the server supports optional vaults.
+  `--json` includes `unlocked` and the server-provided `mode` when available.
+  Missing mode preserves older-server behavior. Output remains visible with `--quiet`.
 - `uzi vault unlock` — ask the owner to run this when their vault is locked.
   It prompts on stderr without echo for their login password or OIDC vault
   passphrase. Never solicit, read, or handle the owner's password or passphrase
