@@ -1,3 +1,4 @@
+import { terminalSealMaterial } from "../src/codex/executor-lifetime.js";
 import { summaryOwnership } from "../src/codex/summary-ownership.js";
 import { provisionNative } from "./codex-provision-fixture.js";
 import { provisionRunTools } from "../src/provision-run.js";
@@ -26178,5 +26179,301 @@ describe("issue3472 M1 Codex repository instruction snapshot", () => {
       assert.ok(childInstructions.includes(CODEX_REPO_INSTRUCTIONS_APPEND));
       assert.ok(childInput.includes("Do the child work"));
     });
+  });
+});
+
+
+describe("3404 terminal executor lifetime", () => {
+  const done = epochResponder("th-1", "tn-1", t => { t.push(signalDone()).push(turnCompleted()); });
+  function barrier() {
+    let resolve!: () => void;
+    const promise = new Promise<void>(r => { resolve = r; });
+    return { promise, resolve };
+  }
+
+  it("3404 seals a real completed provider/provision incarnation and rejects runtime fakes and foreign seals", async () => {
+    const rig = makeRig({ responder: done });
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    const { ctx } = makeCtx();
+    await executor.run(ctx);
+    assert.ok(rig.providerLaunches() > 0);
+    assert.ok(rig.disposed() > 0);
+    const source = Object.freeze({ runId: ctx.runId });
+    const result = await executor.sealLifetime(source);
+    assert.equal(result.kind, "sealed");
+    if (result.kind !== "sealed") return;
+    assert.equal(executor.acceptsLifetimeSeal(result.seal, source), true);
+    assert.equal(executor.acceptsLifetimeSeal({}, source), false);
+    assert.equal(executor.acceptsLifetimeSeal(JSON.parse(JSON.stringify(result.seal)), source), false);
+    assert.equal(executor.acceptsLifetimeSeal(result.seal, { runId: ctx.runId }), false);
+    const material = terminalSealMaterial(result.seal)!;
+    assert.equal(material.sourceUse, source);
+    assert.ok(material.incarnations.length >= 2, "provision and provider registries are both inventoried");
+    assert.equal(new Set(material.incarnations.map(entry => entry.registry)).size, material.incarnations.length);
+    const foreign = makeExecutor(makeRig(), bindingOf(API_KEY));
+    assert.equal(foreign.acceptsLifetimeSeal(result.seal, source), false);
+    const launches = rig.providerLaunches(), credentials = rig.client.releaseCalls.length;
+    await assert.rejects(executor.run(ctx), /lifetime closed/);
+    await assert.rejects(executor.withCredentialFreeCapture(100, async () => {}), /lifetime closed/);
+    await assert.rejects(executor.settleForCredentialFreeCapture(100), /lifetime closed/);
+    assert.equal(rig.providerLaunches(), launches);
+    assert.equal(rig.client.releaseCalls.length, credentials);
+    assert.equal((await executor.sealLifetime(source)), result);
+  });
+
+  it("3404 closes synchronously and joins a retained progress observer without failing the completed run", async () => {
+    const entered = barrier(), release = barrier();
+    const responder = epochResponder("th-1", "tn-1", t => {
+      t.push(toolCall(11, "report_progress", { in_progress: ["m1"] }, "th-1", "tn-1", "c-p1"))
+        .push(signalDone()).push(turnCompleted());
+    });
+    const rig = makeRig({ responder });
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    const { ctx } = makeCtx({ frozenMilestones: [{ id: "m1", title: "one" }],
+      reportProgress: async () => { entered.resolve(); await release.promise; } });
+    const result = await executor.run(ctx);
+    await entered.promise;
+    let sealed = false;
+    const sealing = executor.sealLifetime({}).then(value => { sealed = true; return value; });
+    try {
+      await assert.rejects(executor.run(ctx), /lifetime closed/);
+      await tick();
+      assert.equal(sealed, false, "the discarded reportProgress tail is owned by the lifetime");
+      release.resolve();
+      assert.equal((await sealing).kind, "sealed");
+      assert.equal(result.branch, ctx.branch);
+    } finally { release.resolve(); await sealing; }
+  });
+
+  for (const failure of ["reap", "dispose", "fileop"] as const) {
+    it(`3404 ${failure} cleanup uncertainty never seals or retries model work`, async () => {
+      const rig = makeRig({ responder: done });
+      if (failure === "reap") rig.root.reap = async () => ({ ok: false, error: { category: "tool", message: "no ECHILD" } });
+      if (failure === "dispose") rig.root.dispose = async () => { throw new Error("cleanup unconfirmed"); };
+      if (failure === "fileop") rig.deps = { ...rig.deps, wireFileop: () => ({ client: { op: async () => ({ ok: true }) },
+        dispose: async () => { throw new Error("fileop closure failed"); } }) };
+      const executor = makeExecutor(rig, bindingOf(API_KEY));
+      const { ctx } = makeCtx();
+      const completed = await executor.run(ctx);
+      const launches = rig.providerLaunches();
+      assert.equal((await executor.sealLifetime({})).kind, "unproven");
+      assert.equal(completed.branch, ctx.branch);
+      assert.equal(rig.providerLaunches(), launches);
+      assert.equal((await executor.sealLifetime({})).kind, "unproven", "permanently unproven, never re-sealed");
+    });
+  }
+
+  it("3404 a delayed provider factory is joined by the seal and a late run is refused before it", async () => {
+    const entered = barrier(), release = barrier();
+    const rig = makeRig({ responder: done });
+    const launch = rig.deps.launchProviderRoot!;
+    let factoryCalls = 0;
+    rig.deps = { ...rig.deps, launchProviderRoot: async (...args) => {
+      factoryCalls++; entered.resolve(); await release.promise; return launch(...args);
+    } };
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    const running = executor.run(makeCtx().ctx).catch(() => undefined);
+    await entered.promise;
+    let settled = false;
+    const sealing = executor.sealLifetime({}).then(value => { settled = true; return value; });
+    try {
+      await tick();
+      assert.equal(settled, false, "the in-flight factory call is an owned producer");
+      release.resolve();
+      await running;
+      assert.equal((await sealing).kind, "unproven", "sealed while a run was active");
+      assert.equal((await executor.sealLifetime({})).kind, "unproven");
+      assert.equal(factoryCalls, 1, "closure after the factory call started never started another");
+    } finally { release.resolve(); await running; await sealing; }
+  });
+
+  it("3404 delayed cache removal keeps original settlement in the lifetime after pending delivery", async () => {
+    const raw = barrier();
+    const rig = makeRig({ responder: done });
+    rig.deps = { ...rig.deps,
+      startCacheHolder: async token => ({ token, path: "/cache", alive: () => false,
+        release: async () => ({ state: "error", reason: "unused" }) }),
+      removeCommandCache: async () => ({ state: "pending", reason: "",
+        settlement: raw.promise.then(() => ({ state: "removed", reason: "" })) }),
+    };
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    await executor.run(makeCtx().ctx);
+    let settled = false;
+    const sealing = executor.sealLifetime({}).then(value => { settled = true; return value; });
+    try {
+      await tick(); assert.equal(settled, false);
+      raw.resolve(); assert.equal((await sealing).kind, "sealed");
+    } finally { raw.resolve(); await sealing; }
+  });
+
+  it("3404 a cache removal that settles unclean, or that only reports a bounded pending answer, never seals", async () => {
+    for (const mode of ["unsettled-answer", "retained"] as const) {
+      const rig = makeRig({ responder: done });
+      rig.deps = { ...rig.deps,
+        startCacheHolder: async token => ({ token, path: "/cache", alive: () => false,
+          release: async () => ({ state: "error", reason: "unused" }) }),
+        removeCommandCache: async () => mode === "retained"
+          ? { state: "pending", reason: "", settlement: Promise.resolve({ state: "retained", reason: "busy" }) }
+          : { state: "pending", reason: "" },
+      };
+      const executor = makeExecutor(rig, bindingOf(API_KEY));
+      await executor.run(makeCtx().ctx);
+      assert.equal((await executor.sealLifetime({})).kind, "unproven", mode);
+    }
+  });
+
+  for (const sealed of [false, true]) {
+    it(`3404 owner abort mid-turn still cancels and interrupts after a lifetime seal (${sealed ? "sealed" : "control"})`, async () => {
+      const controller = new AbortController();
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") return { turn: { id: "tn-1" } };
+        return {};
+      } });
+      rig.transport.push(threadStarted());
+      const executor = makeExecutor(rig, bindingOf(API_KEY));
+      const running = executor.run(makeCtx({ signal: controller.signal }).ctx);
+      await waitFor(() => rig.transport.requests.some(r => r.method === "turn/start"), "turn started");
+      let sealing: Promise<{ kind: string }> | undefined;
+      if (sealed) sealing = executor.sealLifetime({});
+      controller.abort();
+      await assert.rejects(withTimeout(running, 3000, "cancel after seal"), /run cancelled/);
+      assert.ok(rig.transport.requests.some(r => r.method === "turn/interrupt"), "the stop request was delivered");
+      if (sealing) assert.equal((await sealing).kind, "unproven", "a run that was active at seal time stays unproven");
+    });
+  }
+
+  it("3404 a seal is refused while any epoch registry is still unverified", async () => {
+    const rig = makeRig({ responder: done });
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    await executor.run(makeCtx().ctx);
+    (executor as unknown as { unverifiedEpochRegistries: Set<object> }).unverifiedEpochRegistries.add({});
+    assert.equal((await executor.sealLifetime({})).kind, "unproven");
+  });
+
+  it("3404 after a seal a retained refresh bridge is refused before the real refresh", async () => {
+    const rig = makeRig({ responder: done });
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    await executor.run(makeCtx().ctx);
+    assert.equal((await executor.sealLifetime({})).kind, "sealed");
+    const internals = executor as unknown as {
+      lifetimeBoundRefreshBridge(bridge: { refresh(request: unknown): Promise<unknown> }): { refresh(request: unknown): Promise<unknown> };
+    };
+    let refreshed = 0;
+    const bridge = internals.lifetimeBoundRefreshBridge({ refresh: async () => { refreshed++; return {}; } });
+    await assert.rejects(bridge.refresh({}), /lifetime closed/);
+    assert.equal(refreshed, 0, "refused before the underlying bridge.refresh");
+  });
+
+  describe("deferred final registry (deferRegistryTeardown)", () => {
+    type DeferredInternals = {
+      unverifiedEpochRegistries: Set<{ poison(error: unknown): void }>;
+      deferredFinal?: { registry: { poison(error: unknown): void } };
+    };
+    async function sinkThenDispose(executor: CodexExecutor) {
+      // The runner's durability sinks reap the provider root through a boundary before the dispose.
+      await executor.safety!.withBoundary({ boundary: "finalize", deadlineMs: 2000 }, async () => {});
+      return executor.safety!.dispose({ boundary: "terminal", deadlineMs: 2000 });
+    }
+    async function deferredRun(mutate?: (rig: ReturnType<typeof makeRig>) => void) {
+      const rig = makeRig({ responder: done });
+      rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+      mutate?.(rig);
+      const executor = makeExecutor(rig, bindingOf(API_KEY));
+      const { ctx } = makeCtx();
+      await executor.run(ctx);
+      return { rig, executor, source: Object.freeze({ runId: ctx.runId }) };
+    }
+
+    it("3404 seals after the runner's terminal safety.dispose proved the deferred final registry", async () => {
+      const { executor, source } = await deferredRun();
+      const disposal = await sinkThenDispose(executor);
+      assert.equal(disposal.kind, "disposed");
+      const result = await executor.sealLifetime(source);
+      assert.equal(result.kind, "sealed");
+      if (result.kind === "sealed") assert.equal(executor.acceptsLifetimeSeal(result.seal, source), true);
+    });
+
+    it("3404 a deferred final registry is unproven before the terminal dispose", async () => {
+      const { executor, source } = await deferredRun();
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 a rejected terminal dispose leaves the deferred final registry unproven", async () => {
+      const { executor, source } = await deferredRun(rig => {
+        rig.root.dispose = async () => { throw new Error("cleanup unconfirmed"); };
+      });
+      await sinkThenDispose(executor).catch(() => undefined);
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 a throwing terminal hook (installer cleanup proof unavailable) is incomplete and leaves the seal unproven", async () => {
+      // An exhausted terminal deadline: the hook's installState.settle cannot prove the installer
+      // cleanup inside it and throws "installer cleanup proof unavailable".
+      const { executor, source } = await deferredRun();
+      await executor.safety!.withBoundary({ boundary: "finalize", deadlineMs: 2000 }, async () => {});
+      const disposal = await executor.safety!.dispose({ boundary: "terminal", deadlineMs: 0 });
+      assert.equal(disposal.kind, "incomplete");
+      assert.ok(disposal.kind === "incomplete" &&
+        disposal.errors.some(error => /terminal cleanup hook failed/.test(error.message)));
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 a disposal that bypasses safety.dispose and its hook leaves the seal unproven", async () => {
+      const { executor, source } = await deferredRun();
+      await executor.safety!.withBoundary({ boundary: "finalize", deadlineMs: 2000 }, async () => {});
+      const registry = (executor as unknown as DeferredInternals).deferredFinal!.registry as unknown as
+        { disposeTools(deadlineMs: number): Promise<{ kind: string }> };
+      assert.equal((await registry.disposeTools(2000)).kind, "disposed");
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 a seal retires only the final registry bookkeeping and repeats identically", async () => {
+      const { executor, source } = await deferredRun();
+      await sinkThenDispose(executor);
+      const internals = executor as unknown as DeferredInternals;
+      const registry = internals.deferredFinal!.registry;
+      assert.equal(internals.unverifiedEpochRegistries.has(registry), true);
+      const first = await executor.sealLifetime(source);
+      assert.equal(first.kind, "sealed");
+      assert.equal(internals.unverifiedEpochRegistries.has(registry), false);
+      assert.equal(await executor.sealLifetime(source), first);
+    });
+
+    it("3404 an unsettled command-cache removal leaves the deferred final registry unproven", async () => {
+      const { executor, source } = await deferredRun(rig => {
+        rig.deps = { ...rig.deps,
+          startCacheHolder: async token => ({ token, path: "/cache", alive: () => false,
+            release: async () => ({ state: "error", reason: "unused" }) }),
+          removeCommandCache: async () => ({ state: "pending", reason: "",
+            settlement: Promise.resolve({ state: "retained", reason: "busy" }) }),
+        };
+      });
+      await sinkThenDispose(executor).catch(() => undefined);
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 poisoning the registry after an accepted terminal dispose revokes the proof", async () => {
+      const { executor, source } = await deferredRun();
+      const disposal = await sinkThenDispose(executor);
+      assert.equal(disposal.kind, "disposed");
+      const registry = (executor as unknown as DeferredInternals).deferredFinal!.registry;
+      registry.poison({ category: "tool", message: "late poison" });
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 an unverified prior-epoch registry keeps the deferred final seal unproven", async () => {
+      const { executor, source } = await deferredRun();
+      await sinkThenDispose(executor);
+      (executor as unknown as DeferredInternals).unverifiedEpochRegistries.add({ poison() {} });
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+  });
+
+  it("3404 structural source strings confer no authority", async () => {
+    const rig = makeRig({ responder: done });
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    await executor.run(makeCtx().ctx);
+    assert.equal((await executor.sealLifetime("run-1" as never)).kind, "unproven");
   });
 });
