@@ -1505,6 +1505,53 @@ describe("CodexHarness: resumed usage evidence", () => {
       });
     }
 
+    it(`${authMode}: M2 final false guard repeats preparation before a single send`, async () => {
+      let preparations = 0, checks = 0;
+      const { harness, transport } = makeHarness({ authMode });
+      transport.push(threadStarted()).push(turnCompleted("completed")).end();
+      try {
+        await collect(harness.startTurn(makeRequest({ rootDispatch: {
+          prepare: async () => {
+            preparations++;
+            assert.equal(transport.requests.filter(r => r.method === "turn/start").length, 0);
+          },
+          check: () => { checks++; return checks > 1; },
+        } })).events);
+        assert.equal(preparations, 2);
+        assert.equal(checks, 2);
+        assert.equal(transport.requests.filter(r => r.method === "turn/start").length, 1);
+      } finally { await harness.close(); }
+    });
+
+    it(`${authMode}: M2 resumed admission abort does not fabricate incomplete usage`, async () => {
+      const accountant = new CodexUsageAccountant();
+      const controller = new AbortController();
+      const entered = deferred<void>();
+      let notices = 0;
+      const { harness, transport } = makeHarness({ authMode, accountant,
+        onTokenUsageIncomplete: () => { notices++; } });
+      const running = collect(harness.startTurn(makeRequest({
+        resumeSessionId: "resumed-1", signal: controller.signal,
+        rootDispatch: {
+          prepare: async () => {
+            entered.resolve();
+            await new Promise<never>((_, reject) => controller.signal.addEventListener("abort",
+              () => reject(controller.signal.reason), { once: true }));
+          },
+          check: () => controller.signal.throwIfAborted(),
+        },
+      })).events);
+      try {
+        await withTimeout(entered.promise, 2000, "resumed admission entered");
+        controller.abort(new Error("M2 admission cancelled"));
+        await assert.rejects(running, /M2 admission cancelled/);
+        assert.equal(transport.requests.some(r => r.method === "thread/resume"), true);
+        assert.equal(transport.requests.some(r => r.method === "turn/start"), false);
+        assert.equal(accountant.usageIncomplete, false);
+        assert.equal(notices, 0);
+      } finally { controller.abort(); await harness.close(); }
+    });
+
     for (const stopKind of ["abort", "stop"] as const) {
       it(`${authMode}: ${stopKind} after thread resume prevents sending turn/start`, async () => {
         const accountant = new CodexUsageAccountant();
