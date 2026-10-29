@@ -1525,6 +1525,14 @@ export class BareCacheShallowError extends Error {
   }
 }
 
+/** A bounded graph is too large to classify, never an operational read failure. */
+class MarkerWrapperGraphLimitError extends Error {}
+
+/** A frozen reused source cannot be reconstructed by wrapping a different object. */
+export class RecoveryCoverageReuseRefused extends Error {
+  constructor() { super("recovery coverage reuse proof unavailable"); }
+}
+
 /** A supervised retained-readiness effect has no positive cleanup proof. */
 export class RetainedReadinessCleanupUnconfirmedError extends Error {
   constructor() { super("retained_readiness_cleanup"); }
@@ -7836,37 +7844,16 @@ export class GitCache {
     });
   }
 
-  /**
-   * issue #3239: decide what a retained-recovery successor may adopt when the episode restore tip is a
-   * recovery-coverage wrapper that may carry a `wip(park):` marker. Returns undefined for the
-   * unchanged shapes (the tip itself is a marker, or neither the source nor any wrapper leaf is one),
-   * which keep the plain adoption of the tip. Otherwise the wrapper must be provably the worker's own
-   * coverage of the journaled source, and the successor adopts the SOURCE (a marker is then peeled by
-   * the seed's `reset --soft`, so neither marker nor wrapper enters history); any failed proof throws
-   * `successor recovery verification failed`, before a ledger entry or clone exists.
-   *
-   * Fail closed: once the tip is a coverage commit (or the source is a marker), any inability to verify
-   * refuses: an unreadable tip, more than 8 aggregates, or more than MAX_OWED_CANDIDATES_PER_RUN + 2
-   * leaves, or ANY failed read. Only a non-tip commit for which {@link readBoundedCommit} RETURNS
-   * undefined (over 64 KiB, or a body that does not survive the UTF-8 round trip) is demoted to a leaf
-   * and meets the leaf rule, which classifies it by subject and never needs that read; a demoted leaf
-   * whose subject is a coverage subject is refused (genuine aggregates are small ASCII). A read that
-   * THROWS (timeout, git failure, missing object) refuses, as does a failed subject read of the tip,
-   * the source or a leaf: a transient error never classifies a commit as a non-marker. The source and
-   * a marker leaf are compared by plumbing for the same reason.
-   *
-   * The caller holds the bare lock: this helper must never take it (the lock is not reentrant), which is
-   * why it reads aggregates through {@link readBoundedCommit} and not {@link readRecoveryCoverageClaim}.
-   */
-  private async resolveMarkerWrapperAdoption(
-    barePath: string, journal: RecoveryJournalEntry, tip: string, src: string | undefined,
-  ): Promise<{ seedTip: string; expectedHead: string; expectedTree: string; peeledMarkers: string[] } | undefined> {
+  /** Bounded, read-only shape classification under the caller's bare lock.
+   * Shared with clean-source reuse; its marker-free result grants no provenance. */
+  private async readMarkerWrapperGraph(barePath: string, tip: string, src: string | undefined) {
     // The producer's parent set is the owed roots (at most MAX_OWED_CANDIDATES_PER_RUN), the original
     // source (freezeInventory appends it to the roots) and the current source (buildRecoveryCoverage
     // adds it), and the two extras can be distinct.
     const MAX_LEAVES = MAX_OWED_CANDIDATES_PER_RUN + 2, MAX_AGGREGATES = 8, MAX_OBJECT_BYTES = 64 * 1024;
-    const fail = (reason?: string): never => {
-      const error = new Error("successor recovery verification failed");
+    const fail = (reason?: string, limit = false): never => {
+      const error = limit ? new MarkerWrapperGraphLimitError("successor recovery verification failed")
+        : new Error("successor recovery verification failed");
       if (reason !== undefined) annotateRetainedSuccessorError(error, reason);
       throw error;
     };
@@ -7899,7 +7886,7 @@ export class GitCache {
       const sha = queue.shift()!;
       if (seen.has(sha)) continue;
       seen.add(sha);
-      if (seen.size > MAX_AGGREGATES + MAX_LEAVES) return fail("wrapper_walk_bound");
+      if (seen.size > MAX_AGGREGATES + MAX_LEAVES) return fail("wrapper_walk_bound", true);
       let commit;
       try { commit = await this.readBoundedCommit(barePath, sha, MAX_OBJECT_BYTES); } catch (err) {
         const abort = this.boundaryAbortError(err);
@@ -7907,8 +7894,8 @@ export class GitCache {
         return fail(err instanceof Error ? "wrapper_commit_read" : undefined);
       }
       if (!commit) {
-        if (sha === tip) return fail("wrapper_tip_bound");
-        if ((await subjectOf(sha, "wrapper_leaf_subject")).startsWith("uzi recovery coverage ")) return fail("wrapper_coverage_leaf_bound");
+        if (sha === tip) return fail("wrapper_tip_bound", true);
+        if ((await subjectOf(sha, "wrapper_leaf_subject")).startsWith("uzi recovery coverage ")) return fail("wrapper_coverage_leaf_bound", true);
         leaves.add(sha);
         continue;
       }
@@ -7919,7 +7906,7 @@ export class GitCache {
         // marker involvement refuses below (defence in depth: the fingerprint/pin checks would too).
         if (commit.message.startsWith("uzi recovery coverage ")) {
           lookalike = true;
-          if (++lookalikes > MAX_AGGREGATES) return fail("wrapper_lookalike_bound");
+          if (++lookalikes > MAX_AGGREGATES) return fail("wrapper_lookalike_bound", true);
           queue.push(...commit.parents);
           continue;
         }
@@ -7927,12 +7914,43 @@ export class GitCache {
         continue;
       }
       aggregates.push({ fp: m[1]!, tree: commit.tree, author: commit.author, committer: commit.committer });
-      if (aggregates.length > MAX_AGGREGATES) return fail("wrapper_aggregate_bound");
+      if (aggregates.length > MAX_AGGREGATES) return fail("wrapper_aggregate_bound", true);
       queue.push(...commit.parents);
     }
-    if (leaves.size > MAX_LEAVES) return fail("wrapper_leaf_bound");
+    if (leaves.size > MAX_LEAVES) return fail("wrapper_leaf_bound", true);
     const markerLeaves = new Set<string>();
     for (const leaf of leaves) if ((await subjectOf(leaf, "wrapper_leaf_subject")).startsWith(WIP_PARK_COMMIT_PREFIX)) markerLeaves.add(leaf);
+    return { aggregates, leaves, markerLeaves, srcMarker, lookalike, fail };
+  }
+
+  /**
+   * issue #3239: decide what a retained-recovery successor may adopt when the episode restore tip is a
+   * recovery-coverage wrapper that may carry a `wip(park):` marker. Returns undefined for the
+   * unchanged shapes (the tip itself is a marker, or neither the source nor any wrapper leaf is one),
+   * which keep the plain adoption of the tip. Otherwise the wrapper must be provably the worker's own
+   * coverage of the journaled source, and the successor adopts the SOURCE (a marker is then peeled by
+   * the seed's `reset --soft`, so neither marker nor wrapper enters history); any failed proof throws
+   * `successor recovery verification failed`, before a ledger entry or clone exists.
+   *
+   * Fail closed: once the tip is a coverage commit (or the source is a marker), any inability to verify
+   * refuses: an unreadable tip, more than 8 aggregates, or more than MAX_OWED_CANDIDATES_PER_RUN + 2
+   * leaves, or ANY failed read. Only a non-tip commit for which {@link readBoundedCommit} RETURNS
+   * undefined (over 64 KiB, or a body that does not survive the UTF-8 round trip) is demoted to a leaf
+   * and meets the leaf rule, which classifies it by subject and never needs that read; a demoted leaf
+   * whose subject is a coverage subject is refused (genuine aggregates are small ASCII). A read that
+   * THROWS (timeout, git failure, missing object) refuses, as does a failed subject read of the tip,
+   * the source or a leaf: a transient error never classifies a commit as a non-marker. The source and
+   * a marker leaf are compared by plumbing for the same reason.
+   *
+   * The caller holds the bare lock: this helper must never take it (the lock is not reentrant), which is
+   * why it reads aggregates through {@link readBoundedCommit} and not {@link readRecoveryCoverageClaim}.
+   */
+  private async resolveMarkerWrapperAdoption(
+    barePath: string, journal: RecoveryJournalEntry, tip: string, src: string | undefined,
+  ): Promise<{ seedTip: string; expectedHead: string; expectedTree: string; peeledMarkers: string[] } | undefined> {
+    const graph = await this.readMarkerWrapperGraph(barePath, tip, src);
+    if (!graph) return undefined;
+    const { aggregates, leaves, markerLeaves, srcMarker, lookalike, fail } = graph;
     if (!srcMarker && markerLeaves.size === 0) return undefined;
     if (lookalike) return fail("wrapper_lookalike");
 
@@ -19168,11 +19186,28 @@ try {
     });
   }
 
-  /** Recovery-only aggregate, never a tracking/checkpoint/publication ref.
-   * Parent batches have at most 32 roots; every round reduces the count, with no retries.
-   * A failed construction/proof stops the aggregate, retaining all original owed pins. */
+  /** Coverage shape is not provenance. Only the resolver's bounded marker-free
+   * branch is pin-independent, so marker involvement must keep legacy wrapping. */
+  private async reusableRecoveryCoverage(barePath: string, currentSha: string, tree: string): Promise<boolean> {
+    const commit = await this.readBoundedCommit(barePath, currentSha, 64 * 1024);
+    const identity = (kind: string) => `${kind} ${AGENT_GIT_IDENTITY.name} <${AGENT_GIT_IDENTITY.email}> 946684800 +0000`;
+    if (!commit || commit.tree !== tree ||
+        !/^uzi recovery coverage [0-9a-f]{64} round (0|[1-9][0-9]*) batch (0|[1-9][0-9]*)\n$/.test(commit.message) ||
+        commit.author !== identity("author") || commit.committer !== identity("committer")) return false;
+    try {
+      const graph = await this.readMarkerWrapperGraph(barePath, currentSha, undefined);
+      return graph !== undefined && !graph.srcMarker && graph.markerLeaves.size === 0;
+    } catch (error) {
+      if (error instanceof MarkerWrapperGraphLimitError) return false;
+      throw error;
+    }
+  }
+
+  /** Recovery-only coverage source, never a tracking/checkpoint/publication ref.
+   * New inventories may reuse a covered marker-free aggregate; legacy reconstruction
+   * keeps its exact synthetic object. Failed proofs retain all original owed pins. */
   async buildRecoveryCoverage(barePath: string, context: PositiveOwedCandidateContext, originalShas: string[],
-    currentSha: string): Promise<RecoveryCoverage> {
+    currentSha: string, opts: { reuseCoveredCurrent?: "if-covered" | "required" } = {}): Promise<RecoveryCoverage> {
     context = this.snapshotOwedOptions({ context }).context as PositiveOwedCandidateContext;
     if (!Number.isSafeInteger(context.generation) || context.generation <= 0 ||
         "legacy" in context || "origin" in context) throw new Error("recovery coverage requires positive claim context");
@@ -19187,26 +19222,38 @@ try {
         throw new Error("recovery current tree unavailable");
       }
       const fingerprint = createHash("sha256").update(JSON.stringify({ roots, currentSha, tree })).digest("hex");
-      let parents = [...new Set([...roots, currentSha])].sort();
-      let round = 0;
-      do {
-        const next: string[] = [];
-        for (let start = 0; start < parents.length; start += 32) {
-          const args = ["--no-replace-objects", "-c", "commit.gpgsign=false", "commit-tree", tree];
-          for (const parent of parents.slice(start, start + 32)) args.push("-p", parent);
-          args.push("-m", `uzi recovery coverage ${fingerprint} round ${round} batch ${start / 32}`);
-          const sha = (await this.runSynthesisGit(barePath, args, {
-            GIT_AUTHOR_NAME: AGENT_GIT_IDENTITY.name, GIT_AUTHOR_EMAIL: AGENT_GIT_IDENTITY.email,
-            GIT_COMMITTER_NAME: AGENT_GIT_IDENTITY.name, GIT_COMMITTER_EMAIL: AGENT_GIT_IDENTITY.email,
-            GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z", GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
-          })).trim();
-          await this.requireOwedCommit(barePath, sha);
-          next.push(sha);
-        }
-        parents = next;
-        round++;
-      } while (parents.length > 1);
-      const sha = parents[0]!;
+      let reuseCurrent = (opts.reuseCoveredCurrent === "if-covered" || opts.reuseCoveredCurrent === "required") &&
+        await this.reusableRecoveryCoverage(barePath, currentSha, tree);
+      if (reuseCurrent) for (const root of roots) {
+        const relation = await this.ancestry(barePath, root, currentSha);
+        if (relation === "unknown") throw new Error("recovery coverage ancestry proof unavailable");
+        if (relation !== "ancestor") { reuseCurrent = false; break; }
+      }
+      if (opts.reuseCoveredCurrent === "required" && !reuseCurrent)
+        throw new RecoveryCoverageReuseRefused();
+      let sha = currentSha;
+      if (!reuseCurrent) {
+        let parents = [...new Set([...roots, currentSha])].sort();
+        let round = 0;
+        do {
+          const next: string[] = [];
+          for (let start = 0; start < parents.length; start += 32) {
+            const args = ["--no-replace-objects", "-c", "commit.gpgsign=false", "commit-tree", tree];
+            for (const parent of parents.slice(start, start + 32)) args.push("-p", parent);
+            args.push("-m", `uzi recovery coverage ${fingerprint} round ${round} batch ${start / 32}`);
+            const aggregate = (await this.runSynthesisGit(barePath, args, {
+              GIT_AUTHOR_NAME: AGENT_GIT_IDENTITY.name, GIT_AUTHOR_EMAIL: AGENT_GIT_IDENTITY.email,
+              GIT_COMMITTER_NAME: AGENT_GIT_IDENTITY.name, GIT_COMMITTER_EMAIL: AGENT_GIT_IDENTITY.email,
+              GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z", GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
+            })).trim();
+            await this.requireOwedCommit(barePath, aggregate);
+            next.push(aggregate);
+          }
+          parents = next;
+          round++;
+        } while (parents.length > 1);
+        sha = parents[0]!;
+      }
       for (const root of [...roots, currentSha]) {
         if (await this.ancestry(barePath, root, sha) !== "ancestor") throw new Error("recovery coverage proof failed");
       }
