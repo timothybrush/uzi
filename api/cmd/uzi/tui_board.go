@@ -703,10 +703,37 @@ func (m tuiModel) renderBoardBody(height int, fullScreen bool) string {
 			}
 		}
 		accountCols := m.boardAccountCols(rendered)
+		// The status cell never shrinks so far that the band headings in view push their first
+		// label (age / ended) off: it keeps the first label two blanks clear of the widest
+		// heading, within the fixed maximum (tui-ux review of #3732). A labelled heading is one
+		// with at least one of its rows rendered below it.
+		for i := start; i < end; i++ {
+			if items[i].kind == biEyebrow && i+1 < end && items[i+1].kind == biRow {
+				floor := visualWidth(m.boardEyebrow(items[i])) + 2 - boardAgeLabelOffset(m.board.admin)
+				accountCols.statusW = min(boardStatusWordWidth, max(accountCols.statusW, floor))
+			}
+		}
+		// A band's heading names the judge column only when one of its runs carries a verdict:
+		// the judge runs after a run finishes, so active bands would label an empty column.
+		var bandVerdict [numBands]bool
+		for _, r := range rows {
+			if r.JudgeVerdict != nil {
+				bandVerdict[runBandOf(r)] = true
+			}
+		}
 		for i := start; i < end; i++ {
 			switch it := items[i]; it.kind {
 			case biEyebrow:
-				sb.WriteString(m.boardEyebrow(it) + "\n")
+				bmc := mc
+				if !bandVerdict[it.band] {
+					bmc.fullW = 0 // the column stays reserved on rows; only the label is omitted
+				}
+				if i+1 < end && items[i+1].kind == biRow {
+					sb.WriteString(m.boardEyebrowLabelled(it, bmc, accountCols) + "\n")
+				} else {
+					// A heading at the window's bottom edge with no rows under it: no labels.
+					sb.WriteString(m.boardEyebrow(it) + "\n")
+				}
 			case biRow:
 				r := rows[it.runIdx]
 				sel := it.runIdx == m.board.cursor
@@ -832,6 +859,17 @@ func (m tuiModel) boardEyebrow(it boardItem) string {
 		label += m.pal.faint.Render(" · ") + paintSeg(m.pal.alarm, nil, false, itoa(it.failed)+" failed")
 	}
 	return label
+}
+
+// boardEyebrowLabelled is the band heading plus its faint column names (#3732), positioned
+// over the rendered window's cells and dropped where they would collide.
+func (m tuiModel) boardEyebrowLabelled(it boardItem, mc boardMarkerCols, cols boardAccountCols) string {
+	head := m.boardEyebrow(it)
+	labels := placeBoardLabels(visualWidth(head), m.width, m.boardColumnLabels(it.band, mc, cols))
+	if labels == "" {
+		return head
+	}
+	return head + m.pal.faint.Render(labels)
 }
 
 // boardFooter preserves the unabridged legend for version-readout selection.
@@ -982,7 +1020,7 @@ func (m tuiModel) versionClientOnly() string {
 
 const (
 	boardIDWidth         = 8  // short run id (first 8 of the UUID)
-	boardStatusWordWidth = 14 // status word cell; fits the 13-rune longest words ("recovery wait" / "needs landing", issue #1418) with a column of breathing room
+	boardStatusWordWidth = 14 // status word cell MAXIMUM (thresholds reserve it); fits the 13-rune longest words ("recovery wait" / "needs landing", issue #1418) with a column of breathing room. Rows draw the rendered window's measured width (boardAccountCols.statusW, #3732)
 	boardAgeWidth        = 4  // AGE cell (relAge, single-unit)
 	boardMileWidth       = 9  // milestone micro-bar cell (up to boardMileCap ▰/▱ cells, or done/total | –/N text above that)
 	boardMileCap         = 9  // above this many milestones the micro-bar falls back to N/M text
