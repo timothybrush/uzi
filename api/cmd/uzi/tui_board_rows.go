@@ -306,6 +306,13 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	}
 	row += paintSeg(stateC, bg, false, padCell(tok.word, boardStatusWordWidth)) + gap +
 		paintSeg(m.pal.faintC, bg, false, padCell(relAge(ageAt), boardAgeWidth)) + gap
+	if m.boardShowDur() {
+		dur := ""
+		if terminal {
+			dur = boardDurText(r.RunDTO)
+		}
+		row += paintSeg(m.pal.faintC, bg, false, padLeftVisual(dur, boardDurWidth)) + gap
+	}
 
 	if m.boardShowMile() {
 		row += m.boardProgressCell(r, terminal, bg, tok.word) + gap
@@ -444,10 +451,13 @@ func boardCostText(r apitypes.RunListItemDTO) string {
 
 // boardRowPrefixWidth measures the fixed prefix without the milestone micro-bar
 // for column visibility thresholds. cursor(1)+strip(1)+glyph(1)+space(1)+id, then two-space gaps around
-// the status-word and AGE cells, the credential cell when
+// the status-word and AGE cells, the DONE run-length cell when shown, the credential cell when
 // shown, the cost cell when shown, plus the admin owner cell.
-func boardRowPrefixWidth(admin, cred, cost bool) int {
+func boardRowPrefixWidth(admin, dur, cred, cost bool) int {
 	w := 4 + boardIDWidth + 2 + boardStatusWordWidth + 2 + boardAgeWidth + 2
+	if dur {
+		w += boardDurWidth + 2
+	}
 	if cred {
 		w += boardCredWidth + 2
 	}
@@ -469,23 +479,30 @@ func boardRowPrefixWidth(admin, cred, cost bool) int {
 type boardMarkerCols struct{ verdictW, countW, fullW int }
 
 func (m tuiModel) boardMarkerCols(rows []apitypes.RunListItemDTO) boardMarkerCols {
-	var mc boardMarkerCols
 	if m.board.admin {
-		return mc
+		return boardMarkerCols{}
 	}
+	vw, cw := markerSlotWidths(rows)
+	return m.markerColsFor(vw, cw)
+}
+
+// markerSlotWidths is the widest verdict word and "· N" count across rows; 0, 0 when no row
+// carries a verdict. The verdict goes through the same Plain sanitize-and-cap the marker draws.
+func markerSlotWidths(rows []apitypes.RunListItemDTO) (verdictW, countW int) {
 	for _, r := range rows {
 		if r.JudgeVerdict == nil {
 			continue
 		}
-		if w := visualWidth(m.renderer.Plain(*r.JudgeVerdict, 8)); w > mc.verdictW {
-			mc.verdictW = w
-		}
+		verdictW = max(verdictW, visualWidth(capCell(cellText(*r.JudgeVerdict), 8)))
 		if r.JudgeTodoCount > 0 {
-			if w := visualWidth("· " + itoa(r.JudgeTodoCount)); w > mc.countW {
-				mc.countW = w
-			}
+			countW = max(countW, visualWidth("· "+itoa(r.JudgeTodoCount)))
 		}
 	}
+	return verdictW, countW
+}
+
+func (m tuiModel) markerColsFor(verdictW, countW int) boardMarkerCols {
+	mc := boardMarkerCols{verdictW: verdictW, countW: countW}
 	if mc.verdictW > 0 {
 		// The empty-verdict/zero-count marker has the full fixed width, and visualWidth accounts
 		// for the ⚖ glyph's own cell count.
