@@ -118,6 +118,37 @@ without failing until the requeue cap, then ends in `worker_requeue_exhausted`
 accepted but before the worker finished tearing down leaves no record and
 follows the existing terminal path.
 
+A successor that meets a terminal owner whose completed source is not yet retired
+(#3645) takes the same kind of stop. The owner's journal carries a
+completion-source fence, so the worker retires it through the certified completion
+chain rather than clearing it. When that retirement is pending (a busy capture
+cycle or authority lock, a failed preflight, a live owner tail), uncertain, or the
+journal has retained sources and authority finds the fence's source or a slot for
+the path, the claim stops without a terminal report and the
+owner's source is left intact; the claim is requeued up to `RUN_MAX_REQUEUES`. A
+seed that meets a slot still `retiring` (a retirement interrupted before the claim
+arrived) is the same stop, as is an I/O error while the retirement is prepared or a
+coordinator that cannot classify a journal with retained sources. An authority
+refusal, a cancel or shutdown, or a spent maintenance budget during that
+preparation is not this stop: it ends the claim as it did before. A
+journal that changes under the call re-admits at most twice per claim, and the
+third is the same stop. The stop leaves the claim's own custody hold open, so at
+the cap the run parks `recovery_wait` with `worker_requeue_exhausted` for an owner
+Resume or Cancel. Every claim on this path opens its own custody hold and the stop leaves it open, so at
+the default cap of 3 this stop loop accrues at most 1 + `RUN_MAX_REQUEUES` (4) open holds per exhaustion episode, below the default
+`custody_hold_limit` of 8; those holds share the owner's admission count with the
+owner's other runs, so several exhausted runs can hold the owner's new claims
+queued until those holds are discarded or released (Resume and Cancel leave them open). A retained-sources journal
+where authority finds neither a record carrying the fence nor a slot for the path
+(a classify `not_completion`) still takes the unchanged detach. In retire mode, a
+source that is positively invalid or unsupported keeps the outward refusal; for a
+journal with retained sources those outcomes are retained stops instead
+(`completion_unverified` / `published_source_retained`). A same-process Codex owner without a live disposal witness, a
+permanently failing preflight, or a valid fenced source with retained sources
+stays retained until exhaustion, then owner-held. See
+[ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md) for the lock
+order and outcomes.
+
 Workers built before this change reject the new `memoryPark` journal record and
 fail closed on it: they refuse to attach, recover or discard that source. Roll
 workers back only after memory-parked runs are resolved. See the
@@ -1409,7 +1440,8 @@ stays retained until compatible tooling or that discard can address it.
    the remaining maintenance budget when one is running (otherwise the lock's
    default wait of 10 minutes), and the retained-source discard waits at most
    30 seconds. When the deadline expires the operation does not run and fails
-   with an `authority lock timeout` refusal; a wait ended earlier by its
+   with an `authority lock timeout` refusal (the typed `AuthorityLockBusy`, an
+   `AuthorityRefusal` whose message is unchanged); a wait ended earlier by its
    cancel, shutdown or maintenance signal rejects with that abort instead.
    Nothing guarded runs in either case, and nothing is changed by it. The discard then ends in `internal_error` and its claim gate is
    reopened; other callers handle the refusal at their own site (for example,
@@ -1778,7 +1810,7 @@ These worker events identify the failed guard or completed disposition:
 |---|---|---|
 | `orphan_reclaim_refused` | warn | Reclaim stopped at `stage` for `reason`; keep the held work and investigate that guard. |
 | `orphan_retirement_failed` | warn | Canonical retirement failed at an inner stage, with `canonical_retirement_failure`; inspect its safe `errno`. |
-| `orphan_reclaim_succeeded` | info | `stage: complete`; `reason` is exactly `quarantined`, `retained-in-place`, or `source-already-absent`. |
+| `orphan_reclaim_succeeded` | info | `stage: complete`; `reason` is exactly `quarantined`, `retained-in-place`, `source-already-absent`, or `completion-retired` (the fenced owner source was retired through the certified completion chain and the successor re-admits). |
 
 | Refusal stage | Reasons and investigation |
 |---|---|
@@ -1789,6 +1821,7 @@ These worker events identify the failed guard or completed disposition:
 | `quiescence` | `quiescence_blocked` or `quiescence_error`: the scoped capture check blocked or failed. |
 | `attempt_ledger` / `attempt_journal` | `attempt_release_failure`: recording retained attempt state or clearing its journal failed. |
 | `retirement` | `canonical_retirement_failure`, or `attempt_release_failure` when attempt validation falls through to this generic stage. |
+| `completion_handoff` | The owner's journal carried a completion-source fence. `completion_retirement_pending`: the certified retirement is not ready, so the successor stops without failing (see the retained stop above). `completion_retirement_refused`: the outward refusal for an invalid or unsupported fenced source in retire mode (a retire-mode `not_completion` carries subreason `fenced_source`), or a journal that changed under the call (`pair_changed`, the successor re-admits). |
 
 Inner retirement stages are `journal_read`, `journal_validation`, `containment`,
 `holding_parent`, `rename`, `retained_copy`, `intra_device_rename`, and
@@ -1804,7 +1837,15 @@ orphaned skills on every worker. A refusal after a move or copy need not restore
 the original layout.
 
 The new events carry `event`, `stage`, `reason`, `claimant_id`, `owner_id`,
-`repo_id`, `path_shape`, `path_fingerprint`, and `errno`. IDs are UUID strings
+`repo_id`, `path_shape`, `path_fingerprint`, and `errno`, plus an optional
+`retirement_subreason` from a closed set (anything else is written as `unknown`):
+`fenced_source` (a fence refused an uncertified clear), `pair_changed` (the
+owner/path pair changed or the re-admission bound of 2 was passed),
+`completion_pending`, `completion_preflight_retained`, `completion_uncertain`,
+`authority_busy` (the authority lock wait ran out), `published_source_retained`
+(a fenced journal with retained sources was kept, never detached),
+`completion_unverified`, `completion_unsupported`, or `unknown`. It carries no
+error text or paths. IDs are UUID strings
 or `invalid`; path shape is `canonical`, `attempt`, or `unknown`. The fingerprint
 is a 64-hex SHA-256 digest of the path, with 64 zeroes if hashing is unavailable.
 `errno` is allowlisted or `unknown`; optional `http_status` is an integer from
